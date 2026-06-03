@@ -61,10 +61,28 @@ def extract_code_block(text: str) -> str:
     return re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip())
 
 
+def problem_id_from_name(name: str, fallback: int) -> int:
+    """Extract the real KernelBench problem id from the problem name.
+
+    Names look like '19_ReLU.py' or '1_Square_matrix_multiplication_.py' — the
+    leading integer is the problem id within the level, which does not match the
+    dataset array index. Fall back to the array index if no prefix is found.
+    """
+    match = re.match(r"(\d+)", os.path.basename(name))
+    return int(match.group(1)) if match else fallback
+
+
 def load_model(model_id: str, load_in_4bit: bool):
     from vllm import LLM
 
-    kwargs = dict(dtype="bfloat16")
+    # The reranker is loaded first and occupies ~8 GiB. vLLM measures its budget
+    # as a fraction of *total* VRAM, so utilization must stay below the free
+    # fraction (≈39/47 ≈ 0.82 here) or startup fails.
+    kwargs = dict(
+        dtype="auto",
+        max_model_len=16384,
+        gpu_memory_utilization=0.80,
+    )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"
         kwargs["load_format"] = "bitsandbytes"
@@ -258,16 +276,17 @@ def main():
 
         ref_arch_src = problem["code"]
         problem_name = problem.get("name", f"problem_{problem_id:04d}.py")
+        real_id = problem_id_from_name(problem_name, problem_id)
 
         best_flat_path = os.path.join(
             args.output_dir,
-            f"level_{args.level}_problem_{problem_id}_sample_0_kernel.py",
+            f"level_{args.level}_problem_{real_id}_sample_0_kernel.py",
         )
         if args.skip_existing and os.path.exists(best_flat_path):
             print(f"[SKIP] {problem_name}")
             continue
 
-        print(f"\n[{problem_id}/{problem_ids[-1]}] {problem_name}")
+        print(f"\n[{problem_id}/{problem_ids[-1]}] {problem_name} (problem {real_id})")
 
         prompt = get_prompt_for_backend(
             ref_arch_src=ref_arch_src,
@@ -293,19 +312,19 @@ def main():
         print(f"  scores: {[f'{s:.3f}' for s in scores]}  → best=sample_{best_idx} ({scores[best_idx]:.3f})")
 
         # Write all samples + scores.json to per-problem subfolder.
-        problem_dir = os.path.join(args.output_dir, f"problem_{problem_id}")
+        problem_dir = os.path.join(args.output_dir, f"problem_{real_id}")
         os.makedirs(problem_dir, exist_ok=True)
 
         scores_record = {}
         for i, code in enumerate(kernel_codes):
-            fname = f"level_{args.level}_problem_{problem_id}_sample_{i}_kernel.py"
+            fname = f"level_{args.level}_problem_{real_id}_sample_{i}_kernel.py"
             with open(os.path.join(problem_dir, fname), "w") as f:
                 f.write(code)
             scores_record[fname] = scores[i]
 
         scores_meta = {
             "scores": scores_record,
-            "best": f"level_{args.level}_problem_{problem_id}_sample_{best_idx}_kernel.py",
+            "best": f"level_{args.level}_problem_{real_id}_sample_{best_idx}_kernel.py",
         }
         with open(os.path.join(problem_dir, "scores.json"), "w") as f:
             json.dump(scores_meta, f, indent=2)

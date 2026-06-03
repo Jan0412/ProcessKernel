@@ -50,6 +50,17 @@ def extract_code_block(text: str) -> str:
     return re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip())
 
 
+def problem_id_from_name(name: str, fallback: int) -> int:
+    """Extract the real KernelBench problem id from the problem name.
+
+    Names look like '19_ReLU.py' or '1_Square_matrix_multiplication_.py' — the
+    leading integer is the problem id within the level, which does not match the
+    dataset array index. Fall back to the array index if no prefix is found.
+    """
+    match = re.match(r"(\d+)", os.path.basename(name))
+    return int(match.group(1)) if match else fallback
+
+
 def load_model(model_id: str, load_in_4bit: bool):
     from vllm import LLM
 
@@ -164,17 +175,18 @@ def main():
 
         ref_arch_src = problem["code"]
         problem_name = problem.get("name", f"problem_{problem_id:04d}.py")
+        real_id = problem_id_from_name(problem_name, problem_id)
 
         if args.skip_existing and all(
             os.path.exists(
-                os.path.join(out_dir, f"level_{args.level}_problem_{problem_id}_sample_{i}_kernel.py")
+                os.path.join(out_dir, f"level_{args.level}_problem_{real_id}_sample_{i}_kernel.py")
             )
             for i in range(args.num_samples)
         ):
             print(f"[SKIP] {problem_name}")
             continue
 
-        print(f"\n[{problem_id}/{problem_ids[-1]}] {problem_name}")
+        print(f"\n[{problem_id}/{problem_ids[-1]}] {problem_name} (problem {real_id})")
 
         prompt = get_prompt_for_backend(
             ref_arch_src=ref_arch_src,
@@ -188,7 +200,7 @@ def main():
 
         for beam_idx, raw in enumerate(raws):
             code = extract_code_block(raw)
-            fname = f"level_{args.level}_problem_{problem_id}_sample_{beam_idx}_kernel.py"
+            fname = f"level_{args.level}_problem_{real_id}_sample_{beam_idx}_kernel.py"
             fpath = os.path.join(out_dir, fname)
             with open(fpath, "w") as f:
                 f.write(code)
