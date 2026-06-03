@@ -6,9 +6,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../kernel_gen"
 
-MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct"
-OUTPUT_DIR="$SCRIPT_DIR/../runs/Qwen3-Coder-30B-A3B-Instruct_reranked_level1_triton"
-RERANKER_CHECKPOINT="$SCRIPT_DIR/../reranker/data/checkpoints/final"
+MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+OUTPUT_DIR="$SCRIPT_DIR/../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_reranked_level2_triton"
+RERANKER_CHECKPOINT="/path/to/ProcessKernel/mlruns/1/17c0f8c1b9a84fa697432b496694ad39/artifacts/model"
 
 echo "============================================"
 echo "  Start time  : $(date)"
@@ -19,7 +19,7 @@ echo "============================================"
 python generate_kernels_reranked.py \
     --model "$MODEL" \
     --output-dir "$OUTPUT_DIR" \
-    --level 1 \
+    --level 2 \
     --all \
     --num-samples 10 \
     --backend triton \

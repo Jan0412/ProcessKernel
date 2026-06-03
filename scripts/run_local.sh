@@ -6,8 +6,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../kernel_gen"
 
-MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct"
-OUTPUT_DIR="Qwen3-Coder-30B-A3B-Instruct_generated_kernels_samples"
+MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+OUTPUT_DIR="/path/to/ProcessKernel/runs/Qwen3-Coder-30B-A3B-Instruct-FP8_level2_triton"
 
 echo "============================================"
 echo "  Start time  : $(date)"
@@ -18,9 +18,9 @@ echo "============================================"
 python generate_kernels_samples.py \
     --model "$MODEL" \
     --output-dir "$OUTPUT_DIR" \
-    --level 1 \
+    --level 2 \
     --all \
-    --num-samples 10 \
+    --num-samples 1 \
     --backend triton \
     --option one_shot \
     --gpu-name A100 \
