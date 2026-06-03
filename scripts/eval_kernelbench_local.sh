@@ -4,8 +4,9 @@ set -euo pipefail
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# KernelBench repo root (contains scripts/, runs/, results/)
-KERNELBENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../KernelBench_repo" && pwd)"
+# Absolute path to the full KernelBench repo (contains scripts/, runs/, results/, src/).
+# Adjust this to wherever the repo is cloned on the target machine.
+KERNELBENCH_DIR="${HOME}/KernelBench"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 MODEL_SLUG="Qwen3-Coder-Next"
@@ -44,15 +45,13 @@ ls "${RUNS_DIR}/${RUN_NAME}" | head -5
 echo "============================================"
 
 # ── Generate PyTorch eager baseline (skip if already present) ─────────────────
+# generate_baseline_time.py has no CLI interface; it reads hardware_name from
+# source. Run it from the repo root so REPO_TOP_PATH resolves correctly, and
+# pipe "yes" to auto-confirm its interactive prompts.
 if [ -f "$BASELINE_FILE" ]; then
     echo "Baseline already exists at ${BASELINE_FILE}, skipping generation"
 else
-    python3 "${KERNELBENCH_DIR}/scripts/generate_baseline_time.py" \
-        hardware_name="${HARDWARE}" \
-        levels="[${LEVEL}]" \
-        use_torch_compile=false \
-        precision=fp32 \
-        file_name="${HARDWARE}/baseline_time_torch.json"
+    ( cd "$KERNELBENCH_DIR" && yes | python3 scripts/generate_baseline_time.py )
 fi
 
 echo "============================================"
