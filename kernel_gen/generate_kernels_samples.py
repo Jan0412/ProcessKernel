@@ -64,7 +64,14 @@ def problem_id_from_name(name: str, fallback: int) -> int:
 def load_model(model_id: str, load_in_4bit: bool):
     from vllm import LLM
 
-    kwargs = dict(dtype="bfloat16")
+    # The reranker is loaded first and occupies ~8 GiB. vLLM measures its budget
+    # as a fraction of *total* VRAM, so utilization must stay below the free
+    # fraction (≈39/47 ≈ 0.82 here) or startup fails.
+    kwargs = dict(
+        dtype="auto",
+        max_model_len=16384,
+        gpu_memory_utilization=0.80,
+    )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"
         kwargs["load_format"] = "bitsandbytes"
