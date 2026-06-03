@@ -7,9 +7,20 @@ requires-python = ">=3.14"
 dependencies = [
     "accelerate>=1.13.0",
     "datasets>=4.8.5",
+    "flash-attn>=2.8.3",
+    "kernelbench",
+    "kernels<0.15",
     "mlflow>=3.12.0",
+    "numpy>=2.4.6",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
-    "torch>=2.12.0",
     "transformers>=5.9.0",
+    "uvloop>=0.22.1",
+    "vllm>=0.11.0",
 ]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
+[tool.uv.sources]
+kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
