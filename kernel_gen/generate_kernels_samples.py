@@ -108,29 +108,32 @@ def generate_samples(
     )
 
     if think_temperature is not None:
-        # Two-pass: high temperature during thinking, lower temperature for output.
-        # Pass 1: generate thinking section for each sample individually (n=1 per
-        # request so each sample gets its own diverse thinking trace).
+        # Pass 1: reasoning at think_temperature, stop before the code fence.
+        CODE_FENCE = "```python"
         think_params = SamplingParams(
             temperature=think_temperature,
             max_tokens=max_new_tokens,
-            stop=["</think>"],
+            stop=[CODE_FENCE],
+            include_stop_str_in_output=False,
             n=1,
         )
         think_outputs = llm.generate([formatted_prompt] * num_samples, think_params)
 
-        # Pass 2: continue each thinking trace with the output temperature.
+        # Pass 2: generate the code block at the lower temperature.
         output_params = SamplingParams(
             temperature=temperature,
             max_tokens=max_new_tokens,
             n=1,
         )
         continuations = [
-            formatted_prompt + out.outputs[0].text + "</think>"
+            formatted_prompt + out.outputs[0].text + CODE_FENCE
             for out in think_outputs
         ]
         final_outputs = llm.generate(continuations, output_params)
-        return [out.outputs[0].text for out in final_outputs]
+        return [
+            out_think.outputs[0].text + CODE_FENCE + out_code.outputs[0].text
+            for out_think, out_code in zip(think_outputs, final_outputs)
+        ]
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -169,7 +172,7 @@ def main():
     parser.add_argument("--dataset-name", default="ScalingIntelligence/KernelBench")
     parser.add_argument("--num-samples", type=int, default=4, help="Number of diverse samples to generate per problem (default: 4)")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for diversity (default: 0.8)")
-    parser.add_argument("--think-temperature", type=float, default=None, help="If set, enables two-pass generation: this temperature is used during the thinking phase, --temperature is used for the output phase")
+    parser.add_argument("--think-temperature", type=float, default=None, help="If set, enables two-pass generation split at the ```python fence: this temperature is used for the reasoning/prose before the code, --temperature is used for the code itself")
     args = parser.parse_args()
 
     model_slug = args.model.split("/")[-1]
