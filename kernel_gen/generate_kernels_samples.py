@@ -83,7 +83,8 @@ def load_model(model_id: str, load_in_4bit: bool):
 
 
 def generate_samples(
-    llm, prompt: str, max_new_tokens: int, num_samples: int, temperature: float
+    llm, prompt: str, max_new_tokens: int, num_samples: int, temperature: float,
+    think_temperature: float | None = None,
 ) -> list[str]:
     from vllm import SamplingParams
 
@@ -105,6 +106,31 @@ def generate_samples(
     formatted_prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+
+    if think_temperature is not None:
+        # Two-pass: high temperature during thinking, lower temperature for output.
+        # Pass 1: generate thinking section for each sample individually (n=1 per
+        # request so each sample gets its own diverse thinking trace).
+        think_params = SamplingParams(
+            temperature=think_temperature,
+            max_tokens=max_new_tokens,
+            stop=["</think>"],
+            n=1,
+        )
+        think_outputs = llm.generate([formatted_prompt] * num_samples, think_params)
+
+        # Pass 2: continue each thinking trace with the output temperature.
+        output_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+            n=1,
+        )
+        continuations = [
+            formatted_prompt + out.outputs[0].text + "</think>"
+            for out in think_outputs
+        ]
+        final_outputs = llm.generate(continuations, output_params)
+        return [out.outputs[0].text for out in final_outputs]
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -143,6 +169,7 @@ def main():
     parser.add_argument("--dataset-name", default="ScalingIntelligence/KernelBench")
     parser.add_argument("--num-samples", type=int, default=4, help="Number of diverse samples to generate per problem (default: 4)")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for diversity (default: 0.8)")
+    parser.add_argument("--think-temperature", type=float, default=None, help="If set, enables two-pass generation: this temperature is used during the thinking phase, --temperature is used for the output phase")
     args = parser.parse_args()
 
     model_slug = args.model.split("/")[-1]
@@ -203,7 +230,7 @@ def main():
             gpu_name=args.gpu_name if args.include_hardware else None,
         )
 
-        raws = generate_samples(llm, prompt, args.max_new_tokens, args.num_samples, args.temperature)
+        raws = generate_samples(llm, prompt, args.max_new_tokens, args.num_samples, args.temperature, args.think_temperature)
 
         for beam_idx, raw in enumerate(raws):
             code = extract_code_block(raw)
