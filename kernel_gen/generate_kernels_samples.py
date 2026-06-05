@@ -93,8 +93,12 @@ def generate_samples(
         "architecture to get speedups.\n\n"
         "You have complete freedom to choose the set of operators you want to replace. "
         "You may replace some operators with custom kernels and leave others unchanged.\n\n"
-        "You need to provide the complete Python code wrapped in a Python code block "
-        "that starts with ```python and ends with ```."
+        "Before writing any code, first think through and lay out a plan. Identify which "
+        "operators are the most promising to replace, explain why, and describe the kernel "
+        "strategy you intend to use. Keep this planning section concise.\n\n"
+        "After you have written out the plan, implement it. You need to provide the "
+        "complete Python code wrapped in a Python code block that starts with ```python "
+        "and ends with ```."
     )
 
     messages = [
@@ -108,8 +112,14 @@ def generate_samples(
     )
 
     if think_temperature is not None:
-        # Pass 1: reasoning at think_temperature, stop before the code fence.
         CODE_FENCE = "```python"
+        # Instruct models ignore a "plan first" instruction and emit the code fence
+        # immediately. Prefill the assistant turn with a plan heading so the model
+        # is forced to start in prose, generated at think_temperature.
+        PLAN_PREFIX = "## Plan\n"
+        plan_prompt = formatted_prompt + PLAN_PREFIX
+
+        # Pass 1: planning at think_temperature, stop before the code fence.
         think_params = SamplingParams(
             temperature=think_temperature,
             max_tokens=max_new_tokens,
@@ -117,7 +127,8 @@ def generate_samples(
             include_stop_str_in_output=False,
             n=1,
         )
-        think_outputs = llm.generate([formatted_prompt] * num_samples, think_params)
+        think_outputs = llm.generate([plan_prompt] * num_samples, think_params)
+        print(f"  plan lengths (chars): {[len(o.outputs[0].text) for o in think_outputs]}")
 
         # Pass 2: generate the code block at the lower temperature.
         output_params = SamplingParams(
@@ -126,12 +137,12 @@ def generate_samples(
             n=1,
         )
         continuations = [
-            formatted_prompt + out.outputs[0].text + CODE_FENCE
+            plan_prompt + out.outputs[0].text + CODE_FENCE
             for out in think_outputs
         ]
         final_outputs = llm.generate(continuations, output_params)
         return [
-            out_think.outputs[0].text + CODE_FENCE + out_code.outputs[0].text
+            PLAN_PREFIX + out_think.outputs[0].text + CODE_FENCE + out_code.outputs[0].text
             for out_think, out_code in zip(think_outputs, final_outputs)
         ]
 
