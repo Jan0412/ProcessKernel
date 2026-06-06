@@ -26,8 +26,11 @@ import sys
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 KERNELBENCH_SRC = os.path.join(SCRIPT_DIR, "KernelBench", "src")
 sys.path.insert(0, KERNELBENCH_SRC)
+
+from gen_config import print_generation_summary, write_generation_config
 
 
 def parse_problems(spec: str) -> list[int]:
@@ -206,9 +209,22 @@ def main():
     else:
         raise ValueError("Provide --problems or --all.")
 
-    print(f"Output directory : {out_dir}")
-    print(f"Problems to solve: {len(problem_ids)} problems")
-    print(f"Num samples      : {args.num_samples}")
+    config = dict(vars(args))
+    config.update(
+        run_name=os.path.basename(os.path.normpath(out_dir)),
+        dataset_split=dataset_split,
+        num_problems=len(problem_ids),
+        script=os.path.basename(__file__),
+    )
+    print_generation_summary(
+        config,
+        keys=["model", "dataset_name", "level", "num_problems", "num_samples",
+              "temperature", "think_temperature", "backend", "option",
+              "max_new_tokens", "output_dir"],
+        title="KernelBench generation (sampling)",
+    )
+    cfg_path = write_generation_config(out_dir, config)
+    print(f"Saved config     : {cfg_path}")
 
     from kernelbench.prompt_constructor_toml import get_prompt_for_backend
 

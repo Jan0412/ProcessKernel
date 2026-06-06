@@ -31,6 +31,7 @@ sys.path.insert(0, SCRIPT_DIR)
 KERNELBENCH_SRC = os.path.join(SCRIPT_DIR, "KernelBench", "src")
 sys.path.insert(0, KERNELBENCH_SRC)
 
+from gen_config import print_generation_summary, write_generation_config
 from generate_kernels_samples import extract_code_block, generate_samples, load_model
 from kernelbook_convert import ConversionError, convert_row
 
@@ -102,10 +103,22 @@ def main():
     else:
         raise ValueError("Provide --rows or --all.")
 
-    print(f"Output directory : {out_dir}")
-    print(f"Rows to solve    : {len(row_ids)}")
-    print(f"Pseudo-level     : {args.pseudo_level}")
-    print(f"Num samples      : {args.num_samples}")
+    config = dict(vars(args))
+    config.update(
+        run_name=os.path.basename(os.path.normpath(out_dir)),
+        split=KERNELBOOK_SPLIT,
+        num_rows=len(row_ids),
+        script=os.path.basename(__file__),
+    )
+    print_generation_summary(
+        config,
+        keys=["model", "dataset_name", "num_rows", "pseudo_level", "num_samples",
+              "temperature", "think_temperature", "backend", "option",
+              "max_new_tokens", "output_dir"],
+        title="KernelBook generation (sampling)",
+    )
+    cfg_path = write_generation_config(out_dir, config)
+    print(f"Saved config     : {cfg_path}")
 
     from kernelbench.prompt_constructor_toml import get_prompt_for_backend
 
