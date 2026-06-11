@@ -24,6 +24,10 @@ data:
   split_ratios: [0.75, 0.15, 0.15]   # train / val / test
   split_seed: 42
   stratify_by_level: true
+  # Which negatives to include:
+  #   all_negative   -> all non-(compiled & correct) kernels (default)
+  #   compiled_wrong -> only compiled-but-incorrect negatives (drop compile failures)
+  negative_mode: all_negative
 
 model:
   base_model: Qwen/Qwen3-Reranker-0.6B

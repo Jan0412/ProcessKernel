@@ -34,6 +34,11 @@ class DataConfig:
     split_ratios: list[float] = field(default_factory=lambda: [0.7, 0.15, 0.15])
     split_seed: int = 42
     stratify_by_level: bool = True
+    # Which negatives to include in the dataset:
+    #   all_negative  -> every non-(compiled & correct) kernel (default)
+    #   compiled_wrong -> only kernels that compiled but are incorrect (drop
+    #                     compile-failure negatives); positives are kept either way.
+    negative_mode: str = "all_negative"
 
     def levels_for_run_dirs(self) -> list[int]:
         """Return a per-run-dir level list, broadcasting a scalar `level`."""
