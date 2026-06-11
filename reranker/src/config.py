@@ -82,6 +82,29 @@ class TrainConfig:
 
 
 @dataclass
+class PairwiseConfig:
+    """Pairwise-training settings (used only by reranker.src.pairwise.*).
+
+    The pairwise build reads the same labeled source dataset as the pointwise
+    pipeline (``data.dataset_jsonl``) but creates its own fresh problem-level
+    train/val split (no test) and materializes (positive, negative) pairs.
+    """
+
+    pairs_train_jsonl: str = "data/pairs_train.jsonl"
+    pairs_val_jsonl: str = "data/pairs_val.jsonl"
+    pairs_splits_json: str = "data/pairs_splits.json"
+    # Fresh problem-level split (train / val only; pairwise needs no test set).
+    split_ratios: list[float] = field(default_factory=lambda: [0.85, 0.15])
+    split_seed: int = 42
+    stratify_by_level: bool = True
+    pair_mode: str = "compiled_wrong"        # compiled_wrong | all_negative
+    max_negatives_per_positive: Optional[int] = None  # None = full cross product
+    loss_type: str = "logistic"              # logistic | margin
+    margin: float = 1.0
+    pair_seed: int = 42
+
+
+@dataclass
 class MLflowConfig:
     db_file: str = "mlflow.db"
     experiment: str = "KernelReranker"
@@ -98,6 +121,7 @@ class RerankerConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     mlflow: MLflowConfig = field(default_factory=MLflowConfig)
+    pairwise: PairwiseConfig = field(default_factory=PairwiseConfig)
 
 
 def _resolve(path: str) -> str:

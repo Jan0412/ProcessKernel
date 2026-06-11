@@ -1,0 +1,71 @@
+# Configuration for the PAIRWISE kernel reranker training pipeline.
+# A copy of default.yaml adapted for the pairwise (ranking) loss. The pointwise
+# config (default.yaml) is untouched and remains usable independently.
+# Override any leaf value from the CLI:
+#   bash reranker/scripts/train_pairwise_local.sh reranker/configs/pairwise_config.yaml pairwise.loss_type=margin
+
+data:
+  # Same labeled source dataset the pointwise pipeline produces. The pairwise
+  # build reads these rows and forms its own pairs + fresh train/val split.
+  run_dirs:
+    - ../runs/Qwen3-Coder-30B-A3B-Instruct_level1_triton
+    - ../runs/Qwen3-Coder-Next_level1_triton
+    - ../runs/gemma4_level1_triton_sampled
+    - ../runs/qwen36_coding_level1_triton_sampled
+  level: [1, 1, 1, 1]
+  kernelbench_dir: ..
+  dataset_jsonl: data/dataset.jsonl
+  # NOTE: the pointwise train/val/test split fields (splits_json, split_ratios,
+  # split_seed, stratify_by_level) are intentionally omitted — the pairwise path
+  # builds its own train/val split under `pairwise:` below. build_dataset only
+  # needs the fields above.
+
+model:
+  base_model: Qwen/Qwen3-Reranker-0.6B
+  max_length: 4096
+  head_type: seq_cls               # seq_cls | yes_no_lm
+  reserve_ref_tokens: 1024
+  attn_implementation: sdpa
+
+train:
+  # Separate checkpoint dir so the pairwise model never clobbers the pointwise one.
+  output_dir: data/checkpoints_pairwise
+  epochs: 3
+  lr: 1.0e-5
+  per_device_train_batch_size: 8   # a pair = 2 forward passes, so keep this modest
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 8
+  warmup_ratio: 0.01
+  weight_decay: 0.05
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  logging_steps: 5
+  eval_steps: 10
+  save_steps: 10
+  save_total_limit: 2
+  # Select the best checkpoint on a per-problem ranking metric (the real objective).
+  metric_for_best_model: eval_ndcg
+  greater_is_better: true
+  pos_weight: null                 # unused by the pairwise loss
+  seed: 42
+  max_steps: -1                    # -1 = full training; set small (e.g. 20) for a smoke test
+  dataloader_num_workers: 12
+
+mlflow:
+  db_file: mlflow.db
+  experiment: KernelReranker_Pairwise
+  run_name: null                   # null -> base_model + loss_type + timestamp
+
+pairwise:
+  pairs_train_jsonl: data/pairs_train.jsonl
+  pairs_val_jsonl: data/pairs_val.jsonl
+  pairs_splits_json: data/pairs_splits.json
+  split_ratios: [0.85, 0.15]       # train / val (pairwise needs no test set)
+  split_seed: 42
+  stratify_by_level: true
+  pair_mode: compiled_wrong        # compiled_wrong | all_negative
+  max_negatives_per_positive: null # null = full cross product (P x N per problem)
+  loss_type: logistic              # logistic | margin
+  margin: 1.0
+  pair_seed: 42

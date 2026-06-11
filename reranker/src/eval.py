@@ -1,28 +1,38 @@
-"""Evaluate a saved reranker checkpoint on all data splits (train / val / test).
+"""Evaluate a saved reranker checkpoint on data splits (train / val / test).
 
-Prints the same metrics that MLflow tracks during training so you can compare
-checkpoints without launching the full training loop.
+Prints the same metrics that MLflow tracks during training and (unless disabled)
+logs them to the MLflow experiment, so you can evaluate any checkpoint — including
+a pairwise-trained one — against any dataset / splits.json and have the per-split
+numbers land in MLflow next to the training runs.
+
+Point it at a specific dataset + splits with CLI overrides:
+    data.dataset_jsonl=data/new20k.jsonl data.splits_json=data/new20k_splits.json
 
 Usage:
     python -m reranker.src.eval --config configs/default.yaml
     python -m reranker.src.eval --config configs/default.yaml --checkpoint data/checkpoints/final
-    python -m reranker.src.eval --config configs/default.yaml --checkpoint data/checkpoints/checkpoint-200
+    python -m reranker.src.eval --config configs/pairwise_config.yaml \
+        --checkpoint data/checkpoints_pairwise/final --splits test
+    python -m reranker.src.eval --config configs/default.yaml --no-mlflow   # print only
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+from datetime import datetime
 
+import mlflow
 import torch
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments
 
-from reranker.src.config import _resolve, load_config
+from reranker.src.config import _resolve, load_config, to_flat_dict
 from reranker.src.dataset import RerankerCollator, build_datasets
 from reranker.src.metrics import make_compute_metrics
 from reranker.src.model import HeadInfo, _single_token_id, load_tokenizer
-from reranker.src.trainer import RerankerTrainer, compute_pos_weight
+from reranker.src.trainer import RerankerTrainer, compute_pos_weight, setup_mlflow
 
 _METRIC_ORDER = [
     "loss", "pr_auc", "roc_auc", "accuracy", "f1", "precision", "recall",
@@ -106,9 +116,16 @@ def main() -> None:
     pre.add_argument("--config", required=True)
     pre.add_argument("--checkpoint", default=None,
                      help="Checkpoint directory (default: <output_dir>/final)")
+    pre.add_argument("--splits", default="train,val,test",
+                     help="Comma-separated splits to evaluate (default: train,val,test)")
+    pre.add_argument("--run-name", default=None,
+                     help="MLflow run name (default: eval_<checkpoint>_<timestamp>)")
+    pre.add_argument("--no-mlflow", action="store_true",
+                     help="Disable MLflow logging (print metrics only)")
     pre_args, remaining = pre.parse_known_args()
 
     cfg = load_config(argv=["--config", pre_args.config] + remaining)
+    splits = tuple(s.strip() for s in pre_args.splits.split(",") if s.strip())
 
     checkpoint_dir = pre_args.checkpoint or os.path.join(_resolve(cfg.train.output_dir), "final")
     if not os.path.isdir(checkpoint_dir):
@@ -116,6 +133,8 @@ def main() -> None:
 
     print(f"[eval] checkpoint : {checkpoint_dir}")
     print(f"[eval] config     : {pre_args.config}")
+    print(f"[eval] dataset    : {_resolve(cfg.data.dataset_jsonl)}")
+    print(f"[eval] splits     : {_resolve(cfg.data.splits_json)}  {list(splits)}")
 
     if os.path.isfile(os.path.join(checkpoint_dir, "tokenizer_config.json")):
         tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
@@ -124,10 +143,15 @@ def main() -> None:
     else:
         tokenizer = load_tokenizer(cfg.model.base_model)
 
-    datasets = build_datasets(cfg, tokenizer, splits=("train", "val", "test"))
+    datasets = build_datasets(cfg, tokenizer, splits=splits)
     model, head_info = _load_model(checkpoint_dir, cfg, tokenizer)
 
-    pos_weight = cfg.train.pos_weight or compute_pos_weight(datasets["train"].labels)
+    if cfg.train.pos_weight is not None:
+        pos_weight = cfg.train.pos_weight
+    elif "train" in datasets:
+        pos_weight = compute_pos_weight(datasets["train"].labels)
+    else:
+        pos_weight = 1.0
     trainer = RerankerTrainer(
         model=model,
         args=_build_eval_args(cfg),
@@ -136,11 +160,35 @@ def main() -> None:
         pos_weight=pos_weight,
     )
 
-    for split in ("train", "val", "test"):
-        ds = datasets[split]
-        trainer.compute_metrics = make_compute_metrics(ds.groups)
-        metrics = trainer.evaluate(eval_dataset=ds, metric_key_prefix=split)
-        _print_split_metrics(split, metrics)
+    use_mlflow = not pre_args.no_mlflow
+    if use_mlflow:
+        setup_mlflow(cfg)
+        run_name = pre_args.run_name or (
+            f"eval_{os.path.basename(checkpoint_dir.rstrip('/'))}_{datetime.now():%Y%m%d_%H%M%S}"
+        )
+        mlflow.start_run(run_name=run_name)
+        mlflow.set_tag("stage", "eval")
+        mlflow.set_tag("base_model", cfg.model.base_model)
+        mlflow.set_tag("head_type", head_info.head_type)
+        mlflow.set_tag("eval_checkpoint", checkpoint_dir)
+        mlflow.log_params(to_flat_dict(cfg))
+        mlflow.log_param("eval_checkpoint", checkpoint_dir)
+        mlflow.log_param("eval_splits", ",".join(splits))
+
+    try:
+        for split in splits:
+            ds = datasets[split]
+            trainer.compute_metrics = make_compute_metrics(ds.groups)
+            metrics = trainer.evaluate(eval_dataset=ds, metric_key_prefix=split)
+            _print_split_metrics(split, metrics)
+            if use_mlflow:
+                mlflow.log_metrics({
+                    k: v for k, v in metrics.items()
+                    if isinstance(v, (int, float)) and math.isfinite(v)
+                })
+    finally:
+        if use_mlflow:
+            mlflow.end_run()
 
     print("\n[eval] done")
 

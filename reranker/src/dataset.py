@@ -1,9 +1,9 @@
 """Torch dataset + collator for the reranker.
 
 Each example is a (reference architecture, candidate kernel) pair formatted as a
-single sequence for a cross-encoder. Truncation keeps the full reference where
-possible (up to `reserve_ref_tokens`) and truncates the candidate kernel's tail,
-since kernels can be long and the head carries the imports / structure.
+single sequence for a cross-encoder. The (ref, kernel) -> input_ids encoding
+(including truncation) lives in `reranker.src.encoding.SequenceEncoder`, shared
+with the pairwise dataset so both code paths encode identically.
 """
 
 from __future__ import annotations
@@ -16,13 +16,7 @@ from torch.utils.data import Dataset
 
 from reranker.src.config import _resolve
 from reranker.src.data.splits import load_splits
-
-INSTRUCTION = (
-    "You are judging whether a generated GPU kernel is a correct and faster "
-    "drop-in replacement for the given PyTorch reference architecture.\n"
-    "Reference architecture:\n"
-)
-SEPARATOR = "\n\nCandidate kernel:\n"
+from reranker.src.encoding import INSTRUCTION, SEPARATOR, SequenceEncoder  # noqa: F401
 
 
 def _read_jsonl(path: str) -> list[dict]:
@@ -45,6 +39,7 @@ class RerankerDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.reserve_ref_tokens = reserve_ref_tokens
+        self.encoder = SequenceEncoder(tokenizer, max_length, reserve_ref_tokens)
 
         splits = load_splits(_resolve(splits_json))
         all_rows = _read_jsonl(_resolve(dataset_jsonl))
@@ -54,10 +49,6 @@ class RerankerDataset(Dataset):
         ]
         if not self.rows:
             raise ValueError(f"No rows for split '{split}' — check splits.json / dataset.jsonl")
-
-        # Precompute static instruction / separator token ids (no special tokens).
-        self._instr_ids = tokenizer.encode(INSTRUCTION, add_special_tokens=False)
-        self._sep_ids = tokenizer.encode(SEPARATOR, add_special_tokens=False)
 
     # --- grouping / label helpers (used by compute_metrics) -------------------
     @property
@@ -77,28 +68,7 @@ class RerankerDataset(Dataset):
         return len(self.rows)
 
     def _encode_pair(self, ref_src: str, kernel_src: str) -> list[int]:
-        tok = self.tokenizer
-        ref_ids = tok.encode(ref_src, add_special_tokens=False)
-        kernel_ids = tok.encode(kernel_src, add_special_tokens=False)
-
-        # Terminate each example with a single EOS: the seq-cls head scores the
-        # last non-pad token, so we give every sequence a consistent sentinel.
-        # (Qwen tokenizers no longer expose build_inputs_with_special_tokens, so
-        # we assemble the input ids explicitly rather than relying on it.)
-        eos_id = tok.eos_token_id
-        num_special = 1 if eos_id is not None else 0
-        budget = self.max_length - num_special - len(self._instr_ids) - len(self._sep_ids)
-        budget = max(budget, 0)
-
-        ref_keep = min(len(ref_ids), self.reserve_ref_tokens, budget)
-        ref_ids = ref_ids[:ref_keep]
-        kernel_keep = max(budget - len(ref_ids), 0)
-        kernel_ids = kernel_ids[:kernel_keep]
-
-        content = self._instr_ids + ref_ids + self._sep_ids + kernel_ids
-        if eos_id is not None:
-            content.append(eos_id)
-        return content
+        return self.encoder.encode(ref_src, kernel_src)
 
     def __getitem__(self, idx: int) -> dict:
         row = self.rows[idx]
@@ -110,6 +80,22 @@ class RerankerDataset(Dataset):
         }
 
 
+def pad_sequences(
+    seqs: list[list[int]], pad_id: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-pad a list of token-id sequences; return (input_ids, attention_mask)."""
+    max_len = max(len(s) for s in seqs)
+    input_ids, attention_mask = [], []
+    for s in seqs:
+        pad = max_len - len(s)
+        input_ids.append(s + [pad_id] * pad)
+        attention_mask.append([1] * len(s) + [0] * pad)
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(attention_mask, dtype=torch.long),
+    )
+
+
 class RerankerCollator:
     """Pads a batch of variable-length examples; keeps `labels` as a float tensor."""
 
@@ -119,17 +105,13 @@ class RerankerCollator:
             self.pad_id = tokenizer.eos_token_id
 
     def __call__(self, batch: list[dict]) -> dict:
-        max_len = max(len(ex["input_ids"]) for ex in batch)
-        input_ids, attention_mask, labels = [], [], []
-        for ex in batch:
-            pad = max_len - len(ex["input_ids"])
-            input_ids.append(ex["input_ids"] + [self.pad_id] * pad)
-            attention_mask.append(ex["attention_mask"] + [0] * pad)
-            labels.append(ex["labels"])
+        input_ids, attention_mask = pad_sequences(
+            [ex["input_ids"] for ex in batch], self.pad_id
+        )
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.float),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": torch.tensor([ex["labels"] for ex in batch], dtype=torch.float),
         }
 
 
