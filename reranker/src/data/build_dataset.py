@@ -48,6 +48,10 @@ def build_dataset(cfg: RerankerConfig) -> str:
     from kernelbench.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_dataset
 
     data_cfg = cfg.data
+    if data_cfg.negative_mode not in ("all_negative", "compiled_wrong"):
+        raise ValueError(
+            f"data.negative_mode must be 'all_negative' or 'compiled_wrong', got {data_cfg.negative_mode}"
+        )
     levels = data_cfg.levels_for_run_dirs()
     kb_base = os.path.join(_resolve(data_cfg.kernelbench_dir), "KernelBench")
 
@@ -61,6 +65,7 @@ def build_dataset(cfg: RerankerConfig) -> str:
     level_counts: Counter = Counter()
     rows_written = 0
     missing_kernel = 0
+    dropped_compile_fail = 0
 
     with open(out_path, "w") as out_f:
         for run_dir_rel, level in zip(data_cfg.run_dirs, levels):
@@ -107,6 +112,14 @@ def build_dataset(cfg: RerankerConfig) -> str:
                     runtime = float(runtime) if runtime is not None else None
 
                     lr = compute_label(compiled=compiled, correct=correct)
+
+                    # In compiled_wrong mode, keep positives and compiled-but-wrong
+                    # negatives only; drop compile-failure negatives entirely.
+                    if (data_cfg.negative_mode == "compiled_wrong"
+                            and lr.label == 0 and not compiled):
+                        dropped_compile_fail += 1
+                        continue
+
                     reason_counts[lr.reason] += 1
                     level_counts[level] += 1
                     rows_written += 1
@@ -129,9 +142,12 @@ def build_dataset(cfg: RerankerConfig) -> str:
     pos = reason_counts["compiled_and_correct"]
     print("\n" + "=" * 60)
     print(f"Dataset written: {out_path}")
+    print(f"  negative_mode  : {data_cfg.negative_mode}")
     print(f"  rows           : {rows_written}")
     print(f"  positives      : {pos}  ({100 * pos / max(rows_written, 1):.1f}%)")
     print(f"  negatives      : {rows_written - pos}")
+    if data_cfg.negative_mode == "compiled_wrong":
+        print(f"  dropped (compile-fail negatives): {dropped_compile_fail}")
     print(f"  missing kernels: {missing_kernel} (eval entry but no staged .py)")
     print(f"  per-level rows : {dict(level_counts)}")
     print("  label reasons  :")

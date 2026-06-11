@@ -94,6 +94,16 @@ def main():
             manifest = json.load(f)
 
     stats = {"written": 0, "skipped_size": 0, "skipped_convert": 0, "skipped_smoke": 0, "skipped_exists": 0}
+    # Persistent audit trail of every dropped row so "where did the rest go?" is
+    # always answerable after the run, not just from scrollback.
+    skipped_path = os.path.join(args.out, "skipped.jsonl")
+    skipped_f = open(skipped_path, "w")
+
+    def record_skip(row_id, module_name, reason, detail=""):
+        skipped_f.write(json.dumps({
+            "row_id": row_id, "module_name": module_name,
+            "reason": reason, "detail": detail,
+        }) + "\n")
 
     for row_id in row_ids:
         try:
@@ -107,18 +117,21 @@ def main():
 
         if len(python_code) > args.max_src_chars:
             stats["skipped_size"] += 1
+            record_skip(row_id, module_name, "size", f"{len(python_code)} > {args.max_src_chars}")
             continue
 
         fname = f"{row_id}_{module_name}.py"
         fpath = os.path.join(args.out, fname)
         if os.path.exists(fpath) and not args.overwrite:
             stats["skipped_exists"] += 1
+            record_skip(row_id, module_name, "exists", fname)
             continue
 
         try:
             converted = convert_row(python_code, module_name)
         except ConversionError as e:
             stats["skipped_convert"] += 1
+            record_skip(row_id, module_name, "convert", str(e))
             print(f"[SKIP convert] row {row_id} ({module_name}): {e}")
             continue
 
@@ -126,6 +139,7 @@ def main():
             ok, reason = smoke_test(converted, device=args.smoke_device)
             if not ok:
                 stats["skipped_smoke"] += 1
+                record_skip(row_id, module_name, "smoke", reason)
                 print(f"[SKIP smoke] row {row_id} ({module_name}): {reason}")
                 continue
 
@@ -141,16 +155,32 @@ def main():
         stats["written"] += 1
         print(f"[OK] row {row_id} → {fname}")
 
+    skipped_f.close()
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
+    stats_meta = {
+        "dataset_name": args.dataset_name,
+        "rows_requested": len(row_ids),
+        "max_src_chars": args.max_src_chars,
+        "smoke_test": args.smoke_test,
+        "smoke_device": args.smoke_device,
+        "overwrite": args.overwrite,
+        **stats,
+    }
+    stats_path = os.path.join(args.out, "conversion_stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats_meta, f, indent=2)
+
     print("\nDone.")
     print(
-        f"  written={stats['written']}  skipped_convert={stats['skipped_convert']}  "
-        f"skipped_smoke={stats['skipped_smoke']}  skipped_size={stats['skipped_size']}  "
-        f"skipped_exists={stats['skipped_exists']}"
+        f"  rows_requested={len(row_ids)}  written={stats['written']}  "
+        f"skipped_convert={stats['skipped_convert']}  skipped_smoke={stats['skipped_smoke']}  "
+        f"skipped_size={stats['skipped_size']}  skipped_exists={stats['skipped_exists']}"
     )
-    print(f"  manifest: {manifest_path}")
+    print(f"  manifest : {manifest_path}")
+    print(f"  stats    : {stats_path}")
+    print(f"  skipped  : {skipped_path}  (one JSON line per dropped row with its reason)")
 
 
 if __name__ == "__main__":
