@@ -5,10 +5,14 @@ Reads, for each configured run directory:
   - staged kernel sources      level_{L}_problem_{P}_sample_{S}_kernel.py
 and joins them with:
   - the reference architecture source (from the KernelBench dataset)
+  - the per-problem PyTorch baseline runtime (`data.baseline_timing_json`) to
+    compute a `speedup = baseline / kernel_runtime` for each correct kernel
+    (KernelBench `fast_p` style; None when the kernel is wrong or has no baseline).
 
 Label: positive (1) iff compiled AND correct; negative (0) otherwise.
 
-Emits one JSONL row per evaluated kernel candidate to `data.dataset_jsonl`.
+Emits one JSONL row per evaluated kernel candidate to `data.dataset_jsonl`
+(fields include `runtime`, `runtime_min`, `runtime_std`, `speedup`, `label`).
 
 Usage:
     bash scripts/build_dataset.sh [configs/default.yaml]
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections import Counter
 
@@ -34,6 +39,33 @@ def _add_kernelbench_to_path(kernelbench_dir: str) -> None:
 def _load_json(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
+
+
+def _load_baseline_times(path: str) -> dict[int, dict[int, float]]:
+    """Load the PyTorch-eager baseline runtimes as ``{level: {problem_id: time_ms}}``.
+
+    ``time_ms`` is the baseline's mean wall-clock runtime. The KernelBench timing
+    JSON is keyed by ``"level1"`` ... and, within each level, by problem filename
+    (``"1_Square_matrix_multiplication_.py"``) whose integer prefix is the problem
+    id. Returns ``{}`` (and warns) if the file is missing, so ``speedup`` simply
+    becomes ``None`` everywhere.
+    """
+    if not os.path.isfile(path):
+        print(f"[WARN] baseline timing file not found: {path} — speedup will be None for all rows")
+        return {}
+    raw = _load_json(path)
+    out: dict[int, dict[int, float]] = {}
+    for level_key, problems in raw.items():
+        m = re.match(r"level(\d+)$", str(level_key))
+        if not m or not isinstance(problems, dict):
+            continue
+        per_problem: dict[int, float] = {}
+        for fname, stats in problems.items():
+            pm = re.match(r"(\d+)_", str(fname))
+            if pm and isinstance(stats, dict) and stats.get("mean") is not None:
+                per_problem[int(pm.group(1))] = float(stats["mean"])
+        out[int(m.group(1))] = per_problem
+    return out
 
 
 def _staged_kernel_path(run_dir: str, level: int, problem_id: int, sample_id: int) -> str:
@@ -58,6 +90,9 @@ def build_dataset(cfg: RerankerConfig) -> str:
     out_path = _resolve(data_cfg.dataset_jsonl)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
+    # Per-problem PyTorch baseline runtimes for the speedup grade (listwise).
+    baseline_times = _load_baseline_times(_resolve(data_cfg.baseline_timing_json))
+
     # Cache KernelBench datasets per level (run_dirs may share a level).
     kb_datasets: dict[int, object] = {}
 
@@ -66,6 +101,8 @@ def build_dataset(cfg: RerankerConfig) -> str:
     rows_written = 0
     missing_kernel = 0
     dropped_compile_fail = 0
+    correct_with_speedup = 0
+    correct_without_baseline = 0
 
     with open(out_path, "w") as out_f:
         for run_dir_rel, level in zip(data_cfg.run_dirs, levels):
@@ -95,6 +132,8 @@ def build_dataset(cfg: RerankerConfig) -> str:
                     print(f"  [WARN] problem {problem_id} not in KernelBench level {level}")
                     continue
 
+                baseline_time = baseline_times.get(level, {}).get(problem_id)
+
                 for sample in samples:
                     sample_id = int(sample["sample_id"])
                     kernel_path = _staged_kernel_path(
@@ -110,6 +149,22 @@ def build_dataset(cfg: RerankerConfig) -> str:
                     correct = bool(sample.get("correctness", False))
                     runtime = sample.get("runtime")
                     runtime = float(runtime) if runtime is not None else None
+
+                    rstats = sample.get("runtime_stats") or {}
+                    runtime_min = float(rstats["min"]) if rstats.get("min") is not None else None
+                    runtime_std = float(rstats["std"]) if rstats.get("std") is not None else None
+
+                    # Speedup over the per-problem PyTorch baseline (KernelBench
+                    # fast_p style). Only meaningful for correct kernels with a valid
+                    # runtime and a known baseline; otherwise None (the listwise
+                    # builder drops such candidates rather than guessing a grade).
+                    speedup = None
+                    if correct and runtime is not None and runtime > 0:
+                        if baseline_time is not None:
+                            speedup = baseline_time / runtime
+                            correct_with_speedup += 1
+                        else:
+                            correct_without_baseline += 1
 
                     lr = compute_label(compiled=compiled, correct=correct)
 
@@ -135,19 +190,24 @@ def build_dataset(cfg: RerankerConfig) -> str:
                         "compiled": compiled,
                         "correct": correct,
                         "runtime": runtime,
+                        "runtime_min": runtime_min,
+                        "runtime_std": runtime_std,
+                        "speedup": speedup,
                         "label": lr.label,
                     }
                     out_f.write(json.dumps(row) + "\n")
 
-    pos = reason_counts["compiled_and_correct"]
+    n_correct = reason_counts["compiled_and_correct"]
     print("\n" + "=" * 60)
     print(f"Dataset written: {out_path}")
     print(f"  negative_mode  : {data_cfg.negative_mode}")
     print(f"  rows           : {rows_written}")
-    print(f"  positives      : {pos}  ({100 * pos / max(rows_written, 1):.1f}%)")
-    print(f"  negatives      : {rows_written - pos}")
+    print(f"  positives      : {n_correct}  ({100 * n_correct / max(rows_written, 1):.1f}%)")
+    print(f"  negatives      : {rows_written - n_correct}")
     if data_cfg.negative_mode == "compiled_wrong":
         print(f"  dropped (compile-fail negatives): {dropped_compile_fail}")
+    print(f"  speedup        : {correct_with_speedup}/{n_correct} correct have a baseline "
+          f"({correct_without_baseline} correct lack a baseline -> speedup None)")
     print(f"  missing kernels: {missing_kernel} (eval entry but no staged .py)")
     print(f"  per-level rows : {dict(level_counts)}")
     print("  label reasons  :")

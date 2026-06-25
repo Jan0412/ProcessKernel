@@ -1,0 +1,82 @@
+# Configuration for the LISTWISE (LambdaRank) kernel reranker training pipeline.
+# A copy of pairwise_config.yaml adapted for the listwise ranking loss. The
+# pointwise (default.yaml) and pairwise (pairwise_config.yaml) configs are
+# untouched and remain usable independently.
+# Override any leaf value from the CLI:
+#   bash reranker/scripts/train_listwise_local.sh reranker/configs/listwise_config.yaml listwise.sigma=2.0
+
+data:
+  # Same KernelBench evaluation runs the other pipelines use. The listwise build
+  # reads these rows and forms its own speed-graded lists + fresh train/val split.
+  run_dirs:
+    - ../runs/Qwen3-Coder-30B-A3B-Instruct_level1_triton
+    - ../runs/Qwen3-Coder-Next_level1_triton
+    - ../runs/gemma4_level1_triton_sampled
+    - ../runs/qwen36_coding_level1_triton_sampled
+  level: [1, 1, 1, 1]
+  kernelbench_dir: ..
+  # Dedicated dataset file so dropping compile-fails (compiled_wrong) and adding
+  # the speedup field never clobbers the pointwise/pairwise data/dataset.jsonl.
+  dataset_jsonl: data/dataset_listwise.jsonl
+  # Exclude non-compiling kernels entirely — compilation is a cheap deterministic
+  # post-generation check, so the reranker only ever ranks compiling candidates.
+  negative_mode: compiled_wrong
+  # Per-problem PyTorch-eager baseline runtimes for the speedup grade (KernelBench
+  # fast_p style). Resolved relative to the project root (reranker/).
+  baseline_timing_json: ../timing/A100/baseline_time_torch.json
+
+model:
+  base_model: Qwen/Qwen3-Reranker-0.6B
+  max_length: 4096
+  head_type: seq_cls               # seq_cls | yes_no_lm
+  reserve_ref_tokens: 1024
+  attn_implementation: sdpa
+
+train:
+  # Separate checkpoint dir so the listwise model never clobbers the others.
+  output_dir: data/checkpoints_listwise
+  epochs: 3
+  lr: 1.0e-5
+  # One "example" is a whole candidate list, so the per-device batch counts LISTS;
+  # each list runs up to `listwise.list_size` forward passes. Keep it at 1-2 and
+  # use gradient accumulation to reach the effective list batch size.
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 16   # pointwise eval scores single candidates
+  gradient_accumulation_steps: 16
+  warmup_ratio: 0.01
+  weight_decay: 0.05
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  logging_steps: 5
+  eval_steps: 10
+  save_steps: 10
+  save_total_limit: 2
+  # Select the best checkpoint on the per-problem ranking metric (the real objective).
+  metric_for_best_model: eval_ndcg
+  greater_is_better: true
+  pos_weight: null                 # unused by the listwise loss
+  seed: 42
+  max_steps: -1                    # -1 = full training; set small (e.g. 20) for a smoke test
+  dataloader_num_workers: 8
+
+mlflow:
+  db_file: mlflow.db
+  experiment: KernelReranker_Listwise
+  run_name: null                   # null -> base_model + "listwise" + timestamp
+
+listwise:
+  lists_train_jsonl: data/lists_train.jsonl
+  lists_val_jsonl: data/lists_val.jsonl
+  lists_splits_json: data/lists_splits.json
+  split_ratios: [0.85, 0.15]       # train / val (listwise needs no test set)
+  split_seed: 42
+  stratify_by_level: true
+  list_size: 16                    # L: fixed budget of candidates per problem
+  min_list_size: 2                 # skip problems with fewer (deduped) candidates
+  max_positives: 6                 # cap positives so negatives stay represented
+  speedup_lo: 0.25                 # speedup mapped to p=0 (log2 lower bound)
+  speedup_hi: 2.0                  # speedup mapped to p=1 (log2 upper bound)
+  dedup_by_code_hash: true
+  sigma: 1.0                       # logistic slope in the LambdaRank loss
+  list_seed: 42

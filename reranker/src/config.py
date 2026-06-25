@@ -39,6 +39,10 @@ class DataConfig:
     #   compiled_wrong -> only kernels that compiled but are incorrect (drop
     #                     compile-failure negatives); positives are kept either way.
     negative_mode: str = "all_negative"
+    # Per-problem PyTorch-eager baseline runtimes (KernelBench `timing/<hw>/...`),
+    # joined by build_dataset to emit a `speedup = baseline / kernel_runtime` per
+    # correct candidate. Resolved relative to the project root (reranker/).
+    baseline_timing_json: str = "../timing/A100/baseline_time_torch.json"
 
     def levels_for_run_dirs(self) -> list[int]:
         """Return a per-run-dir level list, broadcasting a scalar `level`."""
@@ -110,6 +114,36 @@ class PairwiseConfig:
 
 
 @dataclass
+class ListwiseConfig:
+    """Listwise (LambdaRank) training settings (used only by reranker.src.listwise.*).
+
+    Reads the same labeled source dataset as the pointwise pipeline
+    (``data.dataset_jsonl``), builds its own fresh problem-level train/val split
+    (no test), and materializes one fixed-size, speed-graded candidate *list* per
+    eligible problem. Relevance: negatives (compiled-but-wrong) get 0; correct
+    kernels get ``1 + p`` where ``p`` is the normalized speedup over the per-problem
+    PyTorch baseline (``data.baseline_timing_json``). Non-compiling kernels are
+    excluded upstream via ``data.negative_mode = compiled_wrong``.
+    """
+
+    lists_train_jsonl: str = "data/lists_train.jsonl"
+    lists_val_jsonl: str = "data/lists_val.jsonl"
+    lists_splits_json: str = "data/lists_splits.json"
+    # Fresh problem-level split (train / val only; listwise needs no test set).
+    split_ratios: list[float] = field(default_factory=lambda: [0.85, 0.15])
+    split_seed: int = 42
+    stratify_by_level: bool = True
+    list_size: int = 16          # L: fixed budget of candidates per problem
+    min_list_size: int = 2       # skip problems with fewer (deduped) candidates
+    max_positives: int = 6       # cap positives so negatives stay represented
+    speedup_lo: float = 0.25     # speedup mapped to p=0 (log2 lower bound)
+    speedup_hi: float = 4.0      # speedup mapped to p=1 (log2 upper bound)
+    dedup_by_code_hash: bool = True
+    sigma: float = 1.0           # logistic slope in the LambdaRank loss
+    list_seed: int = 42
+
+
+@dataclass
 class MLflowConfig:
     db_file: str = "mlflow.db"
     experiment: str = "KernelReranker"
@@ -127,6 +161,7 @@ class RerankerConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     mlflow: MLflowConfig = field(default_factory=MLflowConfig)
     pairwise: PairwiseConfig = field(default_factory=PairwiseConfig)
+    listwise: ListwiseConfig = field(default_factory=ListwiseConfig)
 
 
 def _resolve(path: str) -> str:
