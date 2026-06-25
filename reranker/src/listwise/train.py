@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -115,29 +116,36 @@ def main() -> None:
         eval_lists_dataset=eval_lists,
     )
 
-    with mlflow.start_run(run_name=cfg.mlflow.run_name):
-        mlflow.set_tag("base_model", cfg.model.base_model)
-        mlflow.set_tag("head_type", cfg.model.head_type)
-        mlflow.set_tag("training", "listwise")
-        mlflow.set_tag("loss_type", "lambdarank")
-        mlflow.log_params(to_flat_dict(cfg))
-        mlflow.log_metrics({
-            "data_train_lists": len(train_ds),
-            "data_val_lists": len(eval_lists),
-            "data_val_problems": len(set(val_ds.groups)),
-        })
-        _log_config_artifact(cfg)
+    # Only the main process touches MLflow / writes artifacts — under DDP every
+    # rank runs this script, and racing to create the experiment/run trips a
+    # SQLite UNIQUE constraint. Training itself runs on all ranks.
+    is_main = trainer.is_world_process_zero()
+    run_cm = mlflow.start_run(run_name=cfg.mlflow.run_name) if is_main else contextlib.nullcontext()
+    with run_cm:
+        if is_main:
+            mlflow.set_tag("base_model", cfg.model.base_model)
+            mlflow.set_tag("head_type", cfg.model.head_type)
+            mlflow.set_tag("training", "listwise")
+            mlflow.set_tag("loss_type", "lambdarank")
+            mlflow.log_params(to_flat_dict(cfg))
+            mlflow.log_metrics({
+                "data_train_lists": len(train_ds),
+                "data_val_lists": len(eval_lists),
+                "data_val_problems": len(set(val_ds.groups)),
+            })
+            _log_config_artifact(cfg)
 
         trainer.train()
 
         # Save best model + tokenizer + head metadata, log as an MLflow artifact.
-        final_dir = os.path.join(_resolve(cfg.train.output_dir), "final")
-        trainer.save_model(final_dir)
-        tokenizer.save_pretrained(final_dir)
-        with open(os.path.join(final_dir, "reranker_head.json"), "w") as f:
-            json.dump(dataclasses.asdict(head_info), f)
-        mlflow.log_artifacts(final_dir, artifact_path="model")
-        print(f"[done] best model saved to {final_dir}")
+        if is_main:
+            final_dir = os.path.join(_resolve(cfg.train.output_dir), "final")
+            trainer.save_model(final_dir)
+            tokenizer.save_pretrained(final_dir)
+            with open(os.path.join(final_dir, "reranker_head.json"), "w") as f:
+                json.dump(dataclasses.asdict(head_info), f)
+            mlflow.log_artifacts(final_dir, artifact_path="model")
+            print(f"[done] best model saved to {final_dir}")
 
 
 if __name__ == "__main__":
