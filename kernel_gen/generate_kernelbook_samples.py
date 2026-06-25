@@ -24,7 +24,7 @@ import argparse
 import os
 import sys
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -73,6 +73,34 @@ def main():
     parser.add_argument("--gpu-name", default="A100", help="GPU name for hardware-aware prompt")
     parser.add_argument("--include-hardware", action="store_true", help="Inject GPU hardware context into the prompt")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.92,
+        help="Fraction of total VRAM vLLM may use (default: 0.92). Lower if a "
+             "reranker or other process shares the GPU; raise toward ~0.95 only "
+             "if the model still OOMs on KV cache.",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=16384,
+        help="vLLM max sequence length (default: 16384).",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=32,
+        help="Max concurrent sequences vLLM may process (default: 32). Controls "
+             "CUDA graph capture sizes and sampler warmup cost. Must be >= "
+             "--num-samples. Raise only if you need larger batch sizes.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow executing custom modeling code shipped in the model repo "
+             "(required by e.g. NVIDIA-Nemotron). Only enable for repos you trust.",
+    )
     parser.add_argument("--load-in-4bit", action="store_true", help="4-bit quantization via bitsandbytes")
     parser.add_argument("--output-dir", required=True, help="Output directory (created if missing)")
     parser.add_argument("--skip-existing", action="store_true", help="Skip rows whose sample files already exist")
@@ -122,7 +150,14 @@ def main():
 
     from kernelbench.prompt_constructor_toml import get_prompt_for_backend
 
-    llm = load_model(args.model, load_in_4bit=args.load_in_4bit)
+    llm = load_model(
+        args.model,
+        load_in_4bit=args.load_in_4bit,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        trust_remote_code=args.trust_remote_code,
+        max_num_seqs=args.max_num_seqs,
+    )
 
     for row_id in row_ids:
         try:

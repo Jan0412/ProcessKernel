@@ -9,9 +9,20 @@ Point ``--out`` at the KernelBench local level directory you intend to evaluate
 against, e.g. ``${HOME}/KernelBench/KernelBench/level5``. Then run the generation
 scripts with the same ``--rows`` and evaluate with ``dataset_src=local level=5``.
 
+KernelBook ships every shape as the placeholder value ``4`` (batch and feature dims
+alike), which is far too small to be meaningful on an A100/H100 — kernel-launch
+overhead dominates. By default this converter up-scales those placeholder dims to
+GPU-meaningful sizes (``--scale uniform``), rewriting ``get_inputs`` and
+``get_init_inputs`` together so the shapes stay mutually consistent, while leaving
+genuinely meaningful dims (RGB ``3``, spatial ``64``, ``784``) untouched. With
+``--smoke-test`` it walks a fallback ladder (full → halved → quartered → un-scaled)
+and keeps the largest size whose Model actually runs; the chosen scale is recorded
+per row in the manifest. Pass ``--scale off`` for the original tiny-input behaviour.
+
 Example:
     python convert_kernelbook.py \\
         --rows 0-499 \\
+        --scale uniform \\
         --smoke-test \\
         --out ~/KernelBench/KernelBench/level5
 """
@@ -20,7 +31,13 @@ import argparse
 import json
 import os
 
-from kernelbook_convert import ConversionError, convert_row, smoke_test
+from kernelbook_convert import (
+    DEFAULT_SCALE_BY_RANK,
+    ConversionError,
+    ScaleConfig,
+    SmokeRunner,
+    convert_row,
+)
 
 KERNELBOOK_SPLIT = "train"  # KernelBook ships a single split
 
@@ -61,13 +78,69 @@ def main():
         help="Device for --smoke-test (default: cuda; use 'cpu' to dry-run without a GPU)",
     )
     parser.add_argument(
+        "--smoke-timeout",
+        type=float,
+        default=300.0,
+        help="Per-row time budget in seconds for --smoke-test build+forward; "
+        "rows exceeding it are rejected (default: 300; 0 disables)",
+    )
+    parser.add_argument(
         "--max-src-chars",
         type=int,
         default=24000,
         help="Skip rows whose python_code exceeds this many chars (token-budget guard)",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing problem files")
+    parser.add_argument(
+        "--scale",
+        choices=["uniform", "batch-only", "off"],
+        default="uniform",
+        help="Up-scale KernelBook's placeholder '4' dims to GPU-meaningful sizes. "
+        "'uniform' scales batch+coupled feature dims together (rank-aware, default); "
+        "'batch-only' scales just the leading dim; 'off' keeps the original tiny inputs.",
+    )
+    parser.add_argument(
+        "--placeholder-dim",
+        type=int,
+        default=4,
+        help="The placeholder dim value KernelBook uses for every shape (default: 4)",
+    )
+    parser.add_argument(
+        "--batch-target",
+        type=int,
+        default=2048,
+        help="Leading-dim target for --scale batch-only (default: 2048)",
+    )
+    parser.add_argument(
+        "--scale-by-rank",
+        default=None,
+        help="Override per-rank targets as 'rank:size,...' (e.g. '2:1024,4:32'); "
+        f"defaults to {DEFAULT_SCALE_BY_RANK}",
+    )
+    parser.add_argument(
+        "--scale-fallback",
+        default="1.0,0.5,0.25",
+        help="Comma list of scale factors to try in order before falling back to "
+        "un-scaled inputs, when --smoke-test rejects the up-scaled Model (default: 1.0,0.5,0.25)",
+    )
     args = parser.parse_args()
+
+    scale_by_rank = dict(DEFAULT_SCALE_BY_RANK)
+    if args.scale_by_rank:
+        for part in args.scale_by_rank.split(","):
+            rank, size = part.split(":")
+            scale_by_rank[int(rank)] = int(size)
+
+    def make_scale(factor: float) -> ScaleConfig:
+        return ScaleConfig(
+            placeholder=args.placeholder_dim,
+            mode=args.scale,
+            scale_by_rank=scale_by_rank,
+            batch_target=args.batch_target,
+            factor=factor,
+        )
+
+    fallback_factors = [float(x) for x in args.scale_fallback.split(",")] if args.scale else []
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -85,7 +158,10 @@ def main():
 
     print(f"Output level dir : {args.out}")
     print(f"Rows to convert  : {len(row_ids)}")
-    print(f"Smoke test       : {args.smoke_test} (device={args.smoke_device})")
+    print(
+        f"Smoke test       : {args.smoke_test} (device={args.smoke_device}, "
+        f"timeout={args.smoke_timeout:g}s)"
+    )
 
     manifest_path = os.path.join(args.out, "manifest.json")
     manifest: dict = {}
@@ -93,17 +169,19 @@ def main():
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-    stats = {"written": 0, "skipped_size": 0, "skipped_convert": 0, "skipped_smoke": 0, "skipped_exists": 0}
-    # Persistent audit trail of every dropped row so "where did the rest go?" is
-    # always answerable after the run, not just from scrollback.
-    skipped_path = os.path.join(args.out, "skipped.jsonl")
-    skipped_f = open(skipped_path, "w")
+    stats = {
+        "written": 0,
+        "downscaled": 0,
+        "skipped_size": 0,
+        "skipped_convert": 0,
+        "skipped_smoke": 0,
+        "skipped_exists": 0,
+    }
 
-    def record_skip(row_id, module_name, reason, detail=""):
-        skipped_f.write(json.dumps({
-            "row_id": row_id, "module_name": module_name,
-            "reason": reason, "detail": detail,
-        }) + "\n")
+    # Each row's smoke test runs in an isolated, restartable child process so a
+    # pathological row (OOM, segfault, CUDA abort, or hang) only kills the child
+    # and is recorded as a skip — never the whole run. Reused so CUDA stays warm.
+    runner = SmokeRunner(device=args.smoke_device, timeout=args.smoke_timeout) if args.smoke_test else None
 
     for row_id in row_ids:
         try:
@@ -117,31 +195,51 @@ def main():
 
         if len(python_code) > args.max_src_chars:
             stats["skipped_size"] += 1
-            record_skip(row_id, module_name, "size", f"{len(python_code)} > {args.max_src_chars}")
+            print(f"[SKIP size] row {row_id} ({module_name}): {len(python_code)} > {args.max_src_chars}")
             continue
 
         fname = f"{row_id}_{module_name}.py"
         fpath = os.path.join(args.out, fname)
         if os.path.exists(fpath) and not args.overwrite:
             stats["skipped_exists"] += 1
-            record_skip(row_id, module_name, "exists", fname)
+            print(f"[SKIP exists] row {row_id} ({module_name}): {fname}")
             continue
 
-        try:
-            converted = convert_row(python_code, module_name)
-        except ConversionError as e:
-            stats["skipped_convert"] += 1
-            record_skip(row_id, module_name, "convert", str(e))
-            print(f"[SKIP convert] row {row_id} ({module_name}): {e}")
-            continue
+        # Candidate scale configs, tried in order. Without --smoke-test we can't
+        # validate, so we take the first (most-aggressive) candidate as-is. With it,
+        # we walk the ladder down to un-scaled inputs and keep the first that runs.
+        if args.scale == "off":
+            candidates = [("off", make_scale(1.0))]
+        else:
+            candidates = [(f"{args.scale}x{f:g}", make_scale(f)) for f in fallback_factors]
+            candidates.append(("off", ScaleConfig(placeholder=args.placeholder_dim, mode="off")))
 
-        if args.smoke_test:
-            ok, reason = smoke_test(converted, device=args.smoke_device)
-            if not ok:
-                stats["skipped_smoke"] += 1
-                record_skip(row_id, module_name, "smoke", reason)
-                print(f"[SKIP smoke] row {row_id} ({module_name}): {reason}")
+        converted = None
+        applied = None
+        last_reason = ""
+        for label, cfg in candidates:
+            try:
+                cand = convert_row(python_code, module_name, scale=cfg)
+            except ConversionError as e:
+                last_reason = str(e)
                 continue
+            if not args.smoke_test:
+                converted, applied = cand, label
+                break
+            ok, reason = runner.run(cand)
+            if ok:
+                converted, applied = cand, label
+                break
+            last_reason = reason
+
+        if converted is None:
+            if args.smoke_test:
+                stats["skipped_smoke"] += 1
+                print(f"[SKIP smoke] row {row_id} ({module_name}): {last_reason}")
+            else:
+                stats["skipped_convert"] += 1
+                print(f"[SKIP convert] row {row_id} ({module_name}): {last_reason}")
+            continue
 
         with open(fpath, "w") as f:
             f.write(converted)
@@ -151,11 +249,16 @@ def main():
             "entry_point": row.get("entry_point"),
             "repo_link": row.get("repo_link"),
             "file": fname,
+            "scale": applied,
         }
         stats["written"] += 1
-        print(f"[OK] row {row_id} → {fname}")
+        if applied not in ("off", f"{args.scale}x1"):
+            stats["downscaled"] += 1
+        print(f"[OK] row {row_id} → {fname} (scale={applied})")
 
-    skipped_f.close()
+    if runner is not None:
+        runner.close()
+
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -174,13 +277,13 @@ def main():
 
     print("\nDone.")
     print(
-        f"  rows_requested={len(row_ids)}  written={stats['written']}  "
-        f"skipped_convert={stats['skipped_convert']}  skipped_smoke={stats['skipped_smoke']}  "
-        f"skipped_size={stats['skipped_size']}  skipped_exists={stats['skipped_exists']}"
+        f"  written={stats['written']} (downscaled={stats['downscaled']})  "
+        f"skipped_convert={stats['skipped_convert']}  "
+        f"skipped_smoke={stats['skipped_smoke']}  skipped_size={stats['skipped_size']}  "
+        f"skipped_exists={stats['skipped_exists']}"
     )
     print(f"  manifest : {manifest_path}")
     print(f"  stats    : {stats_path}")
-    print(f"  skipped  : {skipped_path}  (one JSON line per dropped row with its reason)")
 
 
 if __name__ == "__main__":
