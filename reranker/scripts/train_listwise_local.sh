@@ -13,16 +13,9 @@ REPO_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"                      # repo root
 CONFIG="${1:-$PROJECT_ROOT/configs/listwise_config.yaml}"
 shift || true   # remaining args are dotted key=value config overrides
 
-# Memory-friendly defaults for a single consumer GPU. A list = up to list_size
-# forward passes, so the per-device batch is kept at 1 list. Applied before "$@"
-# so CLI wins.
-LOCAL_DEFAULTS=(
-  model.max_length=4096
-  train.per_device_train_batch_size=1
-  train.per_device_eval_batch_size=8
-  train.gradient_accumulation_steps=16
-  listwise.list_size=16
-)
+# The YAML config is the single source of truth. Tune memory/batch settings there
+# (per_device_train_batch_size, gradient_accumulation_steps, list_size, max_length,
+# ...). You can still pass one-off dotted key=value overrides on the CLI ("$@").
 
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -41,7 +34,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
 echo "============================================"
 
 # build_dataset / lists run automatically inside listwise/train.py if artifacts are missing.
-uv run python -m reranker.src.listwise.train --config "$CONFIG" "${LOCAL_DEFAULTS[@]}" "$@"
+uv run python -m reranker.src.listwise.train --config "$CONFIG" "$@"
 
 echo "============================================"
 echo "  End time   : $(date)"
