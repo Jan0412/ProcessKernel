@@ -26,6 +26,8 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 
+unset HF_HUB_ENABLE_HF_TRANSFER 2>/dev/null || true
+
 cd "$REPO_ROOT"
 
 echo "============================================"
@@ -39,7 +41,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
 echo "============================================"
 
 # build_dataset / splits run automatically inside train.py if artifacts are missing.
-uv run python -m reranker.src.train --config "$CONFIG" "${LOCAL_DEFAULTS[@]}" "$@"
+uv run python -m reranker.src.train --config "$CONFIG" "$@"
 
 echo "============================================"
 echo "  End time   : $(date)"

@@ -12,6 +12,7 @@ shift || true   # remaining args are dotted key=value config overrides
 
 # Put the repo root on PYTHONPATH so `reranker.src.*` resolves; src/ for `kernelbench`.
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
+unset HF_HUB_ENABLE_HF_TRANSFER 2>/dev/null || true
 
 cd "$REPO_ROOT"
 

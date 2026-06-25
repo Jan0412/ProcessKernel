@@ -6,31 +6,26 @@ data:
   # Each must contain eval_results.json and the staged level_{L}_problem_{P}_sample_{S}_kernel.py files.
   # Paths are resolved relative to the reranker project root (reranker/).
   run_dirs:
-    - ../runs/Qwen3-Coder-30B-A3B-Instruct_level1_triton
-    # - ../runs/Qwen3-Coder-30B-A3B-Instruct_level2_triton
-    - ../runs/Qwen3-Coder-Next_level1_triton
-    # - ../runs/Qwen3-Coder-Next_level2_triton
-    - ../runs/gemma4_level1_triton_sampled
-    - ../runs/qwen36_coding_level1_triton_sampled
+    - ../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_kernelbook_level5_triton
   # Level each run belongs to — must be a list aligned with run_dirs, or a single int applied to all.
-  level: [1, 1, 1, 1]
+  level: [5]
   # Parent repo root (contains src/ for `import kernelbench` and KernelBench/ dataset dir).
   # Resolved relative to the reranker project root, so ".." = /path/to/KernelBench.
   kernelbench_dir: ..
   # Build artifacts (relative to reranker project root).
-  dataset_jsonl: data/dataset.jsonl
-  splits_json: data/splits.json
+  dataset_jsonl: data/kernelbook_dataset.jsonl
+  splits_json: data/kernelbook_splits.json
   # Problem-level split (all samples of a problem stay together).
-  split_ratios: [0.75, 0.15, 0.15]   # train / val / test
+  split_ratios: [0.70, 0.15, 0.15]   # train / val / test
   split_seed: 42
   stratify_by_level: true
   # Which negatives to include:
   #   all_negative   -> all non-(compiled & correct) kernels (default)
   #   compiled_wrong -> only compiled-but-incorrect negatives (drop compile failures)
-  negative_mode: all_negative
+  negative_mode: compiled_wrong
 
 model:
-  base_model: Qwen/Qwen3-Reranker-0.6B
+  base_model: Qwen/Qwen3-Reranker-4B
   max_length: 4096
   head_type: seq_cls               # seq_cls | yes_no_lm
   # Truncation: keep the full reference architecture, truncate the candidate kernel tail.
@@ -39,11 +34,11 @@ model:
 
 train:
   output_dir: data/checkpoints
-  epochs: 3
+  epochs: 5
   lr: 1.0e-5
-  per_device_train_batch_size: 16
-  per_device_eval_batch_size: 16
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 2
   warmup_ratio: 0.01
   weight_decay: 0.05
   bf16: true
@@ -53,7 +48,7 @@ train:
   eval_steps: 10
   save_steps: 10
   save_total_limit: 2
-  metric_for_best_model: eval_pr_auc
+  metric_for_best_model: eval_ndcg
   greater_is_better: true
   # pos_weight for BCEWithLogitsLoss; null -> computed from train-set class balance.
   pos_weight: null
@@ -63,5 +58,5 @@ train:
 
 mlflow:
   db_file: mlflow.db               # SQLite backend, relative to project root (auto-created on first run)
-  experiment: KernelReranker
+  experiment: KernelReranker_KernelBook
   run_name: null                   # null -> derived from base_model + timestamp

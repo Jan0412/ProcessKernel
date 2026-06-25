@@ -7,8 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../kernel_gen"
 
 MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-OUTPUT_DIR="$SCRIPT_DIR/../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_reranked_level2_triton"
-RERANKER_CHECKPOINT="/path/to/ProcessKernel/mlruns/1/17c0f8c1b9a84fa697432b496694ad39/artifacts/model"
+OUTPUT_DIR="$SCRIPT_DIR/../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_kernelbook_reranked_bce_think_level1_triton"
+RERANKER_CHECKPOINT="/path/to/ProcessKernel/mlruns/2/0ff2aab90bdc432d88e3a1263cef2299/artifacts/model"
 
 echo "============================================"
 echo "  Start time  : $(date)"
@@ -19,13 +19,15 @@ echo "============================================"
 python generate_kernels_reranked.py \
     --model "$MODEL" \
     --output-dir "$OUTPUT_DIR" \
-    --level 2 \
+    --level 1 \
     --all \
     --num-samples 10 \
     --backend triton \
     --option one_shot \
-    --gpu-name A100 \
+    --gpu-name L40S \
     --max-new-tokens 16384 \
+    --temperature 0.3 \
+    --think-temperature 1.0 \
     --reranker-checkpoint "$RERANKER_CHECKPOINT" \
     --reranker-device cuda:0 \
     --skip-existing

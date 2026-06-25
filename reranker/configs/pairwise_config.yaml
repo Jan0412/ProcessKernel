@@ -8,13 +8,10 @@ data:
   # Same labeled source dataset the pointwise pipeline produces. The pairwise
   # build reads these rows and forms its own pairs + fresh train/val split.
   run_dirs:
-    - ../runs/Qwen3-Coder-30B-A3B-Instruct_level1_triton
-    - ../runs/Qwen3-Coder-Next_level1_triton
-    - ../runs/gemma4_level1_triton_sampled
-    - ../runs/qwen36_coding_level1_triton_sampled
-  level: [1, 1, 1, 1]
+    - ../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_kernelbook_level5_triton
+  level: [5]
   kernelbench_dir: ..
-  dataset_jsonl: data/dataset.jsonl
+  dataset_jsonl: data/kernelbook_pair_dataset.jsonl
   # NOTE: the pointwise train/val/test split fields (splits_json, split_ratios,
   # split_seed, stratify_by_level) are intentionally omitted — the pairwise path
   # builds its own train/val split under `pairwise:` below. build_dataset only
@@ -30,11 +27,11 @@ model:
 train:
   # Separate checkpoint dir so the pairwise model never clobbers the pointwise one.
   output_dir: data/checkpoints_pairwise
-  epochs: 3
+  epochs: 5
   lr: 1.0e-5
-  per_device_train_batch_size: 8   # a pair = 2 forward passes, so keep this modest
-  per_device_eval_batch_size: 16
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 32   # a pair = 2 forward passes, so keep this modest
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 2
   warmup_ratio: 0.01
   weight_decay: 0.05
   bf16: true
