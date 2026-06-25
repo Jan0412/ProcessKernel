@@ -64,16 +64,42 @@ def problem_id_from_name(name: str, fallback: int) -> int:
     return int(match.group(1)) if match else fallback
 
 
-def load_model(model_id: str, load_in_4bit: bool):
+def load_model(
+    model_id: str,
+    load_in_4bit: bool,
+    gpu_memory_utilization: float = 0.92,
+    max_model_len: int = 16384,
+    trust_remote_code: bool = False,
+    max_num_seqs: int = 32,
+):
     from vllm import LLM
 
-    # The reranker is loaded first and occupies ~8 GiB. vLLM measures its budget
-    # as a fraction of *total* VRAM, so utilization must stay below the free
-    # fraction (≈39/47 ≈ 0.82 here) or startup fails.
+    # gpu_memory_utilization is the fraction of *total* VRAM vLLM may use for
+    # weights + activations + KV cache. Large models (e.g. Qwen3-Next 80B, whose
+    # bf16 weights alone are ~74 GiB/GPU under TP=2) need this high or the KV
+    # cache budget goes negative and startup fails with "No available memory for
+    # the cache blocks". When a separate reranker shares the GPU, lower it so the
+    # sum of both processes stays under 1.0.
+    #
+    # max_num_seqs controls two expensive startup operations:
+    #   1. CUDA graph capture — vLLM captures one graph per batch size up to this
+    #      value; the default (1024) creates 80+ graphs whose combined memory pool
+    #      OOMs on tight-memory models like Qwen3-Next.
+    #   2. Sampler warmup — runs a dummy forward with max_num_seqs requests;
+    #      the logit tensor [max_num_seqs, vocab_size] + topk scratch is ~1.5 GiB
+    #      at 1024 seqs (enough to OOM gpt-oss-120b).
+    # 32 is well above our per-problem sample count (10) and avoids both issues.
+    num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
     kwargs = dict(
         dtype="auto",
-        max_model_len=16384,
-        gpu_memory_utilization=0.80,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=num_gpus,
+        trust_remote_code=trust_remote_code,
+        max_num_seqs=max_num_seqs,
+        # The custom CUDA IPC all-reduce kernel fails with 'invalid argument'
+        # on H100 nodes without NVLink IPC support. NCCL is always correct.
+        disable_custom_all_reduce=True,
     )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"
