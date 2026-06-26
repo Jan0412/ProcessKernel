@@ -32,13 +32,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import random
 import sys
 from collections import defaultdict
 
 from reranker.src.config import RerankerConfig, _resolve, load_config
+from reranker.src.data.labels import speed_p
 
 
 def _read_jsonl(path: str) -> list[dict]:
@@ -87,15 +87,6 @@ def _write_splits(assignment: dict, splits_path: str) -> None:
 
 
 # --- relevance + list construction -------------------------------------------
-def _speed_p(speedup: float, lo: float, hi: float) -> float:
-    """Map an (absolute) speedup over the baseline to p in [0, 1] on a log2 scale.
-
-    lo -> 0, hi -> 1, clamped. e.g. lo=0.25x, hi=4x => 1x maps to p=0.5.
-    """
-    lg, llo, lhi = math.log2(speedup), math.log2(lo), math.log2(hi)
-    return min(1.0, max(0.0, (lg - llo) / (lhi - llo)))
-
-
 def _code_hash(src: str) -> str:
     return hashlib.sha1(src.encode("utf-8", "ignore")).hexdigest()
 
@@ -132,7 +123,7 @@ def _build_list_for_problem(rows: list[dict], lw, rng: random.Random) -> list[di
             su = r.get("speedup")
             if su is None or su <= 0:
                 continue
-            positives.append((r, 1.0 + _speed_p(su, lw.speedup_lo, lw.speedup_hi)))
+            positives.append((r, 1.0 + speed_p(su, lw.speedup_lo, lw.speedup_hi)))
     negatives = [r for r in compiling if r["label"] == 0]
 
     if not positives:

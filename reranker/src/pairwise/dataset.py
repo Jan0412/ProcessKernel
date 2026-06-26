@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import torch
 from torch.utils.data import Dataset
 
 from reranker.src.config import _resolve
@@ -66,6 +67,7 @@ class PairwiseDataset(Dataset):
         return {
             "pos_input_ids": self.encoder.encode(pos["ref_arch_src"], pos["kernel_src"]),
             "neg_input_ids": self.encoder.encode(neg["ref_arch_src"], neg["kernel_src"]),
+            "weight": float(pair.get("weight", 1.0)),
         }
 
 
@@ -85,4 +87,5 @@ class PairwiseCollator:
             "pos_attention_mask": pos_mask,
             "neg_input_ids": neg_ids,
             "neg_attention_mask": neg_mask,
+            "weight": torch.tensor([ex["weight"] for ex in batch], dtype=torch.float),
         }

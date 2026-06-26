@@ -64,8 +64,16 @@ pairwise:
   split_ratios: [0.85, 0.15]       # train / val (pairwise needs no test set)
   split_seed: 42
   stratify_by_level: true
-  pair_mode: compiled_wrong        # compiled_wrong | all_negative
+  pair_mode: compiled_wrong        # compiled_wrong | all_negative | speed
   max_negatives_per_positive: null # null = full cross product (P x N per problem)
   loss_type: logistic              # logistic | margin
   margin: 1.0
   pair_seed: 42
+  # --- `speed` pair_mode only (fast_p) -------------------------------------
+  # Grade compiling kernels like listwise: wrong -> rel 0, correct -> rel = 1 + p
+  # where p = normalized speedup over the per-problem PyTorch baseline. Every pair
+  # with a relevance gap >= min_rel_gap is emitted (correct>wrong AND fast>slow).
+  speedup_lo: 0.25                 # speedup mapped to p=0 (log2 lower bound)
+  speedup_hi: 4.0                  # speedup mapped to p=1 (log2 upper bound)
+  min_rel_gap: 0.0                 # raise (e.g. 0.2) to drop near-tie speed pairs
+  weighted_loss: false             # true -> RankNet loss weighted by each pair's rel gap

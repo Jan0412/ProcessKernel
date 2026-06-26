@@ -106,11 +106,17 @@ class PairwiseConfig:
     split_ratios: list[float] = field(default_factory=lambda: [0.85, 0.15])
     split_seed: int = 42
     stratify_by_level: bool = True
-    pair_mode: str = "compiled_wrong"        # compiled_wrong | all_negative
+    pair_mode: str = "compiled_wrong"        # compiled_wrong | all_negative | speed
     max_negatives_per_positive: Optional[int] = None  # None = full cross product
     loss_type: str = "logistic"              # logistic | margin
     margin: float = 1.0
     pair_seed: int = 42
+    # `speed` pair_mode (fast_p): grade compiling kernels like listwise
+    # (wrong -> 0, correct -> 1 + speed_p) and pair every rel gap >= min_rel_gap.
+    speedup_lo: float = 0.25      # speedup mapped to p=0 (log2 lower bound)
+    speedup_hi: float = 4.0       # speedup mapped to p=1 (log2 upper bound)
+    min_rel_gap: float = 0.0      # min relevance difference to form a pair
+    weighted_loss: bool = False   # optional: weight each pair's loss by its rel gap
 
 
 @dataclass

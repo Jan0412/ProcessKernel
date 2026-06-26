@@ -30,6 +30,7 @@ import sys
 from collections import Counter, defaultdict
 
 from reranker.src.config import RerankerConfig, _resolve, load_config
+from reranker.src.data.labels import speed_p
 
 
 def _read_jsonl(path: str) -> list[dict]:
@@ -128,9 +129,84 @@ def _emit_pairs_for_split(
                     "pair_mode": pair_mode,
                     "pos": _ref(pos),
                     "neg": _ref(neg),
+                    "weight": 1.0,
                 }) + "\n")
                 n_pairs += 1
     return n_pairs, n_pos_used, n_pos_no_pair
+
+
+def _graded_candidates(rows: list[dict], lo: float, hi: float) -> list[tuple[dict, float]]:
+    """Compiling kernels with graded relevance: wrong -> 0, correct -> 1 + speed_p.
+
+    Mirrors the listwise grading exactly. Correct kernels lacking a valid baseline
+    speedup are dropped (never guessed); non-compiling kernels are excluded.
+    """
+    out: list[tuple[dict, float]] = []
+    for r in rows:
+        if not r.get("compiled"):
+            continue
+        if r["label"] == 1:
+            su = r.get("speedup")
+            if su is None or su <= 0:
+                continue
+            out.append((r, 1.0 + speed_p(su, lo, hi)))
+        else:  # compiled-but-wrong
+            out.append((r, 0.0))
+    return out
+
+
+def _emit_graded_pairs_for_split(
+    by_problem: dict[tuple, list[dict]],
+    split_problems: set[tuple],
+    lo: float,
+    hi: float,
+    min_rel_gap: float,
+    max_neg: int | None,
+    rng: random.Random,
+    out_f,
+) -> tuple[int, int, int]:
+    """Write speed-graded (higher-rel, lower-rel) pairs for `split_problems`.
+
+    Each candidate acts as an anchor (positive) against every strictly-lower-rel
+    partner whose relevance gap is at least `min_rel_gap`. The gap is stored as the
+    pair `weight` (used only when pairwise.weighted_loss is on). This subsumes both
+    correct>wrong and fast-correct>slow-correct pairs.
+
+    Returns (n_pairs, n_anchors_used, n_problems_skipped).
+    """
+    n_pairs = n_anchors = n_skipped = 0
+    for key in split_problems:
+        cands = _graded_candidates(by_problem.get(key, []), lo, hi)
+        if len(cands) < 2:
+            n_skipped += 1
+            continue
+        level, problem_id = key
+        emitted_here = 0
+        for hi_row, hi_rel in cands:
+            partners = [
+                (lo_row, hi_rel - lo_rel)
+                for lo_row, lo_rel in cands
+                if hi_rel - lo_rel > 0 and hi_rel - lo_rel >= min_rel_gap
+            ]
+            if not partners:
+                continue
+            if max_neg is not None and len(partners) > max_neg:
+                partners = rng.sample(partners, max_neg)
+            n_anchors += 1
+            for lo_row, gap in partners:
+                out_f.write(json.dumps({
+                    "level": level,
+                    "problem_id": problem_id,
+                    "pair_mode": "speed",
+                    "pos": _ref(hi_row),
+                    "neg": _ref(lo_row),
+                    "weight": round(float(gap), 6),
+                }) + "\n")
+                n_pairs += 1
+                emitted_here += 1
+        if emitted_here == 0:
+            n_skipped += 1
+    return n_pairs, n_anchors, n_skipped
 
 
 def build_pairs(cfg: RerankerConfig) -> tuple[str, str, str]:
@@ -163,29 +239,41 @@ def build_pairs(cfg: RerankerConfig) -> tuple[str, str, str]:
     print(f"\n[pairs] source        : {source_path}  ({len(rows)} rows)")
     print(f"[pairs] pair_mode     : {pw.pair_mode}")
     print(f"[pairs] max_neg/pos   : {pw.max_negatives_per_positive}")
+    if pw.pair_mode == "speed":
+        print(f"[pairs] speedup map   : {pw.speedup_lo}x -> 0 .. {pw.speedup_hi}x -> 1  "
+              f"(rel = 1 + p); min_rel_gap {pw.min_rel_gap}")
     print(f"[pairs] problems      : train {len(train_problems)} / val {len(val_problems)}")
+
+    def _emit(problems, f) -> tuple[int, int, int]:
+        if pw.pair_mode == "speed":
+            return _emit_graded_pairs_for_split(
+                by_problem, problems, pw.speedup_lo, pw.speedup_hi,
+                pw.min_rel_gap, pw.max_negatives_per_positive, pair_rng, f,
+            )
+        return _emit_pairs_for_split(
+            by_problem, problems, pw.pair_mode, pw.max_negatives_per_positive, pair_rng, f,
+        )
 
     stats = {}
     with open(train_path, "w") as f:
-        stats["train"] = _emit_pairs_for_split(
-            by_problem, train_problems, pw.pair_mode, pw.max_negatives_per_positive, pair_rng, f
-        )
+        stats["train"] = _emit(train_problems, f)
     with open(val_path, "w") as f:
-        stats["val"] = _emit_pairs_for_split(
-            by_problem, val_problems, pw.pair_mode, pw.max_negatives_per_positive, pair_rng, f
-        )
+        stats["val"] = _emit(val_problems, f)
 
     print("\n" + "=" * 60)
-    for split, (n_pairs, n_pos_used, n_pos_no_pair) in stats.items():
+    for split, (n_pairs, n_used, n_no_pair) in stats.items():
         path = train_path if split == "train" else val_path
-        print(f"  {split:5s}: {n_pairs} pairs  "
-              f"({n_pos_used} positives paired, {n_pos_no_pair} positives with no eligible negative)")
+        if pw.pair_mode == "speed":
+            detail = f"({n_used} anchors paired, {n_no_pair} problems skipped — too few / all-equal)"
+        else:
+            detail = f"({n_used} positives paired, {n_no_pair} positives with no eligible negative)"
+        print(f"  {split:5s}: {n_pairs} pairs  {detail}")
         print(f"         -> {path}")
     print(f"  splits -> {splits_path}")
     print("=" * 60)
 
     if stats["train"][0] == 0:
-        print("[ERROR] 0 training pairs written. Check pair_mode / dataset labels.")
+        print("[ERROR] 0 training pairs written. Check pair_mode / speedup coverage / dataset labels.")
         sys.exit(1)
     return train_path, val_path, splits_path
 

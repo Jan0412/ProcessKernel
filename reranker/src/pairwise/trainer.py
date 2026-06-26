@@ -30,6 +30,7 @@ class PairwiseTrainer(RerankerTrainer):
         *args,
         loss_type: str = "logistic",
         margin: float = 1.0,
+        weighted: bool = False,
         pair_collator=None,
         eval_pairs_dataset=None,
         **kwargs,
@@ -39,6 +40,7 @@ class PairwiseTrainer(RerankerTrainer):
             raise ValueError(f"loss_type must be one of {LOSS_TYPES}, got {loss_type}")
         self._loss_type = loss_type
         self._margin = margin
+        self._weighted = weighted
         # `self.data_collator` (passed in) is the pointwise collator used for eval;
         # the pairwise collator is swapped in for the train dataloader.
         self._point_collator = self.data_collator
@@ -60,14 +62,20 @@ class PairwiseTrainer(RerankerTrainer):
         return pos_logits, neg_logits
 
     def _pairwise_loss(self, diff: torch.Tensor) -> torch.Tensor:
+        """Per-pair loss (no reduction) over the score difference s_pos - s_neg."""
         if self._loss_type == "logistic":
-            return F.softplus(-diff).mean()
-        return F.relu(self._margin - diff).mean()  # margin
+            return F.softplus(-diff)
+        return F.relu(self._margin - diff)  # margin
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         pos_logits, neg_logits = self._forward_pair(model, inputs)
         diff = pos_logits - neg_logits
-        loss = self._pairwise_loss(diff)
+        losses = self._pairwise_loss(diff)
+        if self._weighted and "weight" in inputs:
+            w = inputs["weight"]
+            loss = (losses * w).sum() / w.sum().clamp_min(1e-8)
+        else:
+            loss = losses.mean()
         return (loss, {"diff": diff}) if return_outputs else loss
 
     # --- dataloaders: pairwise for train, pointwise for eval ------------------
@@ -109,7 +117,8 @@ class PairwiseTrainer(RerankerTrainer):
             batch = {k: v.to(device) for k, v in batch.items()}
             pos_logits, neg_logits = self._forward_pair(model, batch)
             diff = pos_logits - neg_logits
-            total_loss += self._pairwise_loss(diff).item() * diff.numel()
+            # Reported eval loss is unweighted (plain mean) for comparability.
+            total_loss += self._pairwise_loss(diff).sum().item()
             correct += (diff > 0).sum().item()
             n += diff.numel()
         if was_training:
