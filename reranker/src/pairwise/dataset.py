@@ -72,7 +72,14 @@ class PairwiseDataset(Dataset):
 
 
 class PairwiseCollator:
-    """Pads the positive and negative sides of a pair batch independently."""
+    """Stacks the positive and negative sides into one ``(2B, L)`` batch.
+
+    Both sides are padded to a single common length and concatenated as
+    ``[pos_0..pos_{B-1}, neg_0..neg_{B-1}]`` so the trainer scores a pair with a
+    **single** forward pass (then splits the logits back). One forward keeps each
+    parameter used exactly once per step, which DDP + gradient checkpointing
+    require (two separate forwards mark params ready twice and crash under DDP).
+    """
 
     def __init__(self, tokenizer):
         self.pad_id = tokenizer.pad_token_id
@@ -80,12 +87,10 @@ class PairwiseCollator:
             self.pad_id = tokenizer.eos_token_id
 
     def __call__(self, batch: list[dict]) -> dict:
-        pos_ids, pos_mask = pad_sequences([ex["pos_input_ids"] for ex in batch], self.pad_id)
-        neg_ids, neg_mask = pad_sequences([ex["neg_input_ids"] for ex in batch], self.pad_id)
+        seqs = [ex["pos_input_ids"] for ex in batch] + [ex["neg_input_ids"] for ex in batch]
+        input_ids, attention_mask = pad_sequences(seqs, self.pad_id)
         return {
-            "pos_input_ids": pos_ids,
-            "pos_attention_mask": pos_mask,
-            "neg_input_ids": neg_ids,
-            "neg_attention_mask": neg_mask,
+            "input_ids": input_ids,            # (2B, L): rows [0:B]=pos, [B:2B]=neg
+            "attention_mask": attention_mask,
             "weight": torch.tensor([ex["weight"] for ex in batch], dtype=torch.float),
         }

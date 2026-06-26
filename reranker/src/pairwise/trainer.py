@@ -49,16 +49,18 @@ class PairwiseTrainer(RerankerTrainer):
 
     # --- pairwise loss helpers ------------------------------------------------
     def _forward_pair(self, model, inputs) -> tuple[torch.Tensor, torch.Tensor]:
-        pos_out = model(
-            input_ids=inputs["pos_input_ids"],
-            attention_mask=inputs["pos_attention_mask"],
+        """One forward over the stacked ``[pos; neg]`` batch, split back per side.
+
+        The collator concatenates the two sides into a single ``(2B, L)`` batch
+        (first B = positives, last B = negatives), so each parameter is used
+        exactly once per step — required for DDP + gradient checkpointing.
+        """
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
         )
-        pos_logits = self._head_info.extract_logits(pos_out, inputs["pos_attention_mask"])
-        neg_out = model(
-            input_ids=inputs["neg_input_ids"],
-            attention_mask=inputs["neg_attention_mask"],
-        )
-        neg_logits = self._head_info.extract_logits(neg_out, inputs["neg_attention_mask"])
+        logits = self._head_info.extract_logits(outputs, inputs["attention_mask"])  # (2B,)
+        pos_logits, neg_logits = logits.chunk(2, dim=0)
         return pos_logits, neg_logits
 
     def _pairwise_loss(self, diff: torch.Tensor) -> torch.Tensor:
