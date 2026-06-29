@@ -7,8 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../kernel_gen"
 
 MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-OUTPUT_DIR="$SCRIPT_DIR/../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_kernelbook_reranked_bce_think_level1_triton"
-RERANKER_CHECKPOINT="/path/to/ProcessKernel/mlruns/2/0ff2aab90bdc432d88e3a1263cef2299/artifacts/model"
+OUTPUT_DIR="$SCRIPT_DIR/../runs/Qwen3-Coder-30B-A3B-Instruct-FP8_kernelbook_reranked_pair_fastp_think_level2_triton"
+RERANKER_CHECKPOINT="/path/to/ProcessKernel/mlruns/3/3160efcda6304b909af4ab29b87f7384/artifacts/model"
 
 echo "============================================"
 echo "  Start time  : $(date)"
@@ -19,7 +19,7 @@ echo "============================================"
 python generate_kernels_reranked.py \
     --model "$MODEL" \
     --output-dir "$OUTPUT_DIR" \
-    --level 1 \
+    --level 2 \
     --all \
     --num-samples 10 \
     --backend triton \

@@ -99,7 +99,8 @@ def load_model(model_id: str, load_in_4bit: bool):
 
 
 def generate_samples(
-    llm, prompt: str, max_new_tokens: int, num_samples: int, temperature: float
+    llm, prompt: str, max_new_tokens: int, num_samples: int, temperature: float,
+    think_temperature: float | None = None,
 ) -> list[str]:
     from vllm import SamplingParams
 
@@ -108,8 +109,12 @@ def generate_samples(
         "architecture to get speedups.\n\n"
         "You have complete freedom to choose the set of operators you want to replace. "
         "You may replace some operators with custom kernels and leave others unchanged.\n\n"
-        "You need to provide the complete Python code wrapped in a Python code block "
-        "that starts with ```python and ends with ```."
+        "Before writing any code, first think through and lay out a plan. Identify which "
+        "operators are the most promising to replace, explain why, and describe the kernel "
+        "strategy you intend to use. Keep this planning section concise.\n\n"
+        "After you have written out the plan, implement it. You need to provide the "
+        "complete Python code wrapped in a Python code block that starts with ```python "
+        "and ends with ```."
     )
 
     messages = [
@@ -121,6 +126,36 @@ def generate_samples(
     formatted_prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+
+    if think_temperature is not None:
+        CODE_FENCE = "```python"
+        PLAN_PREFIX = "## Plan\n"
+        plan_prompt = formatted_prompt + PLAN_PREFIX
+
+        think_params = SamplingParams(
+            temperature=think_temperature,
+            max_tokens=max_new_tokens,
+            stop=[CODE_FENCE],
+            include_stop_str_in_output=False,
+            n=1,
+        )
+        think_outputs = llm.generate([plan_prompt] * num_samples, think_params)
+        print(f"  plan lengths (chars): {[len(o.outputs[0].text) for o in think_outputs]}")
+
+        output_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+            n=1,
+        )
+        continuations = [
+            plan_prompt + out.outputs[0].text + CODE_FENCE
+            for out in think_outputs
+        ]
+        final_outputs = llm.generate(continuations, output_params)
+        return [
+            PLAN_PREFIX + out_think.outputs[0].text + CODE_FENCE + out_code.outputs[0].text
+            for out_think, out_code in zip(think_outputs, final_outputs)
+        ]
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -225,6 +260,7 @@ def main():
     parser.add_argument("--dataset-name", default="ScalingIntelligence/KernelBench")
     parser.add_argument("--num-samples", type=int, default=8, help="Number of candidates to generate per problem (default: 8)")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature (default: 0.8)")
+    parser.add_argument("--think-temperature", type=float, default=None, help="If set, enables two-pass generation split at the ```python fence: this temperature is used for the reasoning/prose before the code, --temperature is used for the code itself")
     # Reranker args
     parser.add_argument(
         "--reranker-checkpoint",
@@ -274,7 +310,7 @@ def main():
     print_generation_summary(
         config,
         keys=["model", "dataset_name", "level", "num_problems", "num_samples",
-              "temperature", "backend", "option", "max_new_tokens",
+              "temperature", "think_temperature", "backend", "option", "max_new_tokens",
               "reranker_checkpoint_resolved", "reranker_max_length", "output_dir"],
         title="KernelBench generation (reranked)",
     )
@@ -314,7 +350,7 @@ def main():
             gpu_name=args.gpu_name if args.include_hardware else None,
         )
 
-        raws = generate_samples(llm, prompt, args.max_new_tokens, args.num_samples, args.temperature)
+        raws = generate_samples(llm, prompt, args.max_new_tokens, args.num_samples, args.temperature, args.think_temperature)
         kernel_codes = [extract_code_block(raw) for raw in raws]
 
         scores = score_kernels(
