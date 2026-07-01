@@ -29,7 +29,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
-    "transformers>=5.9.0",
+    "transformers>=4.56.0,<5",
     "uvloop>=0.22.1",
 ]
 
