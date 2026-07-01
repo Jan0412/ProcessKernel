@@ -6,18 +6,23 @@
 #   bash reranker/scripts/train_listwise_local.sh reranker/configs/listwise_config.yaml listwise.sigma=2.0
 
 data:
-  # Same KernelBench evaluation runs the other pipelines use. The listwise build
-  # reads these rows and forms its own speed-graded lists + fresh train/val split.
+  # New large level 5/6 kernelbook runs (~500k kernels). These live in the sibling
+  # KernelBench checkout, not the repo's own runs/, so paths + kernelbench_dir are
+  # absolute. The listwise build reads these and forms speed-graded lists.
   run_dirs:
-    - ../runs/Qwen3-Coder-30B-A3B-Instruct_level1_triton
-    - ../runs/Qwen3-Coder-Next_level1_triton
-    - ../runs/gemma4_level1_triton_sampled
-    - ../runs/qwen36_coding_level1_triton_sampled
-  level: [1, 1, 1, 1]
-  kernelbench_dir: ..
+    - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kernelbook_level5_triton
+    - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kernelbook_level6_think_triton
+    - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kernelbook_level6_think_triton_v2
+    - /path/to/workdir/KernelBench/runs/Qwen3-Coder-30B-A3B-Instruct_kernelbook_level6_think_triton
+    - /path/to/workdir/KernelBench/runs/Qwen3-Coder-30B-A3B-Instruct_kernelbook_level6_triton
+    - /path/to/workdir/KernelBench/runs/Qwen3-Coder-Next_kernelbook_level5_triton
+  level: [5, 6, 6, 6, 6, 5]
+  # The sibling KernelBench checkout these runs were generated/evaluated against
+  # (its KernelBench/ dataset dir resolves problem_id -> ref_arch).
+  kernelbench_dir: /path/to/workdir/KernelBench
   # Dedicated dataset file so dropping compile-fails (compiled_wrong) and adding
   # the speedup field never clobbers the pointwise/pairwise data/dataset.jsonl.
-  dataset_jsonl: data/dataset_listwise.jsonl
+  dataset_jsonl: data/dataset_listwise_l56.jsonl
   # Exclude non-compiling kernels entirely — compilation is a cheap deterministic
   # post-generation check, so the reranker only ever ranks compiling candidates.
   negative_mode: compiled_wrong
@@ -34,7 +39,7 @@ model:
 
 train:
   # Separate checkpoint dir so the listwise model never clobbers the others.
-  output_dir: data/checkpoints_listwise
+  output_dir: data/checkpoints_listwise_l56
   epochs: 3
   lr: 1.0e-5
   # One "example" is a whole candidate list, so the per-device batch counts LISTS;
@@ -52,8 +57,10 @@ train:
   eval_steps: 10
   save_steps: 10
   save_total_limit: 2
-  # Select the best checkpoint on the per-problem ranking metric (the real objective).
-  metric_for_best_model: eval_ndcg
+  # Select on the graded per-problem ranking metric (rewards ranking FAST correct
+  # kernels on top, not just correct-vs-wrong). Alternatives: eval_fast_at1 (higher
+  # better) or a low eval_speed_regret_at1. Eval is listwise-only now (no binary pass).
+  metric_for_best_model: eval_list_ndcg_graded
   greater_is_better: true
   pos_weight: null                 # unused by the listwise loss
   seed: 42
@@ -66,17 +73,21 @@ mlflow:
   run_name: null                   # null -> base_model + "listwise" + timestamp
 
 listwise:
-  lists_train_jsonl: data/lists_train.jsonl
-  lists_val_jsonl: data/lists_val.jsonl
-  lists_splits_json: data/lists_splits.json
+  lists_train_jsonl: data/lists_train_l56.jsonl
+  lists_val_jsonl: data/lists_val_l56.jsonl
+  lists_splits_json: data/lists_splits_l56.json
   split_ratios: [0.85, 0.15]       # train / val (listwise needs no test set)
   split_seed: 42
   stratify_by_level: true
   list_size: 16                    # L: fixed budget of candidates per problem
   min_list_size: 2                 # skip problems with fewer (deduped) candidates
-  max_positives: 6                 # cap positives so negatives stay represented
+  max_positives: 10                # cap positives per list (spread-preserving subsample)
+  max_negatives: 6                 # cap negatives so fast-vs-slow pairs aren't drowned
+  min_positives: 1                 # skip problems with fewer positives (1 = keep all; 2 = speed-rankable only)
   speedup_lo: 0.25                 # speedup mapped to p=0 (log2 lower bound)
-  speedup_hi: 2.0                  # speedup mapped to p=1 (log2 upper bound)
+  speedup_hi: 2.5                  # speedup mapped to p=1 (~p95 of the L5/6 data)
+  speed_quant: 0.0                 # deadband: snap p to this grid (0 = off; try ~0.1)
   dedup_by_code_hash: true
   sigma: 1.0                       # logistic slope in the LambdaRank loss
+  loss_alpha: 0.5                  # correctness-vs-speed pair weight (lower = more speed)
   list_seed: 42

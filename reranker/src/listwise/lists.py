@@ -96,6 +96,29 @@ def _ref(row: dict, rel: float) -> dict:
     return {"run_name": row["run_name"], "sample_id": row["sample_id"], "rel": round(float(rel), 6)}
 
 
+def _subsample_positives_by_spread(
+    positives: list[tuple[dict, float]], k: int, rng: random.Random
+) -> list[tuple[dict, float]]:
+    """Keep ``k`` positives that preserve the speed spread (not a uniform sample).
+
+    Sort by relevance (speed) and pick evenly spaced ranks including both extremes,
+    so the fastest and slowest correct kernels are always kept and the list retains
+    a real fast-vs-slow gradient instead of possibly collapsing to one speed bucket.
+    """
+    if len(positives) <= k:
+        return positives
+    if k <= 1:
+        return [max(positives, key=lambda pr: pr[1])]  # keep the single fastest
+    ordered = sorted(positives, key=lambda pr: pr[1])
+    n = len(ordered)
+    idxs = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+    if len(idxs) < k:  # rounding collapsed some ranks — top up from the rest
+        remaining = [i for i in range(n) if i not in idxs]
+        rng.shuffle(remaining)
+        idxs = sorted(set(idxs) | set(remaining[: k - len(idxs)]))
+    return [ordered[i] for i in idxs]
+
+
 def _build_list_for_problem(rows: list[dict], lw, rng: random.Random) -> list[dict] | None:
     """Return one problem's candidate list (refs with rel), or None to skip it.
 
@@ -123,18 +146,20 @@ def _build_list_for_problem(rows: list[dict], lw, rng: random.Random) -> list[di
             su = r.get("speedup")
             if su is None or su <= 0:
                 continue
-            positives.append((r, 1.0 + speed_p(su, lw.speedup_lo, lw.speedup_hi)))
+            positives.append((r, 1.0 + speed_p(su, lw.speedup_lo, lw.speedup_hi, lw.speed_quant)))
     negatives = [r for r in compiling if r["label"] == 0]
 
-    if not positives:
+    if len(positives) < max(lw.min_positives, 1):
         return None
     if len(positives) + len(negatives) < lw.min_list_size:
         return None
 
-    # Fixed budget: cap positives, fill the rest with compiled-but-wrong negatives.
+    # Positive-rich budget: cap positives while preserving the speed spread, then
+    # keep only a bounded number of negatives (enough to teach the correct-vs-wrong
+    # gate, not so many they drown the fast-vs-slow pairs).
     if len(positives) > lw.max_positives:
-        positives = rng.sample(positives, lw.max_positives)
-    neg_budget = max(lw.list_size - len(positives), 0)
+        positives = _subsample_positives_by_spread(positives, lw.max_positives, rng)
+    neg_budget = max(min(lw.max_negatives, lw.list_size - len(positives)), 0)
     if len(negatives) > neg_budget:
         negatives = rng.sample(negatives, neg_budget)
 

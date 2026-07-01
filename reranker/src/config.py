@@ -141,11 +141,17 @@ class ListwiseConfig:
     stratify_by_level: bool = True
     list_size: int = 16          # L: fixed budget of candidates per problem
     min_list_size: int = 2       # skip problems with fewer (deduped) candidates
-    max_positives: int = 6       # cap positives so negatives stay represented
+    max_positives: int = 10      # cap positives per list (spread-preserving subsample)
+    max_negatives: int = 6       # cap negatives per list so speed pairs aren't drowned
+    min_positives: int = 1       # skip problems with fewer positives (guardrail; 1 = keep all)
     speedup_lo: float = 0.25     # speedup mapped to p=0 (log2 lower bound)
-    speedup_hi: float = 4.0      # speedup mapped to p=1 (log2 upper bound)
+    speedup_hi: float = 2.5      # speedup mapped to p=1 (log2 upper bound; ~p95 of data)
+    speed_quant: float = 0.0     # deadband: snap p to this grid (0 = off) so sub-noise
+                                 # speedup differences don't create spurious ranking pairs
     dedup_by_code_hash: bool = True
     sigma: float = 1.0           # logistic slope in the LambdaRank loss
+    loss_alpha: float = 0.5      # weight of correctness vs speed pairs in the loss
+                                 # (0.5 = equal; lower pushes harder on fast-vs-slow)
     list_seed: int = 42
 
 

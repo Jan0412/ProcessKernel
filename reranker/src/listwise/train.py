@@ -112,6 +112,7 @@ def main() -> None:
         compute_metrics=make_compute_metrics(val_ds.groups),
         head_info=head_info,
         sigma=cfg.listwise.sigma,
+        alpha=cfg.listwise.loss_alpha,
         list_collator=ListwiseCollator(tokenizer),
         eval_lists_dataset=eval_lists,
     )
