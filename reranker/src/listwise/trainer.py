@@ -28,14 +28,17 @@ def lambdarank_loss(scores: torch.Tensor, rels: torch.Tensor, sigma: float = 1.0
     scores: (n,) model logits; rels: (n,) graded relevance (>= 0).
 
     ``alpha`` splits the ranking pairs into two groups and weights them:
-    ``loss = alpha * correctness_term + (1 - alpha) * speed_term``, each term the
-    mean over its own pairs. **correctness** pairs have the lower item wrong
-    (``rel_j == 0``); **speed** pairs are both-correct (``rel_j > 0``). This stops
-    the abundant correct-vs-wrong pairs from drowning the fast-vs-slow signal —
-    ``alpha=0.5`` weights the two objectives equally regardless of their counts;
-    lower ``alpha`` pushes harder on speed. Still LambdaRank: each pair keeps its
-    ``ΔNDCG`` weight and the list-level ``idcg`` normalization. If only one group
-    is present, that group carries the whole loss.
+    ``loss = alpha * correctness_term + (1 - alpha) * speed_term``. **correctness**
+    pairs have the lower item wrong (``rel_j == 0``); **speed** pairs are
+    both-correct (``rel_j > 0``). Each term is the ``ΔNDCG``-weighted *average* of
+    its pairs' logistic losses (normalized by the group's own ΔNDCG mass), so both
+    terms are O(softplus) regardless of how small the group's raw ΔNDCG values
+    are. This is what makes ``alpha`` a true cross-group knob: speed pairs' gain
+    gaps are inherently tiny next to correct-vs-wrong gaps (~40x at the median on
+    our data), and a plain mean of ``ΔNDCG * softplus`` would let the correctness
+    gradient dominate even at ``alpha=0.5``. ΔNDCG still sets the *relative*
+    weight of pairs within a group. If only one group is present, that group
+    carries the whole loss.
 
     Returns a scalar loss, or None if the list has no valid pair to rank
     (fewer than 2 candidates, no positive relevance, or all-equal relevance).
@@ -75,14 +78,20 @@ def lambdarank_loss(scores: torch.Tensor, rels: torch.Tensor, sigma: float = 1.0
     j_wrong = (rels.unsqueeze(0) == 0).float()
     corr = pos * j_wrong                                                # correct-vs-wrong pairs
     speed = pos * (1.0 - j_wrong)                                       # fast-vs-slow pairs
-    n_corr, n_speed = corr.sum(), speed.sum()
+    # Normalize each group by its own ΔNDCG mass (not its pair count): the term
+    # becomes a ΔNDCG-weighted average of softplus, so both groups have O(1)
+    # magnitude and alpha genuinely balances them. The mass is > 0 whenever the
+    # mask is nonempty (ranks are unique -> discounts differ; pos requires
+    # strictly different rels -> gains differ); the clamp is belt-and-braces.
+    corr_mass = (corr * delta_ndcg).sum()
+    speed_mass = (speed * delta_ndcg).sum()
 
     terms, weights = [], []
-    if n_corr > 0:
-        terms.append((corr * pair_loss).sum() / n_corr)
+    if corr.sum() > 0:
+        terms.append((corr * pair_loss).sum() / corr_mass.clamp_min(1e-12))
         weights.append(alpha)
-    if n_speed > 0:
-        terms.append((speed * pair_loss).sum() / n_speed)
+    if speed.sum() > 0:
+        terms.append((speed * pair_loss).sum() / speed_mass.clamp_min(1e-12))
         weights.append(1.0 - alpha)
     # Renormalize weights so a missing group hands its full weight to the other.
     wsum = sum(weights)
@@ -118,6 +127,7 @@ class ListwiseTrainer(RerankerTrainer):
         *args,
         sigma: float = 1.0,
         alpha: float = 0.5,
+        speed_gap_eval: float = 0.25,
         list_collator=None,
         eval_lists_dataset=None,
         **kwargs,
@@ -125,6 +135,7 @@ class ListwiseTrainer(RerankerTrainer):
         super().__init__(*args, **kwargs)
         self._sigma = sigma
         self._alpha = alpha
+        self._speed_gap_eval = speed_gap_eval
         # `self.data_collator` (passed in) is the pointwise collator used for eval;
         # the listwise collator is swapped in for the train dataloader.
         self._point_collator = self.data_collator
@@ -202,6 +213,7 @@ class ListwiseTrainer(RerankerTrainer):
         total_loss, n_loss_lists = 0.0, 0
         ndcgs: list[float] = []
         speed_correct = speed_total = 0
+        big_correct = big_total = 0
         corr_correct = corr_total = 0
         n_lists = 0
         top1_correct = 0
@@ -237,6 +249,12 @@ class ListwiseTrainer(RerankerTrainer):
                 speed_correct += (speed_mask & better).sum().item()
                 speed_total += speed_mask.sum().item()
 
+                # Speed pairs with a clear (super-noise) gap only — the plain
+                # speed_pair_acc is diluted by near-tie pairs.
+                big_mask = speed_mask & ((r.unsqueeze(1) - r.unsqueeze(0)) >= self._speed_gap_eval)
+                big_correct += (big_mask & better).sum().item()
+                big_total += big_mask.sum().item()
+
                 # @1 metrics: the model picks the single top-scored candidate.
                 top_rel = r[int(torch.argmax(s).item())].item()
                 picked_p = top_rel - 1.0 if top_rel > 0 else 0.0   # 0 if the gate fails
@@ -257,6 +275,7 @@ class ListwiseTrainer(RerankerTrainer):
             f"{prefix}_list_loss": total_loss / max(n_loss_lists, 1),
             f"{prefix}_list_ndcg_graded": float(sum(ndcgs) / max(len(ndcgs), 1)),
             f"{prefix}_speed_pair_acc": speed_correct / max(speed_total, 1),
+            f"{prefix}_speed_pair_acc_big": big_correct / max(big_total, 1),
             f"{prefix}_correctness_pair_acc": corr_correct / max(corr_total, 1),
             f"{prefix}_top1_correct": top1_correct / max(n_lists, 1),
             f"{prefix}_speed_regret_at1": regret_sum / max(n_regret, 1),

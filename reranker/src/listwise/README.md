@@ -107,8 +107,10 @@ bash reranker/scripts/build_lists.sh reranker/configs/listwise_config.yaml
 
 **Rebuild when** you change `data.run_dirs`, `negative_mode`, `baseline_timing_json`, or any
 `listwise.*` knob that affects list construction (`list_size`, `max_positives`, `speedup_lo/hi`,
-`dedup_by_code_hash`, the split/seed fields). Delete the stale artifacts (or just rerun the two
-commands — they overwrite) so `train.py` doesn't reuse old lists:
+`speedup_stat`, `speed_quant`, `dedup_by_code_hash`, the split/seed fields). **This is mandatory:**
+`train.py` only builds artifacts that are *missing* — it does not detect config changes, so with
+stale files on disk it silently trains on the old grading while MLflow logs the new config.
+Delete the stale artifacts (or just rerun the two commands — they overwrite):
 
 ```bash
 rm -f reranker/data/dataset_listwise.jsonl reranker/data/lists_*.jsonl reranker/data/lists_splits.json
@@ -132,7 +134,11 @@ that affects listwise training, grouped by section.
 | `max_positives` | `6` | Cap on how many correct kernels go into one list, so negatives stay represented. If a problem has more correct kernels, they are randomly sub-sampled (preserving the speed spread). |
 | `speedup_lo` | `0.25` | Speedup mapped to relevance-fraction `p = 0` (log2 scale). A correct kernel ≤ `0.25×` baseline grades at the bottom of the correct band. |
 | `speedup_hi` | `4.0` | Speedup mapped to `p = 1`. A correct kernel ≥ `4×` baseline grades at the top. Between `lo` and `hi`, `p` interpolates on a **log2** scale (so `1×` → `p≈0.5` with the defaults). |
+| `speedup_stat` | `mean` | Which dataset speedup grades the lists: `mean` (`speedup`, KernelBench `fast_p` convention) or `min` (`speedup_min` = baseline min / kernel min — noise-robust for micro-kernels). |
+| `speed_quant` | `0.0` | Snap `p` to this grid (`0` = off). Sub-grid speedup differences get the same grade → no noise-tie ranking pair. `0.1` ≈ ignore < ~35% runtime differences (with `lo=0.2, hi=4`). |
 | `sigma` | `1.0` | Logistic slope `σ` in the LambdaRank pairwise term `softplus(-σ(s_i - s_j))`. Higher `σ` = sharper preference / larger gradients on mis-ordered pairs. |
+| `loss_alpha` | `0.5` | Weight of the correctness-pair group vs the speed-pair group in the loss (groups are ΔNDCG-mass-normalized, so `0.5` is truly equal; lower pushes harder on fast-vs-slow). |
+| `speed_gap_eval` | `0.25` | Min rel gap for `eval_speed_pair_acc_big` — speed-pair accuracy restricted to clearly-separated (super-noise) pairs. |
 | `dedup_by_code_hash` | `true` | Drop near-identical kernels (`sha1(kernel_src)`) before building a list, so duplicate low-temperature samples don't eat list slots. |
 | `split_ratios` | `[0.85, 0.15]` | Fresh **problem-level** train/val split (no test set; listwise needs none). All candidates of a problem stay in one split. |
 | `split_seed` | `42` | RNG seed for the train/val split. |
@@ -203,9 +209,13 @@ that affects listwise training, grouped by section.
 - `data/lists_splits.json` — `{ "1:7": "train", … }`.
 - `data/checkpoints_listwise/final/` — best model + tokenizer + `reranker_head.json`, also logged to MLflow.
 
-Metrics logged per eval: pointwise **ranking** metrics on the full val pool
-(`eval_ndcg`, `eval_pass_at_1`, `eval_recall_at_1`, `eval_coverage`) plus listwise
-`eval_list_loss` and `eval_list_pair_acc` (fraction of `r_i>r_j` pairs the model orders correctly).
+Metrics logged per eval (listwise-only pass over the val lists): `eval_list_loss`,
+`eval_list_ndcg_graded` (model selection), pair accuracies split by pair type
+(`eval_correctness_pair_acc`, `eval_speed_pair_acc`, and `eval_speed_pair_acc_big` —
+the latter restricted to speed pairs with rel gap ≥ `speed_gap_eval`, i.e. clearly
+super-noise speed differences, so progress on real fast-vs-slow signal isn't diluted
+by near-ties), plus the @1 metrics `eval_top1_correct`, `eval_speed_regret_at1`,
+`eval_fast_at1`.
 
 ---
 
@@ -235,6 +245,18 @@ Each candidate gets a target relevance `r`:
 ```
 p = clip( ( log2(speedup) − log2(speedup_lo) ) / ( log2(speedup_hi) − log2(speedup_lo) ), 0, 1 )
 ```
+
+Two knobs keep timing noise out of the grades:
+
+- **`speedup_stat`** picks which runtime statistic feeds the ratio: `mean` (the KernelBench
+  `fast_p` convention) or `min` (`baseline_min / kernel_runtime_min`). For microsecond-scale,
+  launch-bound kernels the mean is heavily noise-inflated (std/mean up to ~28% at p90 on the
+  L5/6 baselines); `min` is the robust choice. `build_dataset` emits both (`speedup`,
+  `speedup_min`), so switching only requires rebuilding the *lists*.
+- **`speed_quant`** snaps `p` to a grid (e.g. `0.1`): candidates whose speedups differ by less
+  than the grid step land on the **same** grade and generate **no** ranking pair. Without it,
+  most speed pairs were sub-noise ties (on our L5/6 data: median gap ≈ 7% runtime difference,
+  61% of pairs < 16%) that teach nothing and dilute the real fast-vs-slow signal.
 
 So every correct kernel (`r ∈ [1,2]`) outranks every wrong one (`r = 0`), and among the correct
 ones, faster ⇒ higher `r`. A correct kernel with **no** baseline speedup is **dropped** (never
@@ -283,17 +305,24 @@ a **constant** (detached from the gradient — the defining trick of LambdaRank)
 
 Over all ordered pairs where `i` should outrank `j` (i.e. `r_i > r_j`):
 
+The pairs `P = {(i,j): r_i > r_j}` are split into two groups: **correctness** pairs (the lower
+item is wrong, `r_j = 0`) and **speed** pairs (both correct, `r_j > 0`). Each group's term is the
+ΔNDCG-**weighted average** of its pairs' logistic costs, and `loss_alpha` mixes the groups:
+
 $$
 \mathcal{L}_{\text{list}}
-= \frac{1}{|P|} \sum_{(i,j)\in P} |\Delta\text{NDCG}_{ij}| \;\cdot\; \log\!\big(1 + e^{-\sigma (s_i - s_j)}\big),
-\qquad P = \{(i,j): r_i > r_j\}
+= \alpha \cdot \frac{\sum_{(i,j)\in P_{\text{corr}}} w_{ij} \, \ell_{ij}}{\sum_{P_{\text{corr}}} w_{ij}}
+\;+\; (1-\alpha) \cdot \frac{\sum_{(i,j)\in P_{\text{speed}}} w_{ij} \, \ell_{ij}}{\sum_{P_{\text{speed}}} w_{ij}},
+\qquad w_{ij} = |\Delta\text{NDCG}_{ij}|,\;\; \ell_{ij} = \log\!\big(1 + e^{-\sigma (s_i - s_j)}\big)
 $$
 
-The term `log(1 + e^{−σ(s_i − s_j)})` (= `softplus(−σ(s_i−s_j))`) is the RankNet logistic cost: it is
-small when `s_i ≫ s_j` (correctly ordered) and grows linearly when `s_i ≪ s_j` (wrongly ordered).
-Multiplying by `|ΔNDCG_ij|` makes the optimizer spend its effort where the ranking metric improves
-most — overwhelmingly on getting the **top** of the list right, which is exactly "pick the fastest
-correct kernel."
+The term `ℓ_ij` (= `softplus(−σ(s_i−s_j))`) is the RankNet logistic cost: small when `s_i ≫ s_j`
+(correctly ordered), growing linearly when `s_i ≪ s_j` (wrongly ordered). ΔNDCG still decides which
+pairs matter *within* a group (top-of-list pairs dominate). The per-group normalization by the
+group's own ΔNDCG mass is what makes `α` a **true** correctness-vs-speed knob: speed pairs' gain
+gaps are inherently tiny next to correct-vs-wrong gaps (~40× at the median on our data), so a
+plain ΔNDCG-weighted mean over *all* pairs would let correctness dominate the gradient even at
+`α = 0.5`. If a list has only one group, that group carries the whole loss.
 
 The **batch loss** is the mean of `L_list` over the lists in the batch that have at least one valid
 pair. Lists with `< 2` candidates, no positive, or all-equal relevance contribute no gradient
@@ -313,9 +342,10 @@ we get it automatically from autograd because only the `softplus` term carries g
 
 ### 3.5 Reference implementation
 
-See [`trainer.py`](trainer.py) → `lambdarank_loss(scores, rels, sigma)` for the exact tensor code
-(it builds the `n×n` pair tensors, masks to `r_i > r_j`, weights by the detached `ΔNDCG`, and
-normalizes by the number of valid pairs), and `ListwiseTrainer.compute_loss`, which runs one forward
+See [`trainer.py`](trainer.py) → `lambdarank_loss(scores, rels, sigma, alpha)` for the exact tensor
+code (it builds the `n×n` pair tensors, masks to `r_i > r_j`, splits correctness vs speed pairs,
+weights by the detached `ΔNDCG`, and normalizes each group by its ΔNDCG mass), and
+`ListwiseTrainer.compute_loss`, which runs one forward
 over all candidates of the batch, `torch.split`s the scores back per list via `group_sizes`, and
 averages `lambdarank_loss` over the lists.
 

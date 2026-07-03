@@ -140,10 +140,11 @@ def _build_list_for_problem(rows: list[dict], lw, rng: random.Random) -> list[di
         compiling.append(r)
 
     # Positives = correct kernels graded by speedup; drop those without a baseline.
+    speedup_field = "speedup_min" if lw.speedup_stat == "min" else "speedup"
     positives: list[tuple[dict, float]] = []
     for r in compiling:
         if r["label"] == 1:
-            su = r.get("speedup")
+            su = r.get(speedup_field)
             if su is None or su <= 0:
                 continue
             positives.append((r, 1.0 + speed_p(su, lw.speedup_lo, lw.speedup_hi, lw.speed_quant)))
@@ -206,6 +207,8 @@ def _emit_lists(
 def build_lists(cfg: RerankerConfig) -> tuple[str, str, str]:
     """Build lists_train.jsonl, lists_val.jsonl, lists_splits.json. Returns their paths."""
     lw = cfg.listwise
+    if lw.speedup_stat not in ("mean", "min"):
+        raise ValueError(f"listwise.speedup_stat must be 'mean' or 'min', got {lw.speedup_stat!r}")
     source_path = _resolve(cfg.data.dataset_jsonl)
     if not os.path.isfile(source_path):
         raise FileNotFoundError(
@@ -233,6 +236,7 @@ def build_lists(cfg: RerankerConfig) -> tuple[str, str, str]:
     print(f"\n[lists] source       : {source_path}  ({len(rows)} rows)")
     print(f"[lists] list_size    : {lw.list_size}  (max_positives {lw.max_positives})")
     print(f"[lists] speedup map  : {lw.speedup_lo}x -> 0 .. {lw.speedup_hi}x -> 1  (rel = 1 + p)")
+    print(f"[lists] speedup stat : {lw.speedup_stat}  (quant {lw.speed_quant})")
     print(f"[lists] problems     : train {len(train_problems)} / val {len(val_problems)}")
 
     stats = {

@@ -41,11 +41,13 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
-def _load_baseline_times(path: str) -> dict[int, dict[int, float]]:
-    """Load the PyTorch-eager baseline runtimes as ``{level: {problem_id: time_ms}}``.
+def _load_baseline_times(path: str) -> dict[int, dict[int, dict[str, float]]]:
+    """Load the PyTorch-eager baseline runtimes as ``{level: {problem_id: {"mean", "min"}}}``.
 
-    ``time_ms`` is the baseline's mean wall-clock runtime. The KernelBench timing
-    JSON is keyed by ``"level1"`` ... and, within each level, by problem filename
+    Both the mean and the min wall-clock runtime are kept: the mean matches the
+    KernelBench ``fast_p`` convention, the min is the noise-robust statistic for
+    launch-bound micro-kernels. The KernelBench timing JSON is keyed by
+    ``"level1"`` ... and, within each level, by problem filename
     (``"1_Square_matrix_multiplication_.py"``) whose integer prefix is the problem
     id. Returns ``{}`` (and warns) if the file is missing, so ``speedup`` simply
     becomes ``None`` everywhere.
@@ -54,16 +56,19 @@ def _load_baseline_times(path: str) -> dict[int, dict[int, float]]:
         print(f"[WARN] baseline timing file not found: {path} — speedup will be None for all rows")
         return {}
     raw = _load_json(path)
-    out: dict[int, dict[int, float]] = {}
+    out: dict[int, dict[int, dict[str, float]]] = {}
     for level_key, problems in raw.items():
         m = re.match(r"level(\d+)$", str(level_key))
         if not m or not isinstance(problems, dict):
             continue
-        per_problem: dict[int, float] = {}
+        per_problem: dict[int, dict[str, float]] = {}
         for fname, stats in problems.items():
             pm = re.match(r"(\d+)_", str(fname))
             if pm and isinstance(stats, dict) and stats.get("mean") is not None:
-                per_problem[int(pm.group(1))] = float(stats["mean"])
+                entry = {"mean": float(stats["mean"])}
+                if stats.get("min") is not None:
+                    entry["min"] = float(stats["min"])
+                per_problem[int(pm.group(1))] = entry
         out[int(m.group(1))] = per_problem
     return out
 
@@ -102,6 +107,7 @@ def build_dataset(cfg: RerankerConfig) -> str:
     missing_kernel = 0
     dropped_compile_fail = 0
     correct_with_speedup = 0
+    correct_with_speedup_min = 0
     correct_without_baseline = 0
 
     with open(out_path, "w") as out_f:
@@ -158,11 +164,20 @@ def build_dataset(cfg: RerankerConfig) -> str:
                     # fast_p style). Only meaningful for correct kernels with a valid
                     # runtime and a known baseline; otherwise None (the listwise
                     # builder drops such candidates rather than guessing a grade).
+                    # `speedup` uses mean runtimes on both sides (the KernelBench
+                    # convention); `speedup_min` uses min/min, which is far less
+                    # noise-inflated for launch-bound micro-kernels.
                     speedup = None
+                    speedup_min = None
                     if correct and runtime is not None and runtime > 0:
                         if baseline_time is not None:
-                            speedup = baseline_time / runtime
+                            speedup = baseline_time["mean"] / runtime
                             correct_with_speedup += 1
+                            baseline_min = baseline_time.get("min")
+                            if (baseline_min is not None and baseline_min > 0
+                                    and runtime_min is not None and runtime_min > 0):
+                                speedup_min = baseline_min / runtime_min
+                                correct_with_speedup_min += 1
                         else:
                             correct_without_baseline += 1
 
@@ -193,6 +208,7 @@ def build_dataset(cfg: RerankerConfig) -> str:
                         "runtime_min": runtime_min,
                         "runtime_std": runtime_std,
                         "speedup": speedup,
+                        "speedup_min": speedup_min,
                         "label": lr.label,
                     }
                     out_f.write(json.dumps(row) + "\n")
@@ -208,6 +224,8 @@ def build_dataset(cfg: RerankerConfig) -> str:
         print(f"  dropped (compile-fail negatives): {dropped_compile_fail}")
     print(f"  speedup        : {correct_with_speedup}/{n_correct} correct have a baseline "
           f"({correct_without_baseline} correct lack a baseline -> speedup None)")
+    print(f"  speedup_min    : {correct_with_speedup_min}/{n_correct} correct have min/min "
+          f"(needs baseline min + runtime_stats.min)")
     print(f"  missing kernels: {missing_kernel} (eval entry but no staged .py)")
     print(f"  per-level rows : {dict(level_counts)}")
     print("  label reasons  :")

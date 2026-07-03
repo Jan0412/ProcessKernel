@@ -12,11 +12,10 @@ data:
   run_dirs:
     - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kernelbook_level5_triton
     - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kernelbook_level6_think_triton
-    - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kernelbook_level6_think_triton_v2
     - /path/to/workdir/KernelBench/runs/Qwen3-Coder-30B-A3B-Instruct_kernelbook_level6_think_triton
     - /path/to/workdir/KernelBench/runs/Qwen3-Coder-30B-A3B-Instruct_kernelbook_level6_triton
     - /path/to/workdir/KernelBench/runs/Qwen3-Coder-Next_kernelbook_level5_triton
-  level: [5, 6, 6, 6, 6, 5]
+  level: [5, 6, 6, 6, 5]
   # The sibling KernelBench checkout these runs were generated/evaluated against
   # (its KernelBench/ dataset dir resolves problem_id -> ref_arch).
   kernelbench_dir: /path/to/workdir/KernelBench
@@ -28,11 +27,11 @@ data:
   negative_mode: compiled_wrong
   # Per-problem PyTorch-eager baseline runtimes for the speedup grade (KernelBench
   # fast_p style). Resolved relative to the project root (reranker/).
-  baseline_timing_json: ../timing/A100/baseline_time_torch.json
+  baseline_timing_json: /path/to/workdir/KernelBench/results/timing/A100/baseline_time_torch.json
 
 model:
   base_model: Qwen/Qwen3-Reranker-0.6B
-  max_length: 4096
+  max_length: 6144
   head_type: seq_cls               # seq_cls | yes_no_lm
   reserve_ref_tokens: 1024
   attn_implementation: sdpa
@@ -40,12 +39,12 @@ model:
 train:
   # Separate checkpoint dir so the listwise model never clobbers the others.
   output_dir: data/checkpoints_listwise_l56
-  epochs: 3
+  epochs: 5
   lr: 1.0e-5
   # One "example" is a whole candidate list, so the per-device batch counts LISTS;
   # each list runs up to `listwise.list_size` forward passes. Keep it at 1-2 and
   # use gradient accumulation to reach the effective list batch size.
-  per_device_train_batch_size: 1
+  per_device_train_batch_size: 2
   per_device_eval_batch_size: 16   # pointwise eval scores single candidates
   gradient_accumulation_steps: 16
   warmup_ratio: 0.01
@@ -54,8 +53,8 @@ train:
   fp16: false
   gradient_checkpointing: true
   logging_steps: 5
-  eval_steps: 10
-  save_steps: 10
+  eval_steps: 20
+  save_steps: 20
   save_total_limit: 2
   # Select on the graded per-problem ranking metric (rewards ranking FAST correct
   # kernels on top, not just correct-vs-wrong). Alternatives: eval_fast_at1 (higher
@@ -65,7 +64,7 @@ train:
   pos_weight: null                 # unused by the listwise loss
   seed: 42
   max_steps: -1                    # -1 = full training; set small (e.g. 20) for a smoke test
-  dataloader_num_workers: 8
+  dataloader_num_workers: 26
 
 mlflow:
   db_file: mlflow.db
@@ -84,10 +83,21 @@ listwise:
   max_positives: 10                # cap positives per list (spread-preserving subsample)
   max_negatives: 6                 # cap negatives so fast-vs-slow pairs aren't drowned
   min_positives: 1                 # skip problems with fewer positives (1 = keep all; 2 = speed-rankable only)
-  speedup_lo: 0.25                 # speedup mapped to p=0 (log2 lower bound)
-  speedup_hi: 2.5                  # speedup mapped to p=1 (~p95 of the L5/6 data)
-  speed_quant: 0.0                 # deadband: snap p to this grid (0 = off; try ~0.1)
+  speedup_lo: 0.2                  # speedup mapped to p=0 (log2 lower bound)
+  speedup_hi: 4.0                  # speedup mapped to p=1 (~p95 of the L5/6 data)
+  # Grade from min/min timing (baseline min / kernel runtime min): the mean is
+  # noise-inflated for the microsecond-scale L5/6 kernels (std/mean up to ~28%
+  # at p90). `mean` restores the KernelBench fast_p convention.
+  speedup_stat: min
+  # Snap p to a 0.1 grid: candidates within ~35% runtime of each other get the
+  # SAME grade and produce no ranking pair. Without this, ~60% of speed pairs
+  # were sub-noise ties (median gap 0.02 ≈ 7% runtime diff) that teach nothing
+  # and dilute the real fast-vs-slow signal.
+  speed_quant: 0.1
   dedup_by_code_hash: true
   sigma: 1.0                       # logistic slope in the LambdaRank loss
-  loss_alpha: 0.5                  # correctness-vs-speed pair weight (lower = more speed)
+  loss_alpha: 0.5                  # correctness-vs-speed group weight (lower = more speed);
+                                   # groups are ΔNDCG-mass-normalized, so 0.5 = truly equal
+  speed_gap_eval: 0.25             # eval_speed_pair_acc_big: only speed pairs with
+                                   # rel gap >= this (≥ ~2x runtime difference)
   list_seed: 42

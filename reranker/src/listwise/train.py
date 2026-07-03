@@ -113,6 +113,7 @@ def main() -> None:
         head_info=head_info,
         sigma=cfg.listwise.sigma,
         alpha=cfg.listwise.loss_alpha,
+        speed_gap_eval=cfg.listwise.speed_gap_eval,
         list_collator=ListwiseCollator(tokenizer),
         eval_lists_dataset=eval_lists,
     )

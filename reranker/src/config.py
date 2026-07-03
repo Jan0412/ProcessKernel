@@ -146,12 +146,17 @@ class ListwiseConfig:
     min_positives: int = 1       # skip problems with fewer positives (guardrail; 1 = keep all)
     speedup_lo: float = 0.25     # speedup mapped to p=0 (log2 lower bound)
     speedup_hi: float = 2.5      # speedup mapped to p=1 (log2 upper bound; ~p95 of data)
+    speedup_stat: str = "mean"   # which dataset speedup grades the lists:
+                                 #   mean -> `speedup` (KernelBench fast_p convention)
+                                 #   min  -> `speedup_min` (noise-robust min/min timing)
     speed_quant: float = 0.0     # deadband: snap p to this grid (0 = off) so sub-noise
                                  # speedup differences don't create spurious ranking pairs
     dedup_by_code_hash: bool = True
     sigma: float = 1.0           # logistic slope in the LambdaRank loss
     loss_alpha: float = 0.5      # weight of correctness vs speed pairs in the loss
                                  # (0.5 = equal; lower pushes harder on fast-vs-slow)
+    speed_gap_eval: float = 0.25  # min rel gap for the eval_speed_pair_acc_big metric
+                                  # (speed-pair accuracy on clearly-separated pairs only)
     list_seed: int = 42
 
 
@@ -183,10 +188,23 @@ def _resolve(path: str) -> str:
     return os.path.normpath(os.path.join(PROJECT_ROOT, path))
 
 
-def _from_dict(cls, data: dict) -> Any:
-    """Recursively build a (nested) dataclass from a plain dict."""
+def _from_dict(cls, data: dict, section: str = "") -> Any:
+    """Recursively build a (nested) dataclass from a plain dict.
+
+    Unknown keys raise instead of being silently dropped — a typo in the YAML
+    (e.g. ``speedup_qant``) would otherwise leave the default in place with no
+    warning, so the config on disk and the config actually used would diverge.
+    """
     # `from __future__ import annotations` makes field types strings — resolve them.
     hints = typing.get_type_hints(cls)
+    known = {f.name for f in fields(cls)}
+    unknown = set(data) - known
+    if unknown:
+        where = section or cls.__name__
+        raise KeyError(
+            f"Unknown config key(s) in '{where}': {sorted(unknown)}. "
+            f"Valid keys: {sorted(known)}"
+        )
     kwargs = {}
     for f in fields(cls):
         if f.name not in data:
@@ -194,7 +212,8 @@ def _from_dict(cls, data: dict) -> Any:
         value = data[f.name]
         ftype = hints.get(f.name, f.type)
         if is_dataclass(ftype) and isinstance(value, dict):
-            kwargs[f.name] = _from_dict(ftype, value)
+            child = f"{section}.{f.name}" if section else f.name
+            kwargs[f.name] = _from_dict(ftype, value, section=child)
         else:
             kwargs[f.name] = value
     return cls(**kwargs)
