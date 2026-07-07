@@ -9,6 +9,7 @@ Everything else (failed to compile or incorrect output) is a negative example (l
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 
@@ -46,3 +47,11 @@ def speed_p(speedup: float, lo: float, hi: float, quant: float = 0.0) -> float:
     if quant > 0:
         p = min(1.0, max(0.0, round(p / quant) * quant))
     return p
+
+
+def code_hash(src: str) -> str:
+    """Stable hash of a kernel source, used to drop duplicate candidates.
+
+    Shared by the listwise and pairwise builds so both dedup identically.
+    """
+    return hashlib.sha1(src.encode("utf-8", "ignore")).hexdigest()

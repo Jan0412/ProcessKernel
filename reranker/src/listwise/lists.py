@@ -30,7 +30,6 @@ Usage:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import random
@@ -38,7 +37,7 @@ import sys
 from collections import defaultdict
 
 from reranker.src.config import RerankerConfig, _resolve, load_config
-from reranker.src.data.labels import speed_p
+from reranker.src.data.labels import code_hash, speed_p
 
 
 def _read_jsonl(path: str) -> list[dict]:
@@ -87,10 +86,6 @@ def _write_splits(assignment: dict, splits_path: str) -> None:
 
 
 # --- relevance + list construction -------------------------------------------
-def _code_hash(src: str) -> str:
-    return hashlib.sha1(src.encode("utf-8", "ignore")).hexdigest()
-
-
 def _ref(row: dict, rel: float) -> dict:
     """Compact reference to a source row within its (level, problem_id) group."""
     return {"run_name": row["run_name"], "sample_id": row["sample_id"], "rel": round(float(rel), 6)}
@@ -133,7 +128,7 @@ def _build_list_for_problem(rows: list[dict], lw, rng: random.Random) -> list[di
         if not r.get("compiled"):
             continue
         if lw.dedup_by_code_hash:
-            h = _code_hash(r["kernel_src"])
+            h = code_hash(r["kernel_src"])
             if h in seen:
                 continue
             seen.add(h)

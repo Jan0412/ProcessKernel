@@ -52,6 +52,11 @@ class PairwiseDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pairs)
 
+    @property
+    def mean_weight(self) -> float:
+        """Dataset-mean pair weight — the constant normalizer for the weighted loss."""
+        return sum(float(p.get("weight", 1.0)) for p in self.pairs) / len(self.pairs)
+
     def _lookup(self, pair: dict, side: str) -> dict:
         ref = pair[side]
         key = _row_key(ref["run_name"], pair["level"], pair["problem_id"], ref["sample_id"])

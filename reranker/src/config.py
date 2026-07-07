@@ -107,7 +107,9 @@ class PairwiseConfig:
     split_seed: int = 42
     stratify_by_level: bool = True
     pair_mode: str = "compiled_wrong"        # compiled_wrong | all_negative | speed
-    max_negatives_per_positive: Optional[int] = None  # None = full cross product
+    max_negatives_per_positive: Optional[int] = None  # cap partners per anchor (None = full cross product)
+    max_pairs_per_problem: Optional[int] = None  # cap each problem's total pairs (None = uncapped)
+    dedup_by_code_hash: bool = True  # drop duplicate kernel sources before pairing (mirrors listwise)
     loss_type: str = "logistic"              # logistic | margin
     margin: float = 1.0
     pair_seed: int = 42
@@ -115,6 +117,8 @@ class PairwiseConfig:
     # (wrong -> 0, correct -> 1 + speed_p) and pair every rel gap >= min_rel_gap.
     speedup_lo: float = 0.25      # speedup mapped to p=0 (log2 lower bound)
     speedup_hi: float = 4.0       # speedup mapped to p=1 (log2 upper bound)
+    speed_quant: float = 0.0      # deadband: snap p to this grid (0 = off) so sub-noise
+                                  # speedup differences grade equally -> no spurious pair
     min_rel_gap: float = 0.0      # min relevance difference to form a pair
     weighted_loss: bool = False   # optional: weight each pair's loss by its rel gap
 

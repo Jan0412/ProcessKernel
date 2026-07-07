@@ -1,47 +1,18 @@
+
 [project]
 name = "processkernel"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-# vLLM 0.11 supports Python >=3.9,<3.14. Pin to 3.12: full wheel coverage for
-# the whole stack, and it avoids 3.14, which forced source builds and resolved
-# torch up to a CUDA-13 build the node's 535 driver (CUDA <= 12.2) can't run.
+
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    # --- CUDA-coupled core ---------------------------------------------------
-    # The compute node's driver is 535.x (CUDA <= 12.2), so torch must be a
-    # CUDA-12 build. vLLM 0.12.0 pins torch==2.9.0, whose PyPI wheel is still a
-    # CUDA 12.8 build (the CUDA-13 switch only happens at torch 2.11). torch
-    # 2.9.0 also satisfies KernelBench's torch>=2.9.0 requirement, so this is
-    # the version that reconciles both. CUDA 12.8 runs on the 535 driver via
-    # CUDA 12.x minor-version compatibility (proven on this node with cu126).
-    # vLLM pulls the matching torch/torchvision/torchaudio itself.
-    "vllm==0.12.0",
-    # Left unconstrained so the resolver can match the vLLM/torch 2.8 pins
-    # rather than forcing 2026-era floors that conflict with that generation.
-    "accelerate",
-    "datasets",
-    "numpy",
-    # --- project deps (not CUDA-coupled) -------------------------------------
+    "datasets>=5.0.0",
     "kernelbench",
-    "kernels<0.15",
-    "mlflow>=3.12.0",
-    "pyyaml>=6.0.3",
-    "scikit-learn>=1.8.0",
-    "seaborn>=0.13.2",
-    "transformers>=4.56.0,<5",
-    "uvloop>=0.22.1",
+    "torch",
+    "vllm==0.24.0",
 ]
-
-[project.optional-dependencies]
-# flash-attn compiles CUDA kernels from source and needs nvcc + CUDA_HOME at
-# install time, so it can only be built on a GPU/compute node (not the login
-# node). Install with: uv sync --extra flash  (inside a GPU Slurm job).
-# Not required for sdpa/eager attention; vLLM bundles its own FlashAttention.
-flash = ["flash-attn>=2.8.3"]
-
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
 
 [tool.uv.sources]
 kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
+

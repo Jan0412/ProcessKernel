@@ -31,6 +31,7 @@ class PairwiseTrainer(RerankerTrainer):
         loss_type: str = "logistic",
         margin: float = 1.0,
         weighted: bool = False,
+        weight_mean: float = 1.0,
         pair_collator=None,
         eval_pairs_dataset=None,
         **kwargs,
@@ -41,6 +42,7 @@ class PairwiseTrainer(RerankerTrainer):
         self._loss_type = loss_type
         self._margin = margin
         self._weighted = weighted
+        self._weight_mean = max(float(weight_mean), 1e-8)
         # `self.data_collator` (passed in) is the pointwise collator used for eval;
         # the pairwise collator is swapped in for the train dataloader.
         self._point_collator = self.data_collator
@@ -74,8 +76,12 @@ class PairwiseTrainer(RerankerTrainer):
         diff = pos_logits - neg_logits
         losses = self._pairwise_loss(diff)
         if self._weighted and "weight" in inputs:
-            w = inputs["weight"]
-            loss = (losses * w).sum() / w.sum().clamp_min(1e-8)
+            # Normalize by the *dataset-mean* weight (a constant), never by this
+            # batch's own w.sum(): per-batch normalization rescales every
+            # micro-batch to the same gradient mass, which cancels the weighting
+            # across batches under gradient accumulation / DDP.
+            w = inputs["weight"] / self._weight_mean
+            loss = (losses * w).mean()
         else:
             loss = losses.mean()
         return (loss, {"diff": diff}) if return_outputs else loss
