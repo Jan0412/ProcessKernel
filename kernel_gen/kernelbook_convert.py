@@ -353,15 +353,67 @@ def convert_row(python_code: str, module_name: str, scale: ScaleConfig | None = 
     )
 
 
-def _run_smoke_inproc(converted_src: str, device: str = "cuda") -> tuple[bool, str]:
+def _sum_numel(obj) -> int:
+    """Total element count over every tensor nested in ``obj``.
+
+    Walks lists/tuples/dicts so multi-output forwards and structured inputs are
+    counted in full; non-tensor leaves contribute 0.
+    """
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return obj.numel()
+    if isinstance(obj, dict):
+        return sum(_sum_numel(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_sum_numel(o) for o in obj)
+    return 0
+
+
+def _run_smoke_inproc(
+    converted_src: str,
+    device: str = "cuda",
+    mem_budget_gb: float | None = None,
+    max_numel_ratio: float | None = None,
+) -> tuple[bool, str]:
     """Instantiate the converted ``Model`` and run one eager forward, in-process.
 
     Returns ``(ok, reason)``. This is the raw build+forward with no isolation:
     a pathological row (e.g. a multi-GiB weight tensor or a kernel that aborts)
     can OOM-kill or hard-crash the *calling* process. Use :class:`SmokeRunner`
     (or :func:`smoke_test`) to run it under a child process instead.
+
+    ``mem_budget_gb`` caps the CUDA caching allocator to a realistic per-sample
+    budget (Fix 1): a reference that only fits on an *empty* card but not under
+    eval memory pressure raises a catchable OOM here, so the caller's fallback
+    ladder down-scales it instead of shipping a row every eval OOMs on.
+
+    ``max_numel_ratio`` rejects references whose output footprint dwarfs their
+    input (Fix 2): the coupled-dim blowups (e.g. an init dim scaled into a new
+    output axis, turning an S**2 input into an S**3 output) are flagged even when
+    they happen to fit, so they never poison labels.
     """
     import torch  # local import so the converter is usable without torch present
+
+    on_cuda = device != "cpu" and torch.cuda.is_available()
+
+    # Fix 1: enforce a realistic memory ceiling. set_per_process_memory_fraction
+    # makes over-budget allocations raise a catchable OutOfMemoryError (handled by
+    # the forward's except below) rather than silently succeeding on a near-empty
+    # card. empty_cache + reset keep one row's footprint from bleeding into the
+    # next, since the worker process is reused across rows.
+    if on_cuda:
+        torch.cuda.empty_cache()
+        if mem_budget_gb and mem_budget_gb > 0:
+            dev_idx = (
+                int(str(device).split(":")[1])
+                if ":" in str(device)
+                else torch.cuda.current_device()
+            )
+            total = torch.cuda.get_device_properties(dev_idx).total_memory
+            frac = min(1.0, (mem_budget_gb * 2**30) / total)
+            torch.cuda.set_per_process_memory_fraction(frac, dev_idx)
+        torch.cuda.reset_peak_memory_stats()
 
     ns: dict = {}
     try:
@@ -386,11 +438,23 @@ def _run_smoke_inproc(converted_src: str, device: str = "cuda") -> tuple[bool, s
         model.eval()
         inputs = _to_device(ns["get_inputs"]())
         with torch.no_grad():
-            model(*inputs)
-        if device != "cpu" and torch.cuda.is_available():
+            output = model(*inputs)
+        if on_cuda:
             torch.cuda.synchronize()  # surface async kernel errors here, not later
     except Exception as e:  # noqa: BLE001
         return False, f"forward failed: {type(e).__name__}: {e}"
+
+    # Fix 2: footprint guard. An output whose element count dwarfs the input's is
+    # the signature of a placeholder init dim scaled into a new output axis; such
+    # rows are absurd even when they fit, so reject and let the ladder shrink them.
+    if max_numel_ratio and max_numel_ratio > 0:
+        in_numel = _sum_numel(inputs)
+        out_numel = _sum_numel(output)
+        if in_numel > 0 and out_numel > max_numel_ratio * in_numel:
+            return False, (
+                f"footprint blowup: output numel {out_numel} > "
+                f"{max_numel_ratio:g}x input numel {in_numel}"
+            )
 
     return True, ""
 
@@ -398,7 +462,9 @@ def _run_smoke_inproc(converted_src: str, device: str = "cuda") -> tuple[bool, s
 _WORKER_READY = "__ready__"
 
 
-def _smoke_worker_loop(device, req_q, resp_q):  # pragma: no cover - child process
+def _smoke_worker_loop(
+    device, req_q, resp_q, mem_budget_gb=None, max_numel_ratio=None
+):  # pragma: no cover - child process
     """Persistent worker: warm torch/CUDA once, then service rows until told to stop."""
     try:
         import torch
@@ -412,7 +478,7 @@ def _smoke_worker_loop(device, req_q, resp_q):  # pragma: no cover - child proce
         item = req_q.get()
         if item is None:  # shutdown sentinel
             return
-        ok, reason = _run_smoke_inproc(item, device)
+        ok, reason = _run_smoke_inproc(item, device, mem_budget_gb, max_numel_ratio)
         resp_q.put((ok, reason))
 
 
@@ -432,11 +498,19 @@ class SmokeRunner:
     # kept separate from the per-row timeout so the first row isn't penalised.
     _STARTUP_TIMEOUT = 300.0
 
-    def __init__(self, device: str = "cuda", timeout: float = 300.0):
+    def __init__(
+        self,
+        device: str = "cuda",
+        timeout: float = 300.0,
+        mem_budget_gb: float | None = None,
+        max_numel_ratio: float | None = None,
+    ):
         import multiprocessing as mp
 
         self.device = device
         self.timeout = timeout if timeout and timeout > 0 else None
+        self.mem_budget_gb = mem_budget_gb
+        self.max_numel_ratio = max_numel_ratio
         self._ctx = mp.get_context("spawn")
         self._proc = None
         self._req_q = None
@@ -451,7 +525,13 @@ class SmokeRunner:
         self._resp_q = self._ctx.Queue()
         self._proc = self._ctx.Process(
             target=_smoke_worker_loop,
-            args=(self.device, self._req_q, self._resp_q),
+            args=(
+                self.device,
+                self._req_q,
+                self._resp_q,
+                self.mem_budget_gb,
+                self.max_numel_ratio,
+            ),
             daemon=True,
         )
         self._proc.start()
@@ -531,12 +611,21 @@ def _exit_reason(exitcode) -> str:
 
 
 def smoke_test(
-    converted_src: str, device: str = "cuda", timeout: float = 300.0
+    converted_src: str,
+    device: str = "cuda",
+    timeout: float = 300.0,
+    mem_budget_gb: float | None = None,
+    max_numel_ratio: float | None = None,
 ) -> tuple[bool, str]:
     """One-shot, process-isolated smoke test (convenience wrapper).
 
     Spawns a fresh child, runs a single row, and tears it down. For converting
     many rows, build one :class:`SmokeRunner` and reuse it so CUDA stays warm.
     """
-    with SmokeRunner(device=device, timeout=timeout) as runner:
+    with SmokeRunner(
+        device=device,
+        timeout=timeout,
+        mem_budget_gb=mem_budget_gb,
+        max_numel_ratio=max_numel_ratio,
+    ) as runner:
         return runner.run(converted_src)
