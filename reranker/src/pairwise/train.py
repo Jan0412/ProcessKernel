@@ -113,7 +113,9 @@ def main() -> None:
         loss_type=cfg.pairwise.loss_type,
         margin=cfg.pairwise.margin,
         weighted=cfg.pairwise.weighted_loss,
-        weight_mean=train_ds.mean_weight if cfg.pairwise.weighted_loss else 1.0,
+        alpha=cfg.pairwise.loss_alpha,
+        group_weight_mass=train_ds.group_weight_mass if cfg.pairwise.weighted_loss else None,
+        n_pairs=len(train_ds),
         pair_collator=PairwiseCollator(tokenizer),
         eval_pairs_dataset=eval_pairs,
     )

@@ -162,6 +162,7 @@ def _emit_pairs_for_split(
                     "pos": _ref(pos),
                     "neg": _ref(neg),
                     "weight": 1.0,
+                    "group": "correctness",  # neg is always wrong in these modes
                 })
         n_pairs += _write_problem_pairs(problem_pairs, pw.max_pairs_per_problem, rng, out_f)
     return n_pairs, n_pos_used, n_pos_no_pair
@@ -222,7 +223,7 @@ def _emit_graded_pairs_for_split(
         problem_pairs: list[dict] = []
         for hi_row, hi_rel in cands:
             partners = [
-                (lo_row, hi_rel - lo_rel)
+                (lo_row, hi_rel - lo_rel, lo_rel)
                 for lo_row, lo_rel in cands
                 if hi_rel - lo_rel > 0 and hi_rel - lo_rel >= pw.min_rel_gap
             ]
@@ -231,7 +232,13 @@ def _emit_graded_pairs_for_split(
             if max_neg is not None and len(partners) > max_neg:
                 partners = rng.sample(partners, max_neg)
             n_anchors += 1
-            for lo_row, gap in partners:
+            for lo_row, gap, lo_rel in partners:
+                # A pair is a *correctness* pair when the low side is wrong
+                # (rel 0) and a *speed* pair when both sides are correct
+                # (rel > 0). The trainer normalizes and balances the two groups
+                # separately (group-split + alpha), like the listwise loss, so
+                # the correctness offset can't swamp the smaller speed gaps.
+                group = "correctness" if lo_rel == 0.0 else "speed"
                 problem_pairs.append({
                     "level": level,
                     "problem_id": problem_id,
@@ -239,6 +246,7 @@ def _emit_graded_pairs_for_split(
                     "pos": _ref(hi_row),
                     "neg": _ref(lo_row),
                     "weight": round(float(gap), 6),
+                    "group": group,
                 })
         emitted_here = _write_problem_pairs(problem_pairs, pw.max_pairs_per_problem, rng, out_f)
         n_pairs += emitted_here

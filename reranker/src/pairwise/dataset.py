@@ -27,6 +27,10 @@ def _row_key(run_name: str, level: int, problem_id: int, sample_id: int) -> tupl
     return (run_name, int(level), int(problem_id), int(sample_id))
 
 
+# Integer ids for the two pair groups the weighted loss balances separately.
+GROUP_IDS = {"correctness": 0, "speed": 1}
+
+
 class PairwiseDataset(Dataset):
     """Loads a pairs JSONL and the source dataset; encodes each side lazily."""
 
@@ -53,9 +57,19 @@ class PairwiseDataset(Dataset):
         return len(self.pairs)
 
     @property
-    def mean_weight(self) -> float:
-        """Dataset-mean pair weight — the constant normalizer for the weighted loss."""
-        return sum(float(p.get("weight", 1.0)) for p in self.pairs) / len(self.pairs)
+    def group_weight_mass(self) -> dict[str, float]:
+        """Total pair weight per group (correctness vs speed).
+
+        These dataset-level constants let the trainer normalize each group by its
+        own mass — so the correctness offset (rel gap >= 1) can't swamp the far
+        smaller speed gaps — and then balance the two with `alpha` (group-split,
+        the pairwise analogue of the listwise loss). Constant, not per-batch, so
+        the weighting survives gradient accumulation / DDP.
+        """
+        masses = {g: 0.0 for g in GROUP_IDS}
+        for p in self.pairs:
+            masses[p.get("group", "correctness")] += float(p.get("weight", 1.0))
+        return masses
 
     def _lookup(self, pair: dict, side: str) -> dict:
         ref = pair[side]
@@ -73,6 +87,7 @@ class PairwiseDataset(Dataset):
             "pos_input_ids": self.encoder.encode(pos["ref_arch_src"], pos["kernel_src"]),
             "neg_input_ids": self.encoder.encode(neg["ref_arch_src"], neg["kernel_src"]),
             "weight": float(pair.get("weight", 1.0)),
+            "group": GROUP_IDS[pair.get("group", "correctness")],
         }
 
 
@@ -98,4 +113,5 @@ class PairwiseCollator:
             "input_ids": input_ids,            # (2B, L): rows [0:B]=pos, [B:2B]=neg
             "attention_mask": attention_mask,
             "weight": torch.tensor([ex["weight"] for ex in batch], dtype=torch.float),
+            "group": torch.tensor([ex["group"] for ex in batch], dtype=torch.long),
         }

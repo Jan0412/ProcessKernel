@@ -120,7 +120,11 @@ class PairwiseConfig:
     speed_quant: float = 0.0      # deadband: snap p to this grid (0 = off) so sub-noise
                                   # speedup differences grade equally -> no spurious pair
     min_rel_gap: float = 0.0      # min relevance difference to form a pair
-    weighted_loss: bool = False   # optional: weight each pair's loss by its rel gap
+    weighted_loss: bool = False   # optional: SOFT weighting via group-split + alpha
+                                  # (the pairwise analogue of listwise's grouped ΔNDCG)
+    loss_alpha: float = 0.5       # weight of correctness vs speed pairs in the loss
+                                  # (0.5 = equal; lower pushes harder on fast-vs-slow).
+                                  # Only used when weighted_loss is on.
 
 
 @dataclass
