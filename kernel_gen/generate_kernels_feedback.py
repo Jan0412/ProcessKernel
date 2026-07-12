@@ -221,6 +221,14 @@ def main():
     if dropped:
         print(f"Dropped {len(dropped)} problems (no correct round-1 kernel or no baseline)")
 
+    if not prompts:
+        raise SystemExit(
+            "No problems have a seed. Every one was dropped -- see seeds.json for why.\n"
+            "Note --problems takes DATASET INDICES, not problem ids: the KernelBench HF split "
+            "is ordered lexicographically, so index 0 is problem 100, index 1 is problem 10. "
+            "Use --all, or check that the sweep summary covers the problems you expect."
+        )
+
     if args.dry_run:
         example = next(iter(prompts))
         print("\n" + "=" * 78)

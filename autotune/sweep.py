@@ -180,12 +180,8 @@ def _env() -> dict:
     return env
 
 
-def sweep(args, phase: str, summary: dict | None = None) -> None:
-    run_dir = Path(args.run_dir)
-    out_dir = run_dir / "sweep"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl = out_dir / "results.jsonl"
-
+def load_done(jsonl: Path) -> set[str]:
+    """Task keys already recorded. Resume is per (kernel, phase, config) -- see run_tasks."""
     done = set()
     if jsonl.exists():
         for line in jsonl.read_text().splitlines():
@@ -194,11 +190,22 @@ def sweep(args, phase: str, summary: dict | None = None) -> None:
                 done.add(f"{rec['kernel']}|{rec['phase']}|{rec['config_id']}")
             except (json.JSONDecodeError, KeyError):
                 continue  # a torn last line from a killed job; ignore it
+    return done
 
-    tasks, skipped = build_tasks(args, phase, summary)
+
+def run_tasks(tasks: list[Task], args, jsonl: Path, label: str) -> None:
+    """Evaluate tasks across the GPUs, appending each result as it lands.
+
+    Resume granularity is one (kernel, config) pair, deliberately. KernelBench's own
+    eval_from_generations.py resumes per *problem* -- once any sample of a problem is written
+    it skips the rest -- which is the wrong unit here and would silently drop work every time
+    the 1-day wall limit requeues us.
+    """
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    done = load_done(jsonl)
     todo = [t for t in tasks if t.key not in done]
-    print(f"[{phase}] {len(tasks):,} tasks, {len(tasks) - len(todo):,} already done, "
-          f"{len(todo):,} to run" + (f"   skipped: {skipped}" if skipped else ""))
+    print(f"[{label}] {len(tasks):,} tasks, {len(tasks) - len(todo):,} already done, "
+          f"{len(todo):,} to run", flush=True)
     if not todo:
         return
 
@@ -238,6 +245,13 @@ def sweep(args, phase: str, summary: dict | None = None) -> None:
         t.start()
     for t in threads:
         t.join()
+
+
+def sweep(args, phase: str, summary: dict | None = None) -> None:
+    tasks, skipped = build_tasks(args, phase, summary)
+    if skipped:
+        print(f"[{phase}] skipped: {skipped}")
+    run_tasks(tasks, args, Path(args.run_dir) / "sweep" / "results.jsonl", phase)
 
 
 def summarize(run_dir: Path, phase: str) -> dict:

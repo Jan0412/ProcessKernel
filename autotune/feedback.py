@@ -72,9 +72,12 @@ def _table(seed: dict, max_rows: int = 26) -> str:
         {k for r in rows for k in r["config"] if k not in LAUNCH_KNOBS}
         | {k for k in identity if k not in LAUNCH_KNOBS}
     )
+    # Only show a launch knob if we actually varied it, or the kernel itself set it. A 1-D
+    # kernel never sweeps num_stages, so an all-"-" column would be pure noise in the context.
     cols = knob_names + [
         k for k in LAUNCH_KNOBS
-        if any(k in r["config"] for r in rows) or k in identity
+        if any(k in r["config"] for r in rows)
+        or (identity.get(k, "default") != "default")
     ]
     if not cols:
         return "(no tunable constants found in your kernel)"
