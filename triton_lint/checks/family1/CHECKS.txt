@@ -1,0 +1,200 @@
+FAMILY 1 — FALLBACK / FAKE WORK
+================================================================================
+Question: does the solution actually do the work in Triton, or does it hand the
+work back to PyTorch (or never run its kernel at all)?
+
+These are the "cheating" checks. They answer the question a naive harness cannot:
+a generation can pass every correctness test and still be a wrapper around cuDNN.
+
+Detection is purely static (stdlib `ast`), which is sufficient here because the
+LLM is not an adversary trying to evade us — it writes `torch.conv2d(...)` in
+plain sight because it does not know better. (Contrast SOL-ExecBench and Dr.
+Kernel, which need *runtime* instrumentation precisely because they police agents
+that could obfuscate.)
+
+
+--------------------------------------------------------------------------------
+F1.1  no_triton_kernel                                            severity: fail
+--------------------------------------------------------------------------------
+Detects: the file contains zero functions decorated with @triton.jit.
+
+Why it matters: the degenerate failure. The task was to write a Triton kernel and
+no Triton kernel exists.
+
+Reference:
+  AutoTriton (Li et al., 2025) — arXiv:2507.05687.
+  Its RL reward combines a rule-based and an execution-based term; the rule-based
+  part assigns reward = 0 to any generation lacking a @triton.jit decorator. This
+  check is that rule.
+
+Implementation note: handles @triton.autotune stacked above @triton.jit, the bare
+`@jit` form from `from triton import jit`, and the `@triton.jit()` call form.
+
+
+--------------------------------------------------------------------------------
+F1.2  dead_kernel                                                 severity: fail
+--------------------------------------------------------------------------------
+Detects: a @triton.jit kernel exists, but no launch site for it is reachable from
+the entry point (ModelNew.forward), following calls transitively through helper
+functions to a fixpoint.
+
+Why it matters: the model writes a beautiful kernel — satisfying any "must contain
+@triton.jit" rule — and then never calls it, computing the answer in PyTorch
+instead. AutoTriton reports this happening even with the decorator rule in place.
+
+Reference:
+  "Fine-Tuning GPT-5 for GPU Kernel Generation" (Tehrani et al., 2026)
+  — arXiv:2602.11000, "Static Reachability Analysis":
+    1. Parse with AST, identify Triton kernels (@triton.jit) or CUDA kernels
+       (load_inline).
+    2. From the entry-point class, perform a worklist traversal collecting all
+       referenced names; recursively expand any name resolving to a top-level
+       def/class until fixpoint.
+    3. A kernel is reachable if its name is in the discovered set. At least one
+       kernel must be reachable, else reward = 0.
+  Failure mode documented in AutoTriton — arXiv:2507.05687.
+
+Deviation from the paper (deliberate, strictly stronger): the paper collects
+*referenced names*, so a kernel merely mentioned inside `if False:` or in an
+unused helper counts as reachable. We anchor on actual launch *sites* — the
+`kernel[grid](...)` subscript-call node — and require that the launch sit in code
+reachable from forward.
+
+Known limitation: reachable ≠ launched ≠ used. A kernel can be reachable and still
+have its output thrown away — that is F1.3.
+
+
+--------------------------------------------------------------------------------
+F1.3  discarded_output                                            severity: fail
+--------------------------------------------------------------------------------
+Detects: a kernel IS launched, but none of the tensors it writes (its tl.store
+targets) flows into forward's return value or is otherwise read.
+
+    def forward(self, x):
+        out = torch.empty_like(x)
+        relu_kernel[(n,)](x, out, x.numel())   # out is a store target...
+        return torch.relu(x)                    # ...and is discarded
+
+Why it matters: reachability analysis (F1.2) passes this file happily — the kernel
+IS launched. Only dataflow catches it. This is the subtler sibling of F1.2 and the
+gap left open by the published static gate.
+
+Reference:
+  Extension beyond the reachability gate of arXiv:2602.11000, which would accept
+  the code above. The runtime analogue is Dr. Kernel / KernelGYM (arXiv:2602.05885),
+  which instruments Triton's launch path (JITFunction / Autotuner) to detect
+  kernels that "execute no code". Doing it statically means no GPU is needed.
+
+Implementation note: requires the argument-role table (which kernel params are
+tl.store targets vs tl.load sources) and alias resolution on the host side. We
+only fire when at least one store-target buffer was resolved — an unresolvable
+argument yields silence, not a false alarm.
+
+
+--------------------------------------------------------------------------------
+F1.4  torch_fallback                                       severity: fail / warn
+--------------------------------------------------------------------------------
+Detects: calls to PyTorch compute operators in host code reachable from forward.
+
+    x = torch.conv2d(x, w)         # <- cuDNN does the real work
+    relu_kernel[grid](x, out, n)   # <- the "Triton solution"
+
+Design: an ALLOWLIST, not a blocklist. Allocation (torch.empty) and shape metadata
+(.view, .stride, .numel) are legitimate wrapper plumbing. Ops that merely move
+memory (.contiguous, torch.zeros) are not *cheating* and are routed to F2.3/F2.4.
+Anything that launches a compute kernel is a fallback.
+
+Severity is FLOP-graded, so a fallback on conv2d is not treated the same as one on
+clamp:
+  HEAVY (fail): matmul/mm/bmm/addmm/einsum/linear, conv*, conv_transpose*,
+                scaled_dot_product_attention, softmax, *_norm, pooling, sort/topk,
+                cumsum — plus any F.* / nn.functional.* call.
+  LIGHT (warn): relu, gelu, exp, sum, mean, clamp, elementwise add/mul, ...
+
+Second pass (lower confidence, warn): tensor arithmetic written as an OPERATOR
+(a + b, a @ b) is an ast.BinOp, not a Call, so a call scanner misses it entirely.
+We fire only when an operand traces back to a forward input or to a tensor a kernel
+wrote — as close to type inference as we get without running anything.
+
+References:
+  AutoTriton (arXiv:2507.05687) documents exactly this failure mode: the model
+    generates a Triton kernel for the ReLU and leaves the convolution as a PyTorch
+    fallback.
+  TritonRL (Woo et al., 2025) — arXiv:2510.17891, "Training LLMs to Think and Code
+    Triton Without Cheating": uses "a rule-based linter, which detects actual calls
+    of Triton kernels and flags reliance on PyTorch modules". The paper describes
+    this linter in one sentence and never released the code — this check fills that
+    hole.
+  Dr. Kernel / KernelGYM (arXiv:2602.05885): the FLOP-weighted severity is a static
+    analogue of their profiling ratio PR = T_generated / T_total, which measures the
+    same quantity at runtime with the torch profiler.
+
+
+--------------------------------------------------------------------------------
+F1.5  nn_module_call                                              severity: fail
+--------------------------------------------------------------------------------
+Detects: an nn.* module constructed in __init__ AND invoked as a callable in
+forward — self.conv(x).
+
+CRITICAL false-positive guard: holding an nn.Conv2d purely to OWN THE WEIGHTS is
+completely legitimate —
+
+    self.conv = nn.Conv2d(...)                         # fine: weight holder
+    conv_kernel[grid](x, self.conv.weight, out, ...)   # fine
+
+What is not legitimate is *invoking* it. So the check is "is a constructed nn
+module ever called", not "is one constructed". Attribute reads (.weight, .bias)
+are not calls and never fire.
+
+Reference: same as F1.4 — AutoTriton (arXiv:2507.05687), TritonRL (arXiv:2510.17891).
+This is the module-level form of the torch fallback.
+
+
+--------------------------------------------------------------------------------
+F1.6  passthrough_kernel                                          severity: fail
+--------------------------------------------------------------------------------
+Detects: a launched kernel whose every stored value traces straight back to a
+tl.load with no arithmetic in between — i.e. the kernel is a memcpy.
+
+    v = tl.load(x_ptr + offs, mask=m)
+    tl.store(out_ptr + offs, v, mask=m)     # computes nothing
+
+Why it matters: this is the shape a model produces when it is satisfying a CHECKER
+rather than solving the problem. Expect it to *appear* once a feedback loop is
+running, even if it is rare in a baseline — which is exactly why it should be in
+place before the loop starts, so we can detect the loop inducing it.
+
+Reference:
+  Dr. Kernel (arXiv:2602.05885) — reward hacking via kernels that execute no
+  meaningful code, and "lazy optimization": models prioritise trivial correctness
+  over meaningful speedup. Their evidence: AutoTriton reaches 30.6% Fast@1 on
+  KernelBench Level-2 but only 9.2% Fast@1.2 — the gap IS lazy optimization.
+
+
+--------------------------------------------------------------------------------
+F1.7  compile_offload                                             severity: fail
+--------------------------------------------------------------------------------
+Detects: torch.compile / torch.jit.script / torch.jit.trace / torch._dynamo /
+torch._inductor anywhere in the file.
+
+Why it matters: letting TorchInductor generate the kernel is a fallback wearing a
+hat. (Note this is checked over the whole module, not just reachable code, because
+a @torch.compile decorator runs at class-definition time.)
+
+Reference: fallback variant of F1.4. The broader anti-cheat taxonomy is in
+SOL-ExecBench (NVIDIA, 2026) — arXiv:2603.19173, which found 589 of 4,075 agent
+submissions (14.5%) engaged in some form of reward hacking.
+
+
+================================================================================
+WHAT FAMILY 1 CANNOT CATCH
+================================================================================
+robust-kbench (Sakana AI, 2025) — arXiv:2509.14279 — documents "cheating" kernels
+that achieve fake 50–120x speedups by hardcoding outputs for the benchmark's test
+inputs, eliminating ops that are not actually redundant, and making assumptions
+about weights. After excluding contaminated tasks, reported speedups drop from
+3.13x to 1.49x.
+
+A kernel that memorises the test inputs looks like perfectly clean Triton. NO
+static analysis will catch it — that requires randomised-input testing. Family 1 is
+one signal among several and must never be the only gate.

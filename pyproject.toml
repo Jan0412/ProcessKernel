@@ -13,6 +13,12 @@ dependencies = [
     "vllm==0.24.0",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [tool.uv.sources]
 kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
