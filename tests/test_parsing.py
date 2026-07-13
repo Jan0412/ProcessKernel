@@ -277,6 +277,29 @@ class TestDegradedInputs:
         assert m.entry is None
         assert "add_kernel" in m.kernels
 
+    def test_latex_in_docstring(self, analyze, recwarn):
+        """Models write LaTeX in non-raw docstrings: `\\sum` is an invalid escape.
+
+        Python warns while compiling the source, which used to leak onto stderr in the
+        middle of the batch progress line. The complaint is about the generation, not
+        about us, so it is captured into notes instead -- but the file still parses and
+        is still analyzed.
+        """
+        m = analyze(
+            src(
+                '''
+def helper(x):
+    """Computes \\sum_i x_i."""
+    return x
+'''
+                + ELEMENTWISE_KERNEL
+            )
+        )
+        assert m.parse_status == "ok"
+        assert "add_kernel" in m.kernels
+        assert any("invalid escape sequence" in n for n in m.notes)
+        assert not [w for w in recwarn if issubclass(w.category, SyntaxWarning)]
+
 
 class TestFilenames:
     def test_roundtrip(self):

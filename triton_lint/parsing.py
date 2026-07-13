@@ -5,6 +5,7 @@ build the function table, resolve the entry point.
 from __future__ import annotations
 
 import ast
+import warnings
 
 from .model import KernelDef, ModuleModel
 
@@ -73,12 +74,23 @@ def build_skeleton(source: str, path: str = "") -> ModuleModel:
         model.parse_status = "empty"
         return model
 
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError) as exc:  # ValueError: null bytes
-        model.parse_status = "syntax_error"
-        model.notes.append(f"parse failed: {type(exc).__name__}: {exc}")
-        return model
+    # Generated sources routinely put LaTeX in a non-raw docstring ("\sum_i x_i"), and
+    # Python warns about the invalid escape while compiling them. That is a complaint
+    # about the generation, not about us, so keep it out of the batch progress output --
+    # but record it per file rather than dropping it. Passing `filename` means anything
+    # that does escape names the offending file instead of "<unknown>".
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SyntaxWarning)
+        try:
+            tree = ast.parse(source, filename=path or "<unknown>")
+        except (SyntaxError, ValueError) as exc:  # ValueError: null bytes
+            model.parse_status = "syntax_error"
+            model.notes.append(f"parse failed: {type(exc).__name__}: {exc}")
+            return model
+
+    for warning in caught:
+        if issubclass(warning.category, SyntaxWarning):
+            model.notes.append(f"line {warning.lineno}: {warning.message}")
 
     model.tree = tree
 
