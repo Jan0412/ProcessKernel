@@ -35,7 +35,8 @@ LAUNCH_WARN_THRESHOLD = 3
 
 @register("F2.2", "launch_overhead", "warn")
 def check(model: ModuleModel) -> list[Finding]:
-    launches = model.reachable_launches
+    # Timed path only: a launch inside autograd backward() costs the forward nothing.
+    launches = model.timed_launches
     if not launches:
         return []
 
@@ -44,23 +45,35 @@ def check(model: ModuleModel) -> list[Finding]:
     for launch in launches:
         if launch.loop_depth > 0:
             loop = " / ".join(launch.loop_vars) or "a loop"
+            preamble = (
+                f"`{launch.kernel_name}` is launched inside a Python loop over "
+                f"{loop} (line {launch.lineno}). Every iteration is a separate, "
+                f"serialised kernel launch (~{fmt_time(LAUNCH_OVERHEAD)} of pure "
+                f"overhead each)."
+            )
+            if launch.recurrence:
+                # A sequential recurrence carries state across iterations; gridding the
+                # loop would run every step from the same initial state (a correctness
+                # bug). The fix is to move the loop *into* the kernel, not into the grid.
+                fix = (
+                    " That loop carries a data dependency across iterations, so it "
+                    "cannot be parallelised -- move the loop inside a single kernel (one "
+                    "launch, an internal sequential loop) instead."
+                )
+            else:
+                fix = " Move that dimension into the launch grid and launch the kernel once."
             findings.append(
                 Finding(
                     check_id="F2.2",
                     severity="fail",
-                    message=(
-                        f"`{launch.kernel_name}` is launched inside a Python loop over "
-                        f"{loop} (line {launch.lineno}). Every iteration is a separate, "
-                        f"serialised kernel launch (~{fmt_time(LAUNCH_OVERHEAD)} of pure "
-                        f"overhead each). Move that dimension into the launch grid and "
-                        f"launch the kernel once."
-                    ),
+                    message=preamble + fix,
                     data={
                         "kernel": launch.kernel_name,
                         "loop_vars": launch.loop_vars,
                         "loop_depth": launch.loop_depth,
                         "lineno": launch.lineno,
                         "kind": "launch_in_loop",
+                        "recurrence": launch.recurrence,
                     },
                 )
             )

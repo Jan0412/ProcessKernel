@@ -23,6 +23,11 @@ MATH_FNS = {
     "where", "fma", "erf", "tanh", "rsqrt", "log2", "exp2", "cdiv", "softmax",
 }
 
+#: BinOp kinds whose operands are scalar arithmetic, never pointer bases (you never
+#: multiply/divide/compare a base pointer). A kernel param seen in one of these is a
+#: scalar dimension/stride, not a tensor pointer -- see :func:`_scalar_params`.
+_SCALAR_BINOPS = (ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.MatMult)
+
 
 def _tl_func(call: ast.Call) -> str | None:
     """``tl.load`` / ``triton.language.store`` -> ``"load"`` / ``"store"``."""
@@ -53,23 +58,111 @@ def _pointer_operands(node: ast.expr) -> set[str]:
     return set()
 
 
+def _additive_terms(node: ast.expr) -> list[ast.expr]:
+    """Flatten the additive spine of an address into its terms.
+
+    ``out_ptr + row * n + col`` -> ``[out_ptr, row * n, col]``. Used to separate the
+    base pointer term from the offset terms (for coverage and copy analysis).
+    """
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        return _additive_terms(node.left) + _additive_terms(node.right)
+    return [node]
+
+
+def _has_literal_stride(term: ast.expr) -> bool:
+    """An offset term that scales an index by a literal int >= 2 (a strided scatter,
+    e.g. ``offs * 2``) -- it skips elements, so the write is not full coverage."""
+    if isinstance(term, ast.BinOp) and isinstance(term.op, ast.Mult):
+        for side in (term.left, term.right):
+            if isinstance(side, ast.Constant) and isinstance(side.value, int) and side.value >= 2:
+                return True
+    return False
+
+
+def _is_partial_coverage(offset_terms: list[ast.expr]) -> bool:
+    """True when a store's offset does not touch every element of its buffer.
+
+    Two structural tells, both sound (a full row-major store has each index once,
+    scaled symbolically):
+
+    * a single index name appears in >= 2 additive terms -- ``i * n + i`` (diagonal),
+      ``col * s1 + col * s2`` (a diagonal-covariance write);
+    * an index is scaled by a literal int >= 2 -- ``offs * 2`` (stride-2 scatter).
+    """
+    counts: dict[str, int] = {}
+    for term in offset_terms:
+        for name in _names(term):
+            counts[name] = counts.get(name, 0) + 1
+    if any(c >= 2 for c in counts.values()):
+        return True
+    return any(_has_literal_stride(term) for term in offset_terms)
+
+
+def _contains_tl_mem(node: ast.AST) -> bool:
+    """True if *node* contains a ``tl.load``/``tl.store``/``tl.atomic_*`` call.
+
+    Such an operand is a *loaded value* (or its address); a multiply/compare applied to
+    it (``tl.load(x_ptr + o) * 2.0``) operates on the value, so the pointer names inside
+    must not be read as scalar operands of that multiply.
+    """
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            fn = _tl_func(sub)
+            if fn in ("load", "store") or (fn is not None and fn.startswith("atomic_")):
+                return True
+    return False
+
+
+def _scalar_params(node: ast.FunctionDef, params: dict[str, ParamRole]) -> set[str]:
+    """Kernel params that are provably scalars (dimensions / strides), never pointers.
+
+    A base pointer is only ever *added* to an offset; it is never multiplied, divided
+    or compared. So a param appearing as an operand of a multiplicative BinOp or a
+    comparison is a scalar. Without this, a scalar dimension sitting bare on a store's
+    additive spine (``out_ptr + b*(2*H) + H + h``) is mistaken for a stored pointer and
+    surfaces as a phantom kernel output.
+
+    Operands that load a value (``tl.load(x_ptr + o) * 2.0``) are skipped -- the pointer
+    names live *inside* the load address, which is additive and handled on its own; it
+    is the loaded value that is multiplied, not the pointer.
+    """
+    scalars: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.BinOp) and isinstance(sub.op, _SCALAR_BINOPS):
+            operands = [sub.left, sub.right]
+        elif isinstance(sub, ast.Compare):
+            operands = [sub.left, *sub.comparators]
+        else:
+            continue
+        for operand in operands:
+            if _contains_tl_mem(operand):
+                continue
+            for name in _names(operand):
+                if name in params:
+                    scalars.add(name)
+    return scalars
+
+
 class _BodyVisitor(ast.NodeVisitor):
     """Single pass over a kernel body collecting roles and structural facts."""
 
-    def __init__(self, kernel: KernelDef):
+    def __init__(self, kernel: KernelDef, scalar_params: set[str]):
         self.kernel = kernel
+        self.scalar_params = scalar_params
         # local variable -> set of kernel params it was derived from
         self.taint: dict[str, set[str]] = {}
         # local variable -> params it is a *pointer* into (see _pointer_operands)
         self.ptr_taint: dict[str, set[str]] = {}
-        # locals assigned straight from a tl.load with no arithmetic applied
-        self.pure_load: set[str] = set()
+        # locals assigned straight from a tl.load with no arithmetic on the value,
+        # mapped to the *offset signature* of the load address (see _offset_signature)
+        self.pure_load: dict[str, frozenset[str]] = {}
         self.has_dot = False
         self.has_reduce = False
         self.has_math = False
         self.loop_depth = 0
         self.accum_in_loop = False
-        self.store_values: list[ast.expr] = []
+        # (stored value expr, is it a straight memcpy of a load at the same offset)
+        self.stores: list[tuple[ast.expr, bool]] = []
 
     # -- taint ------------------------------------------------------------
 
@@ -96,10 +189,33 @@ class _BodyVisitor(ast.NodeVisitor):
         """
         out: set[str] = set()
         for name in _pointer_operands(node):
-            if name in self.kernel.params and not self.kernel.params[name].is_constexpr:
+            if self._is_pointer_param(name):
                 out.add(name)
             out |= self.ptr_taint.get(name, set())
         return out
+
+    def _is_pointer_param(self, name: str) -> bool:
+        role = self.kernel.params.get(name)
+        return role is not None and not role.is_constexpr and name not in self.scalar_params
+
+    def _is_base_ptr_term(self, term: ast.expr) -> bool:
+        """A term of an additive address that is the base pointer, not the offset."""
+        if isinstance(term, ast.Name):
+            return term.id in self.ptr_taint or self._is_pointer_param(term.id)
+        return False
+
+    def _offset_signature(self, addr: ast.expr) -> frozenset[str]:
+        """The offset an address applies, with the base pointer stripped.
+
+        Two loads/stores address the same element iff their offset signatures match.
+        A straight ``x_ptr + offs`` and ``out_ptr + offs`` share ``{offs}``; a gather
+        ``x_ptr + offs*2`` does not match ``out_ptr + offs``.
+        """
+        return frozenset(
+            ast.dump(term)
+            for term in _additive_terms(addr)
+            if not self._is_base_ptr_term(term)
+        )
 
     def _mark(self, node: ast.expr, *, stored=False, loaded=False, atomic=False) -> None:
         for name in self.pointers(node):
@@ -108,13 +224,30 @@ class _BodyVisitor(ast.NodeVisitor):
             role.loaded |= loaded
             role.atomic |= atomic
 
+    def _mark_partial(self, addr: ast.expr) -> None:
+        offset_terms = [t for t in _additive_terms(addr) if not self._is_base_ptr_term(t)]
+        if not _is_partial_coverage(offset_terms):
+            return
+        for name in self.pointers(addr):
+            self.kernel.params[name].partial_store = True
+
     # -- statements -------------------------------------------------------
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         tainted = self.derived(node.value)
         pointed = self.pointers(node.value)
-        is_pure_load = self._is_pure_load(node.value)
+        load_sig = self._load_signature(node.value)
+
+        # A loop-carried self-reference (`acc = tl.maximum(acc, v)`) is a reduction,
+        # just like `acc += v`. A pointer advance (`p = p + BLOCK`, `pointed` non-empty)
+        # is address arithmetic, not accumulation -- excluding it keeps tiled matmul
+        # loops from being misread as reductions.
+        if self.loop_depth > 0 and not pointed:
+            rhs_names = _names(node.value)
+            if any(n in rhs_names for t in node.targets for n in _names(t)):
+                self.accum_in_loop = True
+
         for target in node.targets:
             for name in _names(target):
                 self.taint[name] = set(tainted)
@@ -122,18 +255,20 @@ class _BodyVisitor(ast.NodeVisitor):
                     self.ptr_taint[name] = set(pointed)
                 else:
                     self.ptr_taint.pop(name, None)
-                if is_pure_load:
-                    self.pure_load.add(name)
+                if load_sig is not None:
+                    self.pure_load[name] = load_sig
                 else:
-                    self.pure_load.discard(name)
+                    self.pure_load.pop(name, None)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
-        if self.loop_depth > 0:
+        target_names = _names(node.target)
+        # A pointer advance (`p += BLOCK`) is not a value accumulation.
+        if self.loop_depth > 0 and not any(n in self.ptr_taint for n in target_names):
             self.accum_in_loop = True
-        for name in _names(node.target):
+        for name in target_names:
             self.taint.setdefault(name, set()).update(self.derived(node.value))
-            self.pure_load.discard(name)
+            self.pure_load.pop(name, None)
 
     def visit_For(self, node: ast.For) -> None:
         self.loop_depth += 1
@@ -145,12 +280,20 @@ class _BodyVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self.loop_depth -= 1
 
-    def _is_pure_load(self, value: ast.expr) -> bool:
-        if isinstance(value, ast.Call) and _tl_func(value) == "load":
-            return True
+    def _load_signature(self, value: ast.expr) -> frozenset[str] | None:
+        """Offset signature if *value* is a load with no arithmetic on the loaded
+        value (directly, or through a chain of pure-load names); else ``None``."""
+        if isinstance(value, ast.Call) and _tl_func(value) == "load" and value.args:
+            return self._offset_signature(value.args[0])
         if isinstance(value, ast.Name):
-            return value.id in self.pure_load
-        return False
+            return self.pure_load.get(value.id)
+        return None
+
+    def _is_matching_copy(self, value: ast.expr, store_sig: frozenset[str]) -> bool:
+        """The stored value is a raw load addressed at the *same* offset as the store
+        -- i.e. a genuine element-for-element memcpy, not a gather/scatter/select."""
+        load_sig = self._load_signature(value)
+        return load_sig is not None and load_sig == store_sig
 
     # -- calls ------------------------------------------------------------
 
@@ -162,8 +305,11 @@ class _BodyVisitor(ast.NodeVisitor):
                 self._mark(ptr, loaded=True)
             elif fn == "store":
                 self._mark(ptr, stored=True)
+                self._mark_partial(ptr)
                 if len(node.args) > 1:
-                    self.store_values.append(node.args[1])
+                    value = node.args[1]
+                    matching = self._is_matching_copy(value, self._offset_signature(ptr))
+                    self.stores.append((value, matching))
             elif fn.startswith("atomic_"):
                 # An atomic both reads and writes; zero-init is required.
                 self._mark(ptr, stored=True, loaded=True, atomic=True)
@@ -184,20 +330,14 @@ def _classify(kernel: KernelDef, v: _BodyVisitor) -> str:
     # An accumulator updated inside a loop is a reduction even without tl.sum.
     if v.has_reduce or v.accum_in_loop:
         return "reduction"
-    if v.store_values and all(_stores_raw_load(val, v) for val in v.store_values):
+    # A pure copy performs no arithmetic (has_math would mean a computed branch, e.g. a
+    # tl.constexpr dispatch) and every store is a raw load at the *same* offset (a
+    # gather/scatter/concat recomputes the address -- that is the task, not a decoy).
+    if v.stores and not v.has_math and all(matching for _, matching in v.stores):
         return "copy"
-    if not v.store_values:
+    if not v.stores:
         return "unknown"
     return "elementwise"
-
-
-def _stores_raw_load(value: ast.expr, v: _BodyVisitor) -> bool:
-    """The stored value is a loaded value with no arithmetic applied to it."""
-    if isinstance(value, ast.Call) and _tl_func(value) == "load":
-        return True
-    if isinstance(value, ast.Name):
-        return value.id in v.pure_load
-    return False
 
 
 def analyze_kernel(kernel: KernelDef) -> None:
@@ -212,7 +352,8 @@ def analyze_kernel(kernel: KernelDef) -> None:
         )
     kernel.param_order = [a.arg for a in positional] + [a.arg for a in args.kwonlyargs]
 
-    visitor = _BodyVisitor(kernel)
+    scalars = _scalar_params(kernel.node, kernel.params)
+    visitor = _BodyVisitor(kernel, scalars)
     for stmt in kernel.node.body:
         visitor.visit(stmt)
 
@@ -222,3 +363,14 @@ def analyze_kernel(kernel: KernelDef) -> None:
 def analyze_kernels(model: ModuleModel) -> None:
     for kernel in model.kernels.values():
         analyze_kernel(kernel)
+
+    # Kernel -> kernel call edges: a @triton.jit *device function* is invoked by name
+    # inside another kernel's body (`v * rsqrt(x)`) and inlined by Triton, never
+    # [grid]-launched. F1.2 uses these edges so an inlined helper is not "dead".
+    kernel_names = set(model.kernels)
+    for kernel in model.kernels.values():
+        for node in ast.walk(kernel.node):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                callee = node.func.id
+                if callee in kernel_names and callee != kernel.name:
+                    kernel.calls.add(callee)

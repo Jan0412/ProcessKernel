@@ -52,7 +52,19 @@ def check(model: ModuleModel) -> list[Finding]:
         if not resolved:
             continue  # could not resolve the output tensors -- stay quiet
 
-        if any(b.returned or b.read_by_host or b.is_forward_input for _, b in resolved):
+        # A buffer consumed by a *different* launch (the next kernel in a pipeline) is
+        # used, not discarded. Loading by this same launch does not count -- an atomic
+        # accumulator is stored and loaded by its own launch, and discarding it is still
+        # a real F1.3 hit.
+        def used(buf) -> bool:
+            return (
+                buf.returned
+                or buf.read_by_host
+                or buf.is_forward_input
+                or any(idx != launch.index for idx in buf.loaded_by)
+            )
+
+        if any(used(b) for _, b in resolved):
             continue
 
         names = ", ".join(f"`{v}`" for v, _ in resolved)

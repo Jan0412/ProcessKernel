@@ -56,6 +56,9 @@ class ParamRole:
     stored: bool = False  # pointer reaches the first arg of tl.store
     loaded: bool = False  # pointer reaches the first arg of tl.load
     atomic: bool = False  # target of tl.atomic_*
+    #: at least one store to this pointer writes a strided/diagonal address (does not
+    #: cover every element), so a zero-init of the bound buffer may be required
+    partial_store: bool = False
 
     @property
     def is_pointer(self) -> bool:
@@ -71,6 +74,9 @@ class KernelDef:
     kind: KernelKind = "unknown"
     has_autotune: bool = False
     lineno: int = 0
+    #: other kernels this kernel calls in its body (a @triton.jit device function is
+    #: inlined by Triton, never [grid]-launched) -- see F1.2
+    calls: set[str] = field(default_factory=set)
 
     def outputs(self) -> list[str]:
         return [p.name for p in self.params.values() if p.stored]
@@ -91,6 +97,10 @@ class LaunchSite:
     loop_vars: list[str] = field(default_factory=list)
     # kernel parameter name -> host argument expression
     arg_map: dict[str, ast.expr] = field(default_factory=dict)
+    #: this launch sits in a loop that carries a data dependency through the kernel
+    #: (an input arg is reassigned from an output arg) -- a sequential recurrence that
+    #: must not be moved into the launch grid (see F2.2)
+    recurrence: bool = False
 
 
 @dataclass
@@ -137,7 +147,11 @@ class ModuleModel:
 
     model_class: str | None = None
     entry: str | None = None  # e.g. "ModelNew.forward"
+    #: conservative over-approximation: every function that could possibly run
     reachable: set[str] = field(default_factory=set)
+    #: precise under-approximation: what the benchmark's forward() call executes
+    #: (never autograd ``backward``/``jvp``/``vmap``) -- see hostflow
+    timed_scopes: set[str] = field(default_factory=set)
 
     aliases: dict[str, str] = field(default_factory=dict)
     noncontiguous: set[str] = field(default_factory=set)
@@ -165,6 +179,13 @@ class ModuleModel:
         if self.entry is None:
             return list(self.launches)
         return [ls for ls in self.launches if ls.enclosing in self.reachable]
+
+    @property
+    def timed_launches(self) -> list[LaunchSite]:
+        """Launches the timed forward() actually executes (see :attr:`timed_scopes`)."""
+        if self.entry is None:
+            return list(self.launches)
+        return [ls for ls in self.launches if ls.enclosing in self.timed_scopes]
 
     def canonical(self, name: str) -> str:
         seen: set[str] = set()

@@ -6,7 +6,10 @@ Recovers, for every function in the module:
   ``Subscript`` -- along with the Python loop nesting they sit in and a map from
   kernel parameter name to the host expression passed for it;
 * reachability from the entry point, following calls through helper functions to
-  a fixpoint (a kernel launched from a helper two hops away is still reachable);
+  a fixpoint (a kernel launched from a helper two hops away is still reachable) --
+  computed twice with opposite approximations: ``reachable`` (conservative, for
+  "is this kernel ever used" checks) and ``timed_scopes`` (precise, for "what
+  does the timed forward do" checks);
 * buffers and their aliases (``view``/``permute``/... produce a second name for
   the same memory, so they must be unioned before asking "is this intermediate
   read by anyone else?");
@@ -19,9 +22,15 @@ allocated and consumed inside a helper is a local fact about that helper.
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 
 from .model import Buffer, HostCall, LaunchSite, ModuleModel
-from .parsing import _dotted
+from .parsing import _dotted, is_triton_kernel
+
+#: Namespaces whose attribute calls are free functions combining their arguments
+#: (``torch.cat([a, b])`` forwards ``a`` and ``b``), as opposed to tensor methods
+#: (``out.view(...)`` forwards its receiver).
+MODULE_NAMESPACES = {"torch", "F", "nn", "np", "numpy", "tl", "triton"}
 
 ALLOC_FNS = {
     "empty", "empty_like", "empty_strided",
@@ -41,6 +50,17 @@ ALIAS_METHODS = {
 #: on it really does launch a copy kernel).
 LAYOUT_METHODS = {"permute", "transpose", "t", "expand", "as_strided"}
 
+#: Allocators that read only a tensor's *metadata* (shape/dtype/device), not its data,
+#: from their first argument -- ``torch.empty_like(t)`` is not a host read of ``t``.
+METADATA_LIKE = {
+    "empty_like", "zeros_like", "ones_like", "full_like",
+    "rand_like", "randn_like", "randint_like",
+}
+#: The ``tensor.new_*`` family reads metadata from its *receiver* instead.
+METADATA_NEW = {
+    "new_empty", "new_zeros", "new_ones", "new_full", "new_tensor", "new_empty_strided",
+}
+
 
 def scoped(func: str, name: str) -> str:
     return f"{func}::{name}"
@@ -49,10 +69,18 @@ def scoped(func: str, name: str) -> str:
 class _FuncVisitor(ast.NodeVisitor):
     """Walks one host function, recording launches, calls, aliases and buffers."""
 
-    def __init__(self, model: ModuleModel, qualname: str, kernels: set[str]):
+    def __init__(
+        self,
+        model: ModuleModel,
+        qualname: str,
+        kernels: set[str],
+        param_default_classes: dict[str, list[str]] | None = None,
+    ):
         self.model = model
         self.qual = qualname
         self.kernels = kernels
+        # param name -> local classes named in its default value (`act_layer=GELU`)
+        self.param_default_classes = param_default_classes or {}
         self.loop_stack: list[str] = []
         # Name-load bookkeeping used to decide `read_by_host`.
         self.loads: dict[str, int] = {}
@@ -61,6 +89,9 @@ class _FuncVisitor(ast.NodeVisitor):
         # Passing a tensor into a helper that launches a kernel is plumbing, not a
         # host read -- otherwise every interprocedural intermediate looks "used".
         self.helper_loads: dict[str, int] = {}
+        # A tensor read only for its shape/dtype (`torch.empty_like(t)`) is not a data
+        # read either.
+        self.meta_loads: dict[str, int] = {}
         self.referenced: set[str] = set()
         self.assign_target: dict[int, str] = {}  # id(Call node) -> assigned name
 
@@ -83,13 +114,57 @@ class _FuncVisitor(ast.NodeVisitor):
     def visit_For(self, node: ast.For) -> None:
         var = ast.unparse(node.target) if node.target else "?"
         self.loop_stack.append(var)
+        start = len(self.model.launches)
         self.generic_visit(node)
+        self._detect_recurrence(node, start)
         self.loop_stack.pop()
 
     def visit_While(self, node: ast.While) -> None:
         self.loop_stack.append("while")
+        start = len(self.model.launches)
         self.generic_visit(node)
+        self._detect_recurrence(node, start)
         self.loop_stack.pop()
+
+    def _detect_recurrence(self, loop: ast.AST, start: int) -> None:
+        """Flag launches carrying a data dependency through the loop.
+
+        A sequential recurrence rebinds one of the kernel's *input* tensors to its
+        *output* each iteration (``h = h_new``, where ``h`` is read and ``h_new`` is
+        written by the launch). That loop dimension cannot be moved into the launch
+        grid -- see F2.2. A parallel batch loop (``for i: k(a[i], out[i])``) has no
+        such reassignment.
+        """
+        pairs: list[tuple[str, str]] = []
+        for sub in ast.walk(loop):
+            if (
+                isinstance(sub, ast.Assign)
+                and len(sub.targets) == 1
+                and isinstance(sub.targets[0], ast.Name)
+            ):
+                src = _base_name(sub.value)
+                if src is not None:
+                    pairs.append((sub.targets[0].id, src))
+        if not pairs:
+            return
+
+        for launch in self.model.launches[start:]:
+            kernel = self.model.kernels.get(launch.kernel_name)
+            if kernel is None:
+                continue
+            inputs: set[str] = set()
+            outputs: set[str] = set()
+            for param, expr in launch.arg_map.items():
+                role = kernel.params.get(param)
+                base = _base_name(expr)
+                if role is None or base is None:
+                    continue
+                if role.stored:
+                    outputs.add(base)
+                elif role.loaded:
+                    inputs.add(base)
+            if any(t in inputs and s in outputs for t, s in pairs):
+                launch.recurrence = True
 
     # -- statements -------------------------------------------------------
 
@@ -120,12 +195,16 @@ class _FuncVisitor(ast.NodeVisitor):
 
                 # self.layernorm = LayerNormTriton(...) -- a submodule defined in this
                 # file. Its forward() is where the kernel is actually launched, so
-                # reachability must follow it. Also catches nn.Sequential(Mish(), ...).
+                # reachability must follow it. Also catches nn.Sequential(Mish(), ...)
+                # and `self.act = act_layer()` where act_layer defaults to a local class.
                 local = [
                     n.id
                     for n in ast.walk(node.value)
                     if isinstance(n, ast.Name) and n.id in self.model.local_classes
                 ]
+                for n in ast.walk(node.value):
+                    if isinstance(n, ast.Name) and n.id in self.param_default_classes:
+                        local.extend(self.param_default_classes[n.id])
                 if local:
                     self.model.attr_classes.setdefault(t.attr, []).extend(local)
 
@@ -137,8 +216,47 @@ class _FuncVisitor(ast.NodeVisitor):
 
         self.generic_visit(node)
 
+        # A Subscript/Attribute *target* (`out[mask] = v`) writes those elements; the
+        # base Name carries Load ctx in the AST but is not a host read. Undo the
+        # visit_Name count for it (AugAssign targets, which genuinely read, are handled
+        # in visit_AugAssign and deliberately not undone here).
+        for t in node.targets:
+            if not isinstance(t, ast.Name):
+                base = _base_name(t)
+                if base is not None and self.loads.get(base):
+                    self.loads[base] -= 1
+
+        # A plain rebind `y = x` aliases x; the source Name is plumbing (tracked as an
+        # alias), not a data read -- so it must not count toward read_by_host.
+        if len(node.targets) == 1 and isinstance(node.value, ast.Name):
+            if self.loads.get(node.value.id):
+                self.loads[node.value.id] -= 1
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # `out += x` / `out[i] += x` reads `out` before writing it; the target Name
+        # has Store ctx so visit_Name misses it. Count the base as a host read.
+        base = _base_name(node.target)
+        if base is not None:
+            self.loads[base] = self.loads.get(base, 0) + 1
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # A nested @triton.jit kernel is not host code -- its tl.load/tl.store/tl.dot
+        # must not leak into the enclosing function's call scan.
+        if is_triton_kernel(node):
+            return
+        self.generic_visit(node)
+
     def _record_binding(self, name: str, value: ast.expr) -> None:
         key = scoped(self.qual, name)
+
+        # Rebinding kills the stale non-contiguous flag (it is a monotonic taint set;
+        # without a kill, `x = x.permute(...)` then `x = torch.relu(x)` would keep `x`
+        # flagged and a later no-op `x.contiguous()` would be reported as a copy). The
+        # alias map is deliberately *not* cleared here: an intermediate that is aliased
+        # and then transformed (`loss = full_loss; loss = loss * r`) must keep resolving
+        # to its storage for interprocedural propagation.
+        self.model.noncontiguous.discard(key)
 
         if isinstance(value, ast.Call):
             fn = _dotted(value.func)
@@ -214,7 +332,16 @@ class _FuncVisitor(ast.NodeVisitor):
                 for arg in list(node.args) + [kw.value for kw in node.keywords]:
                     self._count(arg, self.helper_loads)
 
-        self._count(node, self.loads)
+            # Metadata-only allocators read shape/dtype, not data.
+            op = fn.rsplit(".", 1)[-1]
+            if op in METADATA_LIKE and node.args:
+                self._count(node.args[0], self.meta_loads)
+            elif op in METADATA_NEW and isinstance(node.func, ast.Attribute):
+                self._count(node.func.value, self.meta_loads)
+
+        # Host reads are counted comprehensively in visit_Name (every Load-context
+        # Name), so a subscript/slice read is seen and a launch arg is counted with the
+        # same multiplicity in `loads` and `launch_loads` -- they cancel exactly.
         self.generic_visit(node)
 
     def _record_launch(self, kernel_name: str, node: ast.Call) -> None:
@@ -262,6 +389,7 @@ class _FuncVisitor(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
             self.referenced.add(node.id)
+            self.loads[node.id] = self.loads.get(node.id, 0) + 1
         self.generic_visit(node)
 
 
@@ -282,10 +410,19 @@ def _returned_names(node: ast.expr) -> set[str]:
     if isinstance(node, (ast.Attribute, ast.Subscript)):
         return _returned_names(node.value)
     if isinstance(node, ast.Call):
-        # A method call (`out.view(...)`) returns a view of its receiver; a plain
-        # function call (`helper(tmp)`) returns something new.
         if isinstance(node.func, ast.Attribute):
+            # A free function in a module namespace (`torch.cat([a, b])`) combines its
+            # arguments into the result, so they flow out; a tensor method
+            # (`out.view(...)`) returns a view of its receiver.
+            if _base_name(node.func.value) in MODULE_NAMESPACES:
+                out: set[str] = set()
+                for arg in node.args:
+                    out |= _returned_names(arg)
+                for kw in node.keywords:
+                    out |= _returned_names(kw.value)
+                return out
             return _returned_names(node.func.value)
+        # A plain function call (`helper(tmp)`) returns something new.
         return set()
     return set()
 
@@ -310,9 +447,14 @@ def analyze_host(model: ModuleModel) -> None:
     visitors: dict[str, _FuncVisitor] = {}
 
     for qual, node in model.functions.items():
-        v = _FuncVisitor(model, qual, kernels)
+        pdc = _param_default_classes(node, model.local_classes)
+        v = _FuncVisitor(model, qual, kernels, pdc)
         for stmt in node.body:
             v.visit(stmt)
+        # Default argument values are host code too: `def __init__(self,
+        # act_layer=GELU_Triton)` references GELU_Triton, whose kernel really runs.
+        for default in node.args.defaults + [d for d in node.args.kw_defaults if d]:
+            v.visit(default)
         visitors[qual] = v
 
         # Parameters are buffers too (an in-place kernel writes into one).
@@ -323,9 +465,83 @@ def analyze_host(model: ModuleModel) -> None:
             buf = v.buf(arg.arg)
             buf.is_forward_input = is_entry_like
 
+    _record_module_level(model)
+    # Interprocedural propagation creates the buffers for `y = helper(x)` results, so
+    # it must run before _resolve_reads records their host-read flags -- otherwise a
+    # later host read of a helper-produced tensor is checked against a not-yet-existing
+    # buffer and silently dropped.
+    _propagate_interprocedural(model)
     _resolve_reads(model, visitors)
     _resolve_reachability(model, visitors)
-    _propagate_interprocedural(model)
+
+
+def _param_default_classes(
+    node: ast.FunctionDef, local_classes: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """param name -> local classes named in its default value.
+
+    ``def __init__(self, act_layer=GELU_Triton)`` -> ``{"act_layer": ["GELU_Triton"]}``,
+    so a later ``self.act = act_layer()`` can be wired to the class it constructs.
+    """
+    result: dict[str, list[str]] = {}
+    args = node.args
+    positional = list(args.posonlyargs) + list(args.args)
+
+    def classes_in(default: ast.expr) -> list[str]:
+        return [
+            n.id
+            for n in ast.walk(default)
+            if isinstance(n, ast.Name) and n.id in local_classes
+        ]
+
+    for arg, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+        found = classes_in(default)
+        if found:
+            result[arg.arg] = found
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None and (found := classes_in(default)):
+            result[arg.arg] = found
+    return result
+
+
+def _record_module_level(model: ModuleModel) -> None:
+    """Record calls that live outside any function body -- module-level statements
+    (``scripted = torch.jit.script(plain)``) and decorators (``@torch.compile``).
+
+    These run at import/definition time and route work away from Triton, so F1.7 must
+    see them. They are scoped to a synthetic ``"<module>"`` enclosing name, which is in
+    no check's timed/reachable scope set, so only F1.7 (which scans every host call)
+    picks them up.
+    """
+    tree = model.tree
+    if tree is None:
+        return
+
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Call):
+                fn = _dotted(n.func)
+                if fn:
+                    model.host_calls.append(
+                        HostCall(qualname=fn, enclosing="<module>", lineno=n.lineno, node=n)
+                    )
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for dec in n.decorator_list:
+                target = dec.func if isinstance(dec, ast.Call) else dec
+                fn = _dotted(target)
+                if fn:
+                    model.host_calls.append(
+                        HostCall(
+                            qualname=fn,
+                            enclosing="<module>",
+                            lineno=getattr(dec, "lineno", n.lineno),
+                            node=dec if isinstance(dec, ast.Call) else None,
+                        )
+                    )
 
 
 def _resolve_reads(model: ModuleModel, visitors: dict[str, _FuncVisitor]) -> None:
@@ -338,6 +554,7 @@ def _resolve_reads(model: ModuleModel, visitors: dict[str, _FuncVisitor]) -> Non
                 - v.launch_loads.get(name, 0)
                 - v.return_loads.get(name, 0)
                 - v.helper_loads.get(name, 0)
+                - v.meta_loads.get(name, 0)
             )
             if elsewhere > 0:
                 key = model.canonical(scoped(qual, name))
@@ -435,6 +652,13 @@ def _propagate_interprocedural(model: ModuleModel) -> None:
             break
 
 
+#: What calling an instance or an autograd Function actually runs: ``obj(x)`` is
+#: ``__call__`` -> ``forward``, and ``Cls.apply(x)`` additionally runs
+#: ``setup_context`` (torch >= 2.0). ``backward``/``jvp``/``vmap`` run only under
+#: autograd, which the timed forward never triggers.
+FORWARD_PROTOCOL = ("forward", "setup_context", "__call__")
+
+
 def _resolve_reachability(model: ModuleModel, visitors: dict[str, _FuncVisitor]) -> None:
     """Worklist from the entry point to a fixpoint over referenced names.
 
@@ -448,19 +672,43 @@ def _resolve_reachability(model: ModuleModel, visitors: dict[str, _FuncVisitor])
     * a **torch.autograd.Function** -- ``MishAutoFn.apply(x)``, where the launch lives
       in ``MishAutoFn.forward``.
 
-    Both are handled by the same rule: referencing a locally defined class from
-    reachable code makes all of that class's methods reachable. That is deliberately
-    conservative -- we would rather miss a genuinely dead kernel than invent one.
+    Two sets come out of the same walk, because the check families need opposite
+    approximations:
+
+    * ``reachable`` expands a referenced class to **all** of its methods. Checks
+      asking "is this kernel ever used?" (F1.2, F1.6) must over-approximate: a
+      missed edge would invent a dead kernel, so a Triton kernel launched only
+      from ``backward()`` still counts as launched.
+    * ``timed_scopes`` expands a referenced class only to its forward-call
+      protocol (:data:`FORWARD_PROTOCOL`). Checks asking "what does the timed
+      forward compute?" (F1.4, F1.5, F2.2, F2.3) must under-approximate: autograd
+      ``backward``/``jvp``/``vmap`` never run under the benchmark's forward call,
+      and torch ops there would otherwise be reported as cheating.
     """
     if model.entry is None:
         return
 
-    cls = model.model_class
+    def all_methods(name: str) -> list[str]:
+        return model.local_classes.get(name, [])
+
+    def forward_protocol(name: str) -> list[str]:
+        return [
+            m
+            for m in model.local_classes.get(name, [])
+            if m.rsplit(".", 1)[-1] in FORWARD_PROTOCOL
+        ]
+
+    model.reachable = _walk(model, visitors, all_methods)
+    model.timed_scopes = _walk(model, visitors, forward_protocol)
+
+
+def _walk(
+    model: ModuleModel,
+    visitors: dict[str, _FuncVisitor],
+    expand_class: Callable[[str], list[str]],
+) -> set[str]:
     worklist = [model.entry]
     seen: set[str] = set()
-
-    def expand_class(name: str) -> list[str]:
-        return model.local_classes.get(name, [])
 
     while worklist:
         qual = worklist.pop()
@@ -468,22 +716,26 @@ def _resolve_reachability(model: ModuleModel, visitors: dict[str, _FuncVisitor])
             continue
         seen.add(qual)
 
+        # `self.helper()` resolves against the class the current method lives in;
+        # module-level functions fall back to the entry class.
+        own_cls = qual.rsplit(".", 1)[0] if "." in qual else model.model_class
+
         for ref in visitors[qual].referenced:
             if ref in model.functions:
                 worklist.append(ref)
 
-            # A bare reference to a local class (MyFn.apply, or just MyFn) reaches
-            # every method of it.
+            # A reference to a local class (MyFn.apply, MyMod()(x), or just MyFn)
+            # reaches the methods `expand_class` says calling it would run.
             head = ref.split(".", 1)[0]
             worklist.extend(expand_class(head))
 
             if ref.startswith("self."):
                 attr = ref.split(".", 1)[1].split(".", 1)[0]
-                # self.helper(...) -> "ModelNew.helper"
-                if cls and f"{cls}.{attr}" in model.functions:
-                    worklist.append(f"{cls}.{attr}")
+                # self.helper(...) -> "<OwnClass>.helper"
+                if own_cls and f"{own_cls}.{attr}" in model.functions:
+                    worklist.append(f"{own_cls}.{attr}")
                 # self.norm(...) where self.norm = LayerNormTriton(...)
                 for owner in model.attr_classes.get(attr, []):
                     worklist.extend(expand_class(owner))
 
-    model.reachable = seen
+    return seen

@@ -22,6 +22,7 @@ Liger-Kernel (arXiv:2410.10989) -- a wasted full-tensor pass -- applied to alloc
 
 from __future__ import annotations
 
+from ...hostflow import _base_name, scoped
 from ...model import Finding, ModuleModel
 from .. import register
 from ._common import fmt_bytes, fmt_time, transfer_time
@@ -42,8 +43,14 @@ def check(model: ModuleModel) -> list[Finding]:
         if buf.loaded_by or buf.read_by_host:
             continue
 
-        # Does any kernel writing it use an atomic on that pointer (zero-init required)?
+        # Examine only the parameter *this* buffer is bound to, not every stored param
+        # of the kernel: a sibling atomic output (`hist`) must not suppress the finding
+        # for an independent, genuinely-wasted buffer (`out`). Skip when that param
+        # accumulates (atomic/reads it back -- zero-init required) or writes it only
+        # partially (a diagonal/strided store leaves elements at their zero value, so
+        # "use empty_like" would be a correctness bug).
         accumulating = False
+        partial = False
         writers: list[str] = []
         for index in buf.stored_by:
             launch = launches.get(index)
@@ -57,10 +64,15 @@ def check(model: ModuleModel) -> list[Finding]:
                 role = kernel.params.get(param)
                 if role is None or not role.stored:
                     continue
+                var = _base_name(expr)
+                if var is None or model.canonical(scoped(launch.enclosing, var)) != buf.canonical:
+                    continue  # a sibling output of the same kernel, not this buffer
                 if role.atomic or role.loaded:
                     accumulating = True
+                if role.partial_store:
+                    partial = True
 
-        if accumulating or not writers:
+        if accumulating or partial or not writers:
             continue
 
         name = buf.canonical.split("::")[-1]

@@ -25,7 +25,23 @@ def check(model: ModuleModel) -> list[Finding]:
         return []  # F1.1 covers that
 
     launched = {ls.kernel_name for ls in model.reachable_launches}
-    dead = [name for name in model.kernels if name not in launched]
+    # A @triton.jit *device function* is called by name from inside another kernel's
+    # body (Triton inlines it), never [grid]-launched. It is live whenever a launched
+    # kernel reaches it through the call graph -- and "launch it or remove it" would
+    # break the caller. Expand the live set by that transitive closure.
+    live = set(launched)
+    frontier = list(launched)
+    while frontier:
+        name = frontier.pop()
+        kernel = model.kernels.get(name)
+        if kernel is None:
+            continue
+        for callee in kernel.calls:
+            if callee not in live:
+                live.add(callee)
+                frontier.append(callee)
+
+    dead = [name for name in model.kernels if name not in live]
     if not dead:
         return []
 

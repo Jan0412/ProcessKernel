@@ -92,20 +92,37 @@ def check(model: ModuleModel) -> list[Finding]:
 def _build_chains(
     intermediates: list[tuple[Buffer, LaunchSite, list[LaunchSite]]],
 ) -> list[list[tuple[Buffer, LaunchSite, list[LaunchSite]]]]:
-    """Union intermediates whose producer/consumer launches touch."""
-    chains: list[list[tuple[Buffer, LaunchSite, list[LaunchSite]]]] = []
+    """Group intermediates into connected components over the launches they touch.
+
+    A single greedy pass cannot merge two chains once a later intermediate bridges
+    them (a diamond: two producers feeding one consumer, one producer itself fed by an
+    earlier launch), so the shared consumer would land in two contradictory "Fuse …"
+    findings. A union-find over launch indices merges the whole component regardless of
+    processing order -- one finding per connected component.
+    """
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        parent[find(a)] = find(b)
+
+    for _, producer, consumers in intermediates:
+        for consumer in consumers:
+            union(producer.index, consumer.index)
+
+    groups: dict[int, list[tuple[Buffer, LaunchSite, list[LaunchSite]]]] = {}
     for item in sorted(intermediates, key=lambda t: t[1].index):
-        buf, producer, consumers = item
-        attached = False
-        for chain in chains:
-            members = {ls.index for _, p, cs in chain for ls in [p, *cs]}
-            if producer.index in members or any(c.index in members for c in consumers):
-                chain.append(item)
-                attached = True
-                break
-        if not attached:
-            chains.append([item])
-    return chains
+        groups.setdefault(find(item[1].index), []).append(item)
+
+    return [groups[root] for root in sorted(groups, key=lambda r: groups[r][0][1].index)]
 
 
 def _kernel_of(model: ModuleModel, launch: LaunchSite) -> KernelDef | None:

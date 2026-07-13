@@ -94,34 +94,40 @@ def build_skeleton(source: str, path: str = "") -> ModuleModel:
 
     model.tree = tree
 
-    # Function table: module-level functions plus "Class.method" qualnames.
+    # Kernel discovery: every @triton.jit function at *any* nesting depth. Generated
+    # code routinely defines a kernel inside its launcher (`def launch(x): @triton.jit
+    # def k(...): ...; k[grid](...)`), and a @triton.jit device function called from
+    # inside another kernel is a kernel too. Walking only module/class level misses
+    # both -- the file then looks kernel-free and the nested body leaks into the host
+    # scan. So collect kernels by a full walk, and build the function table separately,
+    # skipping anything that is a kernel.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and is_triton_kernel(node):
+            if node.name in model.kernels:
+                model.notes.append(
+                    f"duplicate @triton.jit name `{node.name}` (line {node.lineno})"
+                )
+            model.kernels[node.name] = KernelDef(
+                name=node.name,
+                node=node,
+                has_autotune=has_autotune(node),
+                lineno=node.lineno,
+            )
+
+    # Function table: module-level functions plus "Class.method" qualnames. Kernels
+    # are excluded (handled above); nested non-kernel helpers keep their existing
+    # out-of-table status.
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
-            if is_triton_kernel(node):
-                model.kernels[node.name] = KernelDef(
-                    name=node.name,
-                    node=node,
-                    has_autotune=has_autotune(node),
-                    lineno=node.lineno,
-                )
-            else:
+            if not is_triton_kernel(node):
                 model.functions[node.name] = node
         elif isinstance(node, ast.ClassDef):
             methods: list[str] = []
             for sub in node.body:
-                if isinstance(sub, ast.FunctionDef):
-                    # A jit kernel nested in a class is unusual but legal.
-                    if is_triton_kernel(sub):
-                        model.kernels[sub.name] = KernelDef(
-                            name=sub.name,
-                            node=sub,
-                            has_autotune=has_autotune(sub),
-                            lineno=sub.lineno,
-                        )
-                    else:
-                        qual = f"{node.name}.{sub.name}"
-                        model.functions[qual] = sub
-                        methods.append(qual)
+                if isinstance(sub, ast.FunctionDef) and not is_triton_kernel(sub):
+                    qual = f"{node.name}.{sub.name}"
+                    model.functions[qual] = sub
+                    methods.append(qual)
             model.local_classes[node.name] = methods
 
     model.model_class = _resolve_model_class(tree)
