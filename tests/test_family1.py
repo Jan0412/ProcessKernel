@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from conftest import ELEMENTWISE_KERNEL, src
 
+from triton_lint.checks.family1 import f1_1_no_triton_kernel, f1_4_torch_fallback
+from triton_lint.model import ModuleModel
+
 
 class TestF11NoTritonKernel:
     def test_fires_when_no_kernel(self, fired):
@@ -16,6 +19,11 @@ class TestF11NoTritonKernel:
 
     def test_silent_when_kernel_present(self, fired):
         assert not fired("F1.1", src(ELEMENTWISE_KERNEL))
+
+    def test_silent_on_an_unparseable_file(self):
+        """A file we could not parse has no evidence either way -- never accuse it."""
+        model = ModuleModel(parse_status="syntax_error")
+        assert f1_1_no_triton_kernel.check(model) == []
 
 
 class TestF12DeadKernel:
@@ -349,3 +357,161 @@ class ModelNew(nn.Module):
 
     def test_silent_otherwise(self, fired):
         assert not fired("F1.7", src(ELEMENTWISE_KERNEL))
+
+
+class TestF12Guards:
+    def test_silent_without_any_kernel(self, fired):
+        """F1.1 already says "no kernel"; F1.2 must not pile on."""
+        assert not fired(
+            "F1.2",
+            src("class ModelNew(nn.Module):\n    def forward(self, x):\n        return torch.relu(x)\n"),
+        )
+
+
+class TestF13Guards:
+    def test_silent_when_the_kernel_writes_nothing(self, fired):
+        """No store target -- there is no output to discard. Not this check's business."""
+        assert not fired(
+            "F1.3",
+            src(
+                """
+@triton.jit
+def probe_kernel(x_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs, mask=offs < n)
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        probe_kernel[(1,)](x, x.numel(), BLOCK=128)
+        return x
+"""
+            ),
+        )
+
+    def test_silent_when_the_output_argument_is_unresolvable(self, fired):
+        """The launch omits out_ptr entirely. We resolved no output buffer, so we stay
+        quiet rather than invent a finding."""
+        assert not fired(
+            "F1.3",
+            src(
+                ELEMENTWISE_KERNEL
+                + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        add_kernel[(1,)](x, y)
+        return torch.relu(x)
+"""
+            ),
+        )
+
+
+class TestF14Guards:
+    def test_light_ops_only_are_a_warning(self, check):
+        """No heavy op in sight: worth folding in, but not the "you didn't do the task"
+        failure that a matmul fallback is."""
+        found = check(
+            "F1.4",
+            src(
+                ELEMENTWISE_KERNEL
+                + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return torch.relu(out)
+"""
+            ),
+        )
+        assert len(found) == 1
+        assert found[0].severity == "warn"
+        assert found[0].data["heavy_ops"] == []
+        assert "still uses PyTorch operators" in found[0].message
+
+    def test_ignores_operators_that_are_not_tensor_arithmetic(self, fired):
+        """`n << 1` is grid arithmetic on an int, not a PyTorch kernel."""
+        assert not fired(
+            "F1.4",
+            src(
+                ELEMENTWISE_KERNEL
+                + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        n = x.numel()
+        blocks = n << 1
+        out = torch.empty_like(x)
+        add_kernel[(blocks,)](x, y, out, n, BLOCK=128)
+        return out
+"""
+            ),
+        )
+
+    def test_binop_with_a_scalar_operand(self, check):
+        """2.0 * x -- the left operand is a constant, the right is a tensor."""
+        found = check(
+            "F1.4",
+            src(
+                ELEMENTWISE_KERNEL
+                + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return 2.0 * out
+"""
+            ),
+        )
+        binops = [f for f in found if f.data.get("kind") == "binop"]
+        assert len(binops) == 1
+        assert binops[0].data["ops"] == ["*"]
+
+    def test_silent_on_an_unparsed_module(self):
+        assert f1_4_torch_fallback.check(ModuleModel(parse_status="syntax_error")) == []
+
+
+class TestF15Guards:
+    def test_light_module_is_a_warning_not_a_failure(self, check):
+        """nn.ReLU does compute something, but it is not where the task's cost lives."""
+        found = check(
+            "F1.5",
+            src(
+                ELEMENTWISE_KERNEL
+                + """
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.act = nn.ReLU()
+
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return self.act(out)
+"""
+            ),
+        )
+        assert len(found) == 1
+        assert found[0].severity == "warn"
+        assert found[0].data["heavy"] == []
+        assert "still applies PyTorch modules" in found[0].message
+
+    def test_ignores_calls_to_the_models_own_methods(self, fired):
+        """self._run(...) is not an nn module -- only self.<module>(...) counts."""
+        assert not fired(
+            "F1.5",
+            src(
+                ELEMENTWISE_KERNEL
+                + """
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.drop = nn.Dropout(0.1)
+
+    def _run(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return out
+
+    def forward(self, x, y):
+        return self._run(x, y)
+"""
+            ),
+        )

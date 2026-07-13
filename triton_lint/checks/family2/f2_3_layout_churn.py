@@ -60,8 +60,15 @@ def _is_dtype_cast(call: ast.Call) -> bool:
 def _receiver_is_noncontiguous(model: ModuleModel, scope: str, node: ast.expr) -> bool:
     """True when the receiver provably has a non-contiguous layout.
 
-    Handles both the chained form ``x.permute(0,2,1).contiguous()`` and the bound form
-    ``y = x.permute(0,2,1); y.contiguous()``.
+    Handles both the chained form ``x.permute(0,2,1).contiguous()`` -- caught
+    structurally, by walking the call chain -- and the bound form
+    ``xt = x.permute(0,2,1); xt.contiguous()``, which needs the layout set.
+
+    Note the bound form must be looked up by the **raw scoped name**, not the
+    canonical one. ``model.noncontiguous`` records the alias itself (``forward::xt``),
+    whereas canonicalisation deliberately resolves an alias back to the storage it
+    views (``forward::x``) -- which is the contiguous base, and never in the set. Asking
+    for the canonical name here is therefore guaranteed to answer False.
     """
     if isinstance(node, ast.Call):
         fn = _dotted(node.func) or ""
@@ -73,7 +80,7 @@ def _receiver_is_noncontiguous(model: ModuleModel, scope: str, node: ast.expr) -
             return True
         return _receiver_is_noncontiguous(model, scope, node.value)
     if isinstance(node, ast.Name):
-        return model.canonical(scoped(scope, node.id)) in model.noncontiguous
+        return scoped(scope, node.id) in model.noncontiguous
     return False
 
 
