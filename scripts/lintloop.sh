@@ -11,7 +11,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=2-00:00:00
 #
 # Arm A5: the lint-feedback loop. Generate, lint, repair, up to --rounds times, with each
 # sample stopping as soon as it is clean.
@@ -63,6 +63,10 @@ echo "  out    : $OUTPUT_DIR"
 echo "  node   : $(hostname)"
 echo "============================================================"
 nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader
+
+# vLLM's sampler JIT-compiles flashinfer's top-k/top-p kernel during memory profiling and
+# needs nvcc, which these nodes do not have. See the script for the whole story.
+source "$SLURM_SUBMIT_DIR/scripts/cuda_jit_env.sh"
 
 uv run --no-sync python -m kernel_gen.arms.lintloop \
     --model "$MODEL" \
