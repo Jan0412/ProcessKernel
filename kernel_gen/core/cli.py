@@ -40,9 +40,11 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--problems",
+        "--rows",  # KernelBook is addressed by row index; same dest, same meaning
         default=None,
         help="Dataset indices: '23', '1-49' or '1,5,10'. NOT problem ids -- the "
-             "KernelBench split is ordered lexicographically. Omit for --all.",
+             "KernelBench split is ordered lexicographically, so index 1 is problem 10. "
+             "Omit for --all.",
     )
     parser.add_argument("--all", action="store_true", help="Every problem/row in the split")
     parser.add_argument(

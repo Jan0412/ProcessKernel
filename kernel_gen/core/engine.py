@@ -30,8 +30,14 @@ from .model import Attempt, Problem, Review, Trajectory
 from .sampling import SamplingSpec, generate_batch
 from .text import extract_code_block
 
-#: A critic sees a problem and the code one slot just produced, and returns a verdict:
-#: feedback text, plus ``clean`` when there is nothing actionable to say.
+#: A critic sees a problem, the code one slot just produced, and what it complained
+#: about last round; it returns a verdict: feedback text, plus ``clean`` when there is
+#: nothing actionable to say.
+#:
+#: The third argument is the only history that crosses a round boundary. The prompt
+#: itself is Markov by design, but "you were told this last round and it is still
+#: here" is worth saying -- and the engine is the only thing that knows it, because the
+#: critic is stateless and sees one attempt at a time.
 #:
 #: It always returns a Review -- "nothing to report" is ``Review(clean=True)``, not
 #: ``None``. ``None`` is reserved for "the critic could not run at all", and conflating
@@ -40,7 +46,7 @@ from .text import extract_code_block
 #:
 #: A callable, not a base class: there is one implementation. A second one that needs
 #: state can be a callable object without touching this module.
-Critic = Callable[[Problem, str], Review]
+Critic = Callable[[Problem, str, set], Review]
 
 
 def run_rounds(
@@ -91,7 +97,7 @@ def run_rounds(
 
         n_clean = 0
         for traj, raw in zip(active, raws):
-            attempt = _review(traj.problem, raw, round_index, critic)
+            attempt = _review(traj, raw, round_index, critic)
             traj.attempts.append(attempt)
 
             clean = attempt.review is not None and attempt.review.clean
@@ -113,8 +119,9 @@ def run_rounds(
     return trajectories
 
 
-def _review(problem: Problem, raw: str, round_index: int, critic: Critic | None) -> Attempt:
+def _review(traj: Trajectory, raw: str, round_index: int, critic: Critic | None) -> Attempt:
     """One completion -> one Attempt, degrading rather than raising."""
+    problem = traj.problem
     try:
         code = extract_code_block(raw)
     except Exception as exc:  # noqa: BLE001 - defensive by design
@@ -126,9 +133,17 @@ def _review(problem: Problem, raw: str, round_index: int, critic: Critic | None)
         return attempt
 
     try:
-        attempt.review = critic(problem, code)
+        attempt.review = critic(problem, code, _previous_check_ids(traj))
     except Exception as exc:  # noqa: BLE001 - a critic must never abort a GPU run
         print(f"[WARN] critic raised on problem {problem.problem_id}: {exc}")
         attempt.review = None
 
     return attempt
+
+
+def _previous_check_ids(traj: Trajectory) -> set[str]:
+    """What the critic complained about in this slot's previous round, if any."""
+    last = traj.last
+    if last is None or last.review is None:
+        return set()
+    return set(last.review.data.get("check_ids") or [])

@@ -42,13 +42,19 @@ def build_repair_prompt(problem: Problem, attempt) -> str:
     return f"solve problem {problem.problem_id}\n{REPAIR_MARKER}\n{attempt.code}\n{attempt.review.text}"
 
 
-def critic(problem: Problem, code: str) -> Review:
+def critic(problem: Problem, code: str, previous_check_ids: set) -> Review:
     """Clean iff the code says so. Stands in for the linter."""
     dirty = "bad" in code
+    repeat = " (again)" if "F1.2" in previous_check_ids else ""
     return Review(
-        text="F1.2: you never launched the kernel",
+        text=f"F1.2: you never launched the kernel{repeat}",
         clean=not dirty,
-        data={"n_fail": 1 if dirty else 0, "n_warn": 0, "parse_status": "ok"},
+        data={
+            "n_fail": 1 if dirty else 0,
+            "n_warn": 0,
+            "parse_status": "ok",
+            "check_ids": ["F1.2"] if dirty else [],
+        },
     )
 
 
@@ -148,7 +154,7 @@ def test_an_unparseable_completion_degrades_that_slot_only():
 
 
 def test_a_crashing_critic_does_not_abort_the_run():
-    def explodes(problem, code):
+    def explodes(problem, code, previous_check_ids):
         raise RuntimeError("the linter tripped over something")
 
     backend = FakeBackend(default=GOOD)
@@ -163,7 +169,7 @@ def test_a_crashing_critic_does_not_abort_the_run():
 
 
 def test_a_crashing_critic_is_never_mistaken_for_a_clean_one():
-    def explodes(problem, code):
+    def explodes(problem, code, previous_check_ids):
         raise RuntimeError("boom")
 
     trajs = run(FakeBackend(default=BAD), rounds=1, critic_fn=explodes, n_problems=1, num_samples=1)
