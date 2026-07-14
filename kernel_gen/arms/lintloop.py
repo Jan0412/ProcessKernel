@@ -129,8 +129,7 @@ def main() -> None:
 
     if args.output_dir is None:
         args.output_dir = default_output_dir(args)
-    out_dir = args.output_dir
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = args.output_dir  # created only once we commit to running (see --dry-run)
 
     problems = load_problems(
         args.dataset,
@@ -198,6 +197,7 @@ def main() -> None:
         print(f"[user]\n{base_prompt(problems[0])}")
         return
 
+    os.makedirs(out_dir, exist_ok=True)
     cfg_path = artifacts.write_config(out_dir, config, dataset=args.dataset)
     print(f"Saved config     : {cfg_path}")
 
