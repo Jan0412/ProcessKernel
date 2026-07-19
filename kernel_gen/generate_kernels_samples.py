@@ -72,6 +72,11 @@ def load_model(
     trust_remote_code: bool = False,
     max_num_seqs: int = 32,
 ):
+    # The FLA "packed recurrent decode" kernel (default on) corrupts the CUDA
+    # context on Qwen3.6's GDN layers; see kernel_gen/core/backend.py for the
+    # full story. Harmless for models without GDN layers.
+    os.environ.setdefault("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "0")
+
     from vllm import LLM
 
     # gpu_memory_utilization is the fraction of *total* VRAM vLLM may use for
@@ -100,6 +105,11 @@ def load_model(
         # The custom CUDA IPC all-reduce kernel fails with 'invalid argument'
         # on H100 nodes without NVLink IPC support. NCCL is always correct.
         disable_custom_all_reduce=True,
+        # We only ever send text. On a VL checkpoint, startup otherwise profiles the
+        # vision tower with a dummy max-size image, and the first GEMM in that path
+        # OOMs cuBLAS's handle workspace. Zeroing every modality limit skips that
+        # profiling. No-op on text-only models.
+        language_model_only=True,
     )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"

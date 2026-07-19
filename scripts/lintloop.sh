@@ -37,7 +37,7 @@ export PATH="$HOME/.local/bin:$PATH"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 LEVEL="${1:?usage: sbatch scripts/lintloop.sh <level>}"
-MODEL="${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen3.6-27B}"
 DATASET="${DATASET:-kernelbench}"
 ROUNDS="${ROUNDS:-3}"
 POLICY="${POLICY:-severity}"
@@ -45,7 +45,7 @@ SMOKE="${SMOKE:-0}"
 
 MODEL_SLUG=$(basename "$MODEL")
 TAG=$([ "$DATASET" = "kernelbook" ] && echo "kb" || echo "level")
-OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton"
+OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_no_think"
 
 if [ "$SMOKE" = "1" ]; then
     SCOPE=(--problems 0-4 --num-samples 2)
@@ -68,21 +68,41 @@ nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader
 # needs nvcc, which these nodes do not have. See the script for the whole story.
 source "$SLURM_SUBMIT_DIR/scripts/cuda_jit_env.sh"
 
-uv run --no-sync python -m kernel_gen.arms.lintloop \
-    --model "$MODEL" \
-    --dataset "$DATASET" \
-    --level "$LEVEL" \
-    "${SCOPE[@]}" \
-    --rounds "$ROUNDS" \
-    --feedback-policy "$POLICY" \
-    --backend triton \
-    --option one_shot \
-    --temperature 0.3 \
-    --think-temperature 1.0 \
-    --max-new-tokens 16384 \
-    --max-model-len 32768 \
-    --output-dir "$OUTPUT_DIR" \
-    --skip-existing
+# A CUDA fault kills the context, so the process cannot recover in-band -- only restart.
+# Each attempt resumes via --skip-existing, which reads the slots lint_loop.jsonl already
+# journaled, so a retry continues the run instead of redoing it. Bounded at 3: past that
+# the failure is not the transient this is here to absorb, and a wrong config should not
+# burn the whole 2-day allocation discovering that.
+ATTEMPTS="${ATTEMPTS:-3}"
+for attempt in $(seq 1 "$ATTEMPTS"); do
+    echo
+    echo "--- generation attempt $attempt/$ATTEMPTS"
+    if uv run --no-sync python -m kernel_gen.arms.lintloop \
+        --model "$MODEL" \
+        --dataset "$DATASET" \
+        --level "$LEVEL" \
+        "${SCOPE[@]}" \
+        --rounds "$ROUNDS" \
+        --feedback-policy "$POLICY" \
+        --backend triton \
+        --option one_shot \
+        --temperature 0.6 \
+        --think-temperature 0 \
+        --max-num-seqs "${MAX_NUM_SEQS:-10}" \
+        --max-new-tokens 16384 \
+        --max-model-len 32768 \
+        --output-dir "$OUTPUT_DIR" \
+        --skip-existing; then
+        echo "--- generation finished on attempt $attempt"
+        break
+    fi
+    if [ "$attempt" -ge "$ATTEMPTS" ]; then
+        echo "!! $ATTEMPTS attempts all died -- giving up. The journal is intact:" >&2
+        echo "!! resubmit to resume from $OUTPUT_DIR/lint_loop.jsonl" >&2
+        exit 1
+    fi
+    echo "--- attempt $attempt died; retrying, resuming from the journal" >&2
+done
 
 echo
 echo "Refined kernels : $(find "$OUTPUT_DIR" -maxdepth 1 -name '*_kernel.py' | wc -l)"

@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+
 from conftest import ELEMENTWISE_KERNEL, src
 from helpers import lint, lint_raw
+
+from triton_lint import analyze_source, build_model
+from triton_lint.feedback import render
+
+
+def analyze(source):
+    return build_model(source, "<t>")
 
 
 class TestF12DeadKernel:
@@ -224,3 +233,82 @@ class ModelNew(nn.Module):
 
 def test_device_function_called_from_kernel_is_not_dead():
     assert lint_raw(DEVICE_FUNCTION, "F1.2") == []
+
+
+class TestF12MissingEntryClass:
+    """BUG-25: a generation with no entry-point class at all.
+
+    KernelBench loads a solution with ``getattr(module, "ModelNew")``
+    (kernelbench/eval.py), so a file without that class cannot be loaded and scores
+    zero. Every kernel in it is *provably* dead -- there is nothing that could launch
+    one. That is the strongest possible instance of what F1.2 exists to catch, and it
+    is the one condition under which the check mutes itself:
+    ``severity = "fail" if model.entry else "info"``.
+    """
+
+    KERNEL_ONLY = src(ELEMENTWISE_KERNEL)  # a bare kernel: no ModelNew anywhere
+
+    def test_the_kernel_really_is_unlaunchable(self):
+        """Premise: no entry class, so nothing in the file can ever launch it."""
+        model = analyze(self.KERNEL_ONLY)
+        assert model.model_class is None
+        assert model.entry is None
+        assert model.notes == ["no entry-point class found"]
+        assert model.reachable_launches == []
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="BUG-25: with no entry-point class the file cannot be loaded by the "
+        "harness at all, yet F1.2 downgrades itself from fail to info. info is never "
+        "actionable (feedback.py), so the file is reported clean and the lintloop "
+        "stops on round 0 without telling the model anything. 393 of 1000 slots in "
+        "the Qwen3.6-27B lintloop run went clean this way (real sample: level 1 "
+        "p100_s0)",
+    )
+    def test_missing_entry_class_is_a_fail(self, check):
+        assert [f.severity for f in check("F1.2", self.KERNEL_ONLY)] == ["fail"]
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="BUG-25: the loop's stop signal. render() returns None because the only "
+        "finding is info, so critics.py sets clean=True on an unloadable file",
+    )
+    def test_missing_entry_class_is_not_clean(self):
+        assert render(analyze_source(self.KERNEL_ONLY, "<t>")) is not None
+
+    def test_control_adding_a_broken_wrapper_makes_it_fail(self, check):
+        """The perverse gradient. This file is strictly *worse* -- it has the same dead
+        kernel plus a ModelNew that returns an uninitialised buffer -- and F1.2 rates
+        it `fail` where the kernel-only file above is `clean`. Deleting the wrapper
+        class is rewarded.
+        """
+        found = check(
+            "F1.2",
+            self.KERNEL_ONLY
+            + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        return torch.empty_like(x)
+""",
+        )
+        assert [f.severity for f in found] == ["fail"]
+
+    def test_control_entry_class_inheriting_its_forward_stays_silent(self, check):
+        """The other cause of entry=None, which is *not* this bug: the class exists and
+        inherits a forward that does launch. `model_class` is what separates them, so a
+        fix must gate on that rather than on `entry`.
+        """
+        source = self.KERNEL_ONLY + """
+class Base(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return out
+
+
+class ModelNew(Base):
+    pass
+"""
+        model = analyze(source)
+        assert model.entry is None and model.model_class == "ModelNew"
+        assert check("F1.2", source) == []

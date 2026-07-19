@@ -50,6 +50,12 @@ class VLLMBackend(Backend):
         trust_remote_code: bool = False,
         max_num_seqs: int = 32,
     ):
+        # Disabled as a precaution while debugging Qwen3.6 GDN crashes; not
+        # independently proven causal (the crash-relevant lever turned out to be
+        # max_num_seqs), but harmless and left in place. setdefault so the shell can
+        # still override.
+        os.environ.setdefault("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "0")
+
         from vllm import LLM
 
         # gpu_memory_utilization is the fraction of *total* VRAM vLLM may use for
@@ -70,6 +76,41 @@ class VLLMBackend(Backend):
             # The custom CUDA IPC all-reduce kernel fails with 'invalid argument' on
             # H100 nodes without NVLink IPC support. NCCL is always correct.
             disable_custom_all_reduce=True,
+            # We only ever send text. On a VL checkpoint (e.g. Qwen3.6-27B, which vLLM
+            # resolves to Qwen3_5ForConditionalGeneration) startup otherwise pushes a
+            # dummy max-size image through the vision tower to size the encoder cache,
+            # and the first GEMM in that path dies on an 80 GiB H100:
+            #
+            #     CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling `cublasCreate`
+            #
+            # cuBLAS allocates its handle workspace outside torch's caching allocator,
+            # and the dummy encoder forward leaves it nothing. Zeroing every modality
+            # limit drops the encoder profiling entirely. No-op on text-only models.
+            language_model_only=True,
+            # vLLM's default is "auto", which on Hopper resolves to flashinfer. We used
+            # to pin triton here to skip flashinfer's ~9-minute cold JIT; that trade was
+            # wrong. The Triton/FLA chunk kernel faults with 'unspecified launch failure'
+            # on batches that mix prefills with peeled decodes -- the crash surfaces in
+            # qwen_gdn_linear_attn.py's _forward_core, on the torch.cat stitching the
+            # decode outputs onto chunk_gated_delta_rule's, which is the kernel this
+            # setting picks. It killed jobs 2339959 and 2339985 hours into a run, always
+            # in a repair round, where long prefills and decodes batch together.
+            #
+            # So this is now vLLM's own choice, stated explicitly. The JIT has had an
+            # nvcc since 23fa6e6 and its result is cached after the first run. Falls
+            # back to triton on non-Hopper. Ignored by models with no GDN layers.
+            gdn_prefill_backend="flashinfer",
+            # vLLM 0.24's cudagraph startup is broken for hybrid GDN models: the
+            # "Profiling CUDA graph memory" phase runs dummy decode batches against a
+            # minimal 64-block KV cache before the real one exists, and on Qwen3.6 a
+            # kernel reads past that minimal cache and kills the CUDA context --
+            # 'unspecified launch failure' one second into the phase, every run, with
+            # both GDN prefill backends. Pure-attention models (Qwen3-Coder) are
+            # unaffected. Same bug family as vllm-project/vllm#35743, where the conv
+            # state cache asserts num_cache_lines >= batch in that phase. NONE skips
+            # graph capture and with it the profiling phase; torch.compile stays on.
+            # Costs some decode speed; retire on a vLLM upgrade.
+            compilation_config={"cudagraph_mode": "NONE"},
         )
         if load_in_4bit:
             kwargs["quantization"] = "bitsandbytes"

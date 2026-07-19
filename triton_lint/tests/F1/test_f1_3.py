@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from conftest import ELEMENTWISE_KERNEL, src
 from helpers import lint
 
@@ -193,3 +195,68 @@ def test_two_host_reads_of_a_bare_launch_arg_survive():
 
 def test_single_call_host_read_of_a_bare_launch_arg_is_a_use():
     assert lint(BARE_ARG_ONE_HOST_READ, "F1.3") == []
+
+
+# ---------------------------------------------------------------------------
+# BUG-23 -- open. See tests/BUGS.md.
+# ---------------------------------------------------------------------------
+
+_BUG23_REASON = (
+    "BUG-23: hostflow's visit_Assign records an alias for a method-call view "
+    "(`y = x.view(...)`, via ALIAS_METHODS) and for a bare rebind (`y = x`), but "
+    "never for a SUBSCRIPT view (`c = out[b]`) -- an ast.Subscript reaches neither "
+    "branch. Writing a tensor slice is a write into the parent's storage, so the "
+    "standard per-slice launch idiom (`for b in range(B): c = out[b]; k[grid](.., c, ..)`) "
+    "leaves the store target as a fresh buffer nobody reads, and F1.3 reports the "
+    "output discarded at fail while `out` is returned right below it. 389 of the "
+    "run's 1209 F1.3-flagged files launch a subscript view. Real sample: p2141_s4"
+)
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG23_REASON)
+def test_kernel_writing_a_subscript_view_is_not_discarded(fired):
+    body = src(
+        ELEMENTWISE_KERNEL
+        + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        for b in range(x.shape[0]):
+            sl = out[b]
+            add_kernel[(1,)](x[b], y[b], sl, sl.numel(), BLOCK=128)
+        return out
+"""
+    )
+    assert not fired("F1.3", body)
+
+
+def test_kernel_writing_a_name_alias_is_not_discarded(fired):
+    # Passing control: the bare-rebind spelling of the same dataflow.
+    body = src(
+        ELEMENTWISE_KERNEL
+        + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        sl = out
+        add_kernel[(1,)](x, y, sl, sl.numel(), BLOCK=128)
+        return out
+"""
+    )
+    assert not fired("F1.3", body)
+
+
+def test_kernel_writing_a_method_view_is_not_discarded(fired):
+    # Passing control: the `.view()` spelling of the same dataflow.
+    body = src(
+        ELEMENTWISE_KERNEL
+        + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        sl = out.view(-1)
+        add_kernel[(1,)](x, y, sl, sl.numel(), BLOCK=128)
+        return out
+"""
+    )
+    assert not fired("F1.3", body)

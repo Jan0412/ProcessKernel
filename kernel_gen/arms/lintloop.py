@@ -116,10 +116,14 @@ def default_output_dir(args: argparse.Namespace) -> str:
     )
 
 
+def lint_log_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "lint_loop.jsonl")
+
+
 def load_done_slots(out_dir: str) -> set[tuple[int, int]]:
     return {
         (record["problem_id"], record["sample_id"])
-        for record in artifacts.read_jsonl(os.path.join(out_dir, "lint_loop.jsonl"))
+        for record in artifacts.read_jsonl(lint_log_path(out_dir))
     }
 
 
@@ -224,6 +228,20 @@ def main() -> None:
         max_findings=args.max_findings,
     )
 
+    # A slot is journaled the round it goes done, not at the end of the run: a crash
+    # then costs only the slots still in flight, and --skip-existing reads these records
+    # back. Journaling on done (never mid-trajectory) is what keeps that flag's
+    # invariant -- final() is settled, so no dirty intermediate can be resumed from.
+    #
+    # Writing the flat kernel here too is not redundant with the write_kernels below:
+    # that one only ever sees the slots THIS session ran, so a resumed run would
+    # otherwise ship a run dir missing every slot it skipped.
+    def checkpoint(round_index: int, active: list[Trajectory]) -> None:
+        artifacts.write_attempts(out_dir, active, round_index)
+        finished = [t for t in active if t.done]
+        artifacts.write_kernels(out_dir, finished)
+        artifacts.append_jsonl(lint_log_path(out_dir), [t.to_dict() for t in finished])
+
     trajectories = run_rounds(
         backend,
         slots,
@@ -232,14 +250,10 @@ def main() -> None:
         spec,
         critic=critic,
         rounds=args.rounds,
-        on_round_end=lambda r, active: artifacts.write_attempts(out_dir, active, r),
+        on_round_end=checkpoint,
     )
 
     n_written = artifacts.write_kernels(out_dir, trajectories)
-    artifacts.append_jsonl(
-        os.path.join(out_dir, "lint_loop.jsonl"),
-        [t.to_dict() for t in trajectories],
-    )
     report(trajectories, n_written, args.rounds, out_dir)
 
 

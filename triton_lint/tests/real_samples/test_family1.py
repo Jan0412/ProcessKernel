@@ -1,6 +1,8 @@
 """Family 1 ground truth from the 2026-07-13 hand audit."""
 
 
+import pytest
+
 from real_samples._loader import findings, full_report
 
 # ---------------------------------------------------------------------------
@@ -225,3 +227,106 @@ def test_f1_3_partial_sums_reduced_by_torch_sum_is_a_use():
 
 def test_f1_4_local_triton_submodule_is_not_a_fallback():
     assert findings(10000, 3, "F1.4") == []
+
+
+# ---------------------------------------------------------------------------
+# Fourth audit (2026-07-16), Family 1 against runs/gpt-oss-120b_kernelbook_level5_triton.
+# BUG-21, BUG-22, BUG-23 -- all open. See BUGS.md.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-21: `@torch.jit.script_if_tracing` on the preserved PyTorch training "
+    "path is swept up by the `torch.jit.script` startswith prefix. It compiles only "
+    "under torch.jit.trace, so the timed forward -- which dispatches to the Triton "
+    "inference path -- offloads nothing",
+)
+def test_f1_7_script_if_tracing_is_not_an_offload():
+    assert findings(1510, 9, "F1.7") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-22: gather_kernel decomposes a flat index (`w = idx % W`, `h = idx // W`) "
+    "and gathers through the hoisted address `inp_ptr`; the address arithmetic is the "
+    "task. Both addresses are hoisted into locals, so both offset signatures collapse "
+    "to frozenset() and the kernel is classified `copy`",
+)
+def test_f1_6_hoisted_gather_is_not_a_decoy():
+    assert findings(17827, 1, "F1.6") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-22: hflip_kernel loads column `rev_col = width - 1 - col` and stores "
+    "column `col` -- a horizontal flip, where the reversal lives entirely in the two "
+    "hoisted addresses. Reported as performing none of the task's computation",
+)
+def test_f1_6_hoisted_hflip_is_not_a_decoy():
+    assert findings(369, 5, "F1.6") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-23: the per-batch loop binds `c_ptr = out[b]`, a subscript view into "
+    "the allocated `out`, which the helper returns two lines below the loop. The "
+    "subscript alias is not recorded, so the matmul's output reads as discarded",
+)
+def test_f1_3_kernel_writing_a_batch_slice_is_not_discarded():
+    assert findings(2141, 4, "F1.3") == []
+
+
+# ---------------------------------------------------------------------------
+# F1.5 nn_module_call -- BUG-24 (module-wide attr table)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-24: Conv3x3Triton holds nn.Conv2d only to own the weights and calls "
+    "triton_conv3x3_elu(x, self.conv.weight, self.conv.bias); ModelNew.forward calls "
+    "that module. No nn.Conv2d is ever invoked in the file -- the conv is the Triton "
+    "kernel. The holder's `self.conv` poisons the module-wide nn_modules_in_init, so "
+    "ModelNew's own module is reported at fail as invoking nn.Conv2d, and the advice "
+    "prescribes the weight-holder pattern the file already implements",
+)
+def test_f1_5_local_submodule_sharing_the_holders_attr_name():
+    assert findings(2179, 3, "F1.5") == []
+
+
+def test_f1_5_wrapper_around_nn_conv_still_fires():
+    """Guards the fix: p13387_s5 rebinds `self.conv_0 = EqualizedLR(self.conv_0)`
+    *within one __init__*, and EqualizedLR.forward calls `self.module.forward(...)` --
+    cuDNN still computes the conv, so this must keep failing. Qualifying the table by
+    class preserves it; adding a kill-on-rebind instead would turn it into a miss.
+    """
+    found = findings(13387, 5, "F1.5")
+    assert [f.severity for f in found] == ["fail"]
+    assert [m["attr"] for m in found[0].data["modules"]] == ["shortcut", "conv_0", "conv_1"]
+
+
+# ---------------------------------------------------------------------------
+# F1.2 dead_kernel -- BUG-25 (missing entry class mutes the gate)
+# ---------------------------------------------------------------------------
+
+
+def test_f1_2_real_generation_with_no_entry_class_is_loadable_ground_truth():
+    """Premise for the xfail below: this really is a bare kernel with no class.
+
+    From the Qwen3.6-27B lintloop run, where 407 of 1000 slots ended like this.
+    """
+    report = full_report(100, 0, level=1)
+    assert report.parse_status == "ok"
+    assert [f.check_id + ":" + f.severity for f in report.findings] == ["F1.2:info"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-25: the whole generation is one @triton.jit hinge-loss kernel with no "
+    "ModelNew, so KernelBench's getattr(module, 'ModelNew') cannot load it and the "
+    "sample scores zero. F1.2 reports info, which is not actionable, so the lintloop "
+    "marked this slot clean and stopped at round 0",
+)
+def test_f1_2_real_generation_with_no_entry_class_is_a_fail():
+    assert [f.severity for f in findings(100, 0, "F1.2", level=1)] == ["fail"]

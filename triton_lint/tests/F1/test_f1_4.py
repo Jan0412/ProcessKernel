@@ -7,9 +7,12 @@ for HEAVY_OPS. Only code the timed forward() executes is scanned.
 
 from __future__ import annotations
 
+import pytest
+
 from conftest import ELEMENTWISE_KERNEL, src
 from helpers import forward_with, lint, lint_raw
 
+from triton_lint import build_model
 from triton_lint.checks.family1 import f1_4_torch_fallback
 from triton_lint.model import ModuleModel
 
@@ -406,3 +409,184 @@ def test_local_triton_submodule_is_not_a_fallback():
 
 def test_local_helper_function_is_not_a_fallback():
     assert lint(LOCAL_HELPER_FN, "F1.4") == []
+
+
+# BUG-24: `_is_local_call` consults `model.nn_modules_in_init` *before* `attr_classes`
+# and returns False on a hit, so a poisoned entry overrides the local-submodule guard
+# above and re-opens BUG-16. The table is keyed on the bare attribute name for the
+# whole file and is filled from every class's __init__ regardless of reachability, so
+# a dead reference class -- which these generations routinely keep beside ModelNew --
+# is enough to poison it.
+DEAD_REFERENCE_CLASS = '''
+class Reference(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(n)
+
+    def forward(self, x):
+        return self.layer_norm(x)
+
+'''
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-24: appending an unreachable reference class that binds "
+    "`self.layer_norm = nn.LayerNorm(n)` poisons the module-wide nn_modules_in_init, "
+    "so _is_local_call returns False for ModelNew's own LayerNormTriton and F1.4 "
+    "grades it a heavy fallback at fail -- re-opening BUG-16 for this spelling. The "
+    "class never runs; test_local_triton_submodule_is_not_a_fallback is the same file "
+    "without it and passes",
+)
+def test_dead_reference_class_does_not_make_a_local_submodule_a_fallback():
+    assert lint(LOCAL_SUBMODULE + DEAD_REFERENCE_CLASS, "F1.4") == []
+
+
+def test_control_attr_classes_still_resolves_the_local_submodule():
+    """The linter *knows* the attr is a local class -- F1.4 just never looks."""
+    model = build_model(src(ELEMENTWISE_KERNEL + LOCAL_SUBMODULE + DEAD_REFERENCE_CLASS), "<t>")
+    assert model.attr_classes["layer_norm"] == ["LayerNormTriton"]
+
+
+# BUG-26: BUG-16 diagnosed `_op_of` as matching op tokens "without checking the call
+# actually targets torch", and the fix (`_is_local_call`) whitelisted the code the
+# model wrote itself. A `tl.*` call is neither torch nor model-authored, so it still
+# falls through to the op-list match and is graded a PyTorch fallback.
+TL_IN_HOST = '''
+class ModelNew(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return REPL
+'''
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-26: `tl.sum` is a Triton builtin, not a PyTorch operator. Telling the "
+    "model to 'fold it into the Triton kernel so no work is left to PyTorch' describes "
+    "an op already spelled `tl.` and is not actionable -- p98_s6 of the Qwen3-Coder "
+    "lintloop run carried it through every round of the loop unchanged",
+)
+def test_triton_builtin_in_host_code_is_not_a_torch_fallback():
+    assert lint(TL_IN_HOST.replace("REPL", "tl.sum(out)"), "F1.4") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-26 severity face: `tl.dot` reduces to the op token `dot`, which is in "
+    "HEAVY_OPS, so a Triton builtin is reported at fail as 'the dominant cost of the "
+    "task -- it must be implemented as a Triton kernel'. Real sample p15299_s5 forgot "
+    "the @triton.jit decorator, so F1.1 correctly fails it; this co-finding points at "
+    "the tl.dot inside the kernel body and can send the model rewriting the kernel "
+    "rather than adding the decorator",
+)
+def test_triton_dot_in_host_code_is_not_a_heavy_torch_fallback():
+    assert lint(TL_IN_HOST.replace("REPL", "tl.dot(out, out)"), "F1.4") == []
+
+
+def test_control_torch_sum_in_the_same_position_still_fires():
+    """Pins BUG-26 to the `tl.` namespace, not to the position or the op token."""
+    found = lint(TL_IN_HOST.replace("REPL", "torch.sum(out)"), "F1.4")
+    assert [f.severity for f in found] == ["warn"]
+    assert found[0].data["ops"] == ["torch.sum"]
+
+
+# BUG-27: `_host_scopes` is `model.timed_scopes if model.entry else set(model.functions)`.
+# The fallback abandons the precision the docstring is built on and scans *every*
+# function in the file -- including the autograd `backward` the docstring names as the
+# thing that must never be scanned. It triggers whenever ModelNew inherits its forward
+# rather than defining one, which resolves `entry` to None.
+INHERITED_FORWARD = '''
+class Reference(nn.Module):
+    """The original PyTorch model, left in the file. Nothing constructs it."""
+    def __init__(self, n):
+        super().__init__()
+        self.fc = nn.Linear(n, n)
+
+    def forward(self, x):
+        return torch.matmul(self.fc(x), x)
+
+
+class Base(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+
+
+class ModelNew(Base):
+    pass
+'''
+
+#: The sole edit: a forward that delegates to the one it would have inherited anyway.
+EXPLICIT_FORWARD = INHERITED_FORWARD.replace(
+    "class ModelNew(Base):\n    pass",
+    "class ModelNew(Base):\n    def forward(self, x):\n        return super().forward(x)",
+)
+
+AUTOGRAD_BACKWARD = '''
+class MyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        return torch.matmul(g, g)
+
+
+class Base(nn.Module):
+    def forward(self, x):
+        return MyFn.apply(x)
+
+
+class ModelNew(Base):
+    pass
+'''
+
+
+def test_inherited_forward_leaves_entry_unresolved():
+    """Premise: `class ModelNew(Base): pass` is what puts `_host_scopes` on the
+    all-functions fallback. The class is found; only its forward is inherited."""
+    model = build_model(src(ELEMENTWISE_KERNEL + INHERITED_FORWARD), "<t>")
+    assert model.model_class == "ModelNew"
+    assert model.entry is None
+    assert model.notes == ["ModelNew has no forward()"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-27: ModelNew inherits its forward, so entry is None and _host_scopes "
+    "falls back to every function in the file. The dead `Reference` class -- the "
+    "original PyTorch model, which nothing constructs -- is scanned and its "
+    "torch.matmul reported at fail as what the timed forward computes",
+)
+def test_dead_reference_class_is_not_scanned_when_forward_is_inherited():
+    assert lint(INHERITED_FORWARD, "F1.4") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-27: the fallback scans the autograd `backward` that the _host_scopes "
+    "docstring explicitly names as excluded ('backward/jvp/vmap never run under the "
+    "benchmark's forward call, so a torch op there is not a fallback'). This re-opens "
+    "the founding false positive of this whole audit history -- the pure-Triton Mish "
+    "with a torch backward, p32_s6 -- for any solution that inherits its forward. "
+    "Real sample: p14770_s6",
+)
+def test_autograd_backward_is_not_scanned_when_forward_is_inherited():
+    assert lint(AUTOGRAD_BACKWARD, "F1.4") == []
+
+
+def test_control_an_explicit_delegating_forward_is_silent():
+    """The whole bug in one pair. This file differs from INHERITED_FORWARD only by a
+    `def forward(self, x): return super().forward(x)` -- behaviourally identical code
+    -- and it goes from `fail` to silent. The verdict tracks whether the entry point
+    is spelled out, not what the model computes.
+    """
+    model = build_model(src(ELEMENTWISE_KERNEL + EXPLICIT_FORWARD), "<t>")
+    assert model.entry == "ModelNew.forward"
+    assert lint(EXPLICIT_FORWARD, "F1.4") == []

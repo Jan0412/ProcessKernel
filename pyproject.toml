@@ -10,7 +10,8 @@ dependencies = [
     "datasets>=5.0.0",
     "kernelbench",
     "torch",
-    "vllm==0.24.0",
+    "vllm==0.25.1",
+
 ]
 
 [dependency-groups]
@@ -20,5 +21,5 @@ dev = ["pytest>=8"]
 kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["triton_lint/tests"]
 

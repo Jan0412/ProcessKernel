@@ -9,6 +9,9 @@ is what lands on disk.
 from __future__ import annotations
 
 import os
+import sys
+
+import pytest
 
 from kernel_gen.core import artifacts
 from kernel_gen.core.backend import FakeBackend
@@ -178,6 +181,89 @@ def test_check_filtering_narrows_what_the_loop_enforces(tmp_path):
     repair = backend.batches[1][0]
     assert "F1.2" in repair
     assert "F1.4" not in repair
+
+
+# -- surviving a crash -----------------------------------------------------
+#
+# These drive main() rather than run_rounds, because what they pin lives there: the
+# checkpoint callback, --skip-existing, and the run dir eval globs.
+
+#: main() builds prompts with the real KernelBench constructor, which embeds
+#: ref_arch_src and never mentions the problem name -- so a marker in the source is the
+#: only thing a prompt-keyed rule can discriminate on. Both variants are plain relu, so
+#: HONEST is clean for either.
+MARKED_REF = REF.replace("import torch.nn as nn", "import torch.nn as nn\n\n# variant: {marker}")
+ALPHA = Problem(level=1, problem_id=19, name="19_ReLU.py",
+                ref_arch_src=MARKED_REF.format(marker="ALPHA"))
+BETA = Problem(level=1, problem_id=20, name="20_ReLU.py",
+               ref_arch_src=MARKED_REF.format(marker="BETA"))
+CRASH_RULES = [("variant: ALPHA", HONEST), ("variant: BETA", CHEATING)]
+
+
+class CrashingBackend(FakeBackend):
+    """Dies the way EngineCore did in job 2339985: mid-generate, on round 1's batch."""
+
+    def complete(self, prompts, **kwargs):
+        if self.batches:
+            raise RuntimeError("CUDA error: unspecified launch failure (simulated)")
+        return super().complete(prompts, **kwargs)
+
+
+def drive_main(monkeypatch, out_dir, backend, *, skip_existing):
+    from kernel_gen.arms import lintloop
+    from kernel_gen.core import backend as backend_module
+
+    monkeypatch.setattr(backend_module, "VLLMBackend", lambda *a, **k: backend)
+    monkeypatch.setattr(lintloop, "load_problems", lambda *a, **k: [ALPHA, BETA])
+    # think-temperature 0 -> single-pass sampling, so one complete() per round and
+    # CrashingBackend's batch index is the round index.
+    argv = ["lintloop", "--model", "fake", "--level", "1", "--problems", "19,20",
+            "--num-samples", "2", "--rounds", "3", "--think-temperature", "0",
+            "--output-dir", out_dir]
+    if skip_existing:
+        argv.append("--skip-existing")
+    monkeypatch.setattr(sys, "argv", argv)
+    lintloop.main()
+
+
+def flat_kernels(out_dir):
+    return sorted(f for f in os.listdir(out_dir) if f.endswith("_kernel.py"))
+
+
+def test_a_crash_costs_only_the_slots_still_in_flight(tmp_path, monkeypatch):
+    from kernel_gen.arms import lintloop
+
+    out = str(tmp_path)
+    with pytest.raises(RuntimeError, match="unspecified launch failure"):
+        drive_main(monkeypatch, out, CrashingBackend(rules=CRASH_RULES), skip_existing=False)
+
+    # Problem 19 went clean in round 0, so it is journaled and its kernel is on disk
+    # even though the process died in round 1 -- 13 hours of GPU time that used to be
+    # thrown away. Problem 20 was still in flight and is not recorded: resuming from
+    # its half-finished trajectory would score a dirty intermediate.
+    done = artifacts.read_jsonl(lintloop.lint_log_path(out))
+    assert {(r["problem_id"], r["sample_id"]) for r in done} == {(19, 0), (19, 1)}
+    assert len(flat_kernels(out)) == 2
+
+
+def test_a_resumed_run_dir_holds_every_slot_not_just_the_ones_it_ran(tmp_path, monkeypatch):
+    from kernel_gen.arms import lintloop
+
+    out = str(tmp_path)
+    with pytest.raises(RuntimeError):
+        drive_main(monkeypatch, out, CrashingBackend(rules=CRASH_RULES), skip_existing=False)
+
+    repairing = FakeBackend(rules=[(REPAIR_MARKER, HONEST)] + CRASH_RULES)
+    drive_main(monkeypatch, out, repairing, skip_existing=True)
+
+    # The second session ran only problem 20's two slots, but eval globs this dir and
+    # "N samples per problem" is a contract the whole downstream is built on -- so the
+    # slots it skipped must still be here, and none may be journaled twice.
+    keys = [(r["problem_id"], r["sample_id"])
+            for r in artifacts.read_jsonl(lintloop.lint_log_path(out))]
+    assert sorted(keys) == [(19, 0), (19, 1), (20, 0), (20, 1)]
+    assert len(keys) == len(set(keys))
+    assert len(flat_kernels(out)) == 4
 
 
 def test_round_dirs_stay_invisible_to_the_non_recursive_eval_glob(tmp_path):
