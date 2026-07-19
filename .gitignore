@@ -1,14 +1,37 @@
-data/
-mlruns/
-mlflow_runs/
+# --- Python ---
 *.pyc
 __pycache__/
+.python-version
 .venv/
+.pytest_cache/
+.coverage
+
+# --- Dependency / build ---
 uv.lock
+
+# --- Editor / tooling ---
+.vscode/
+.claude/
+.claude-config
+
+# --- Experiment tracking ---
+mlruns/
+mlflow_runs/
 mlflow.db
-level5/
+
+# --- Caches / links ---
 .hf_cache/
-runs/
+.cuda_link/
+reranker/data/
+
+# --- Vendored benchmark (installed via pyproject git source) ---
 KernelBench/
+
+# --- Generated artifacts ---
+runs/
+level5/
+linter_findings.jsonl
+
+# --- SLURM logs ---
 *.err
 *.out
