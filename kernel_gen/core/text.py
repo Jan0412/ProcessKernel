@@ -6,19 +6,45 @@ docstring. Keep them byte-equivalent in behavior until the arms are ported.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
+import textwrap
 
-_FENCED = re.compile(r"```python\s*(.*?)```", re.DOTALL)
 _LEADING_ID = re.compile(r"(\d+)")
 
 
 def extract_code_block(text: str) -> str:
-    """The first ```python fenced block, or the whole text with fences stripped."""
-    match = _FENCED.search(text)
+    """The first ```python / ```py fenced block, dedented; else the text from its first
+    Python statement, with leading prose and stray fences removed.
+
+    A newline is required after the language tag so an *indented* fence (nested under
+    prose or a list item) does not have the first code line's indentation eaten while the
+    rest keep theirs -- ``textwrap.dedent`` then restores a uniform block. When no fence
+    is present, leading prose ("## Plan", a numbered list) is dropped by resuming at the
+    first Python statement, but only when that turns an unparseable blob into a parseable
+    one -- so a bare file that merely opens with a comment is returned untouched.
+    """
+
+    def _parses(src: str) -> bool:
+        try:
+            ast.parse(src)
+            return True
+        except (SyntaxError, ValueError):
+            return False
+
+    match = re.search(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", text, re.DOTALL)
     if match:
-        return match.group(1).strip()
-    return re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip())
+        return textwrap.dedent(match.group(1)).strip()
+
+    stripped = textwrap.dedent(re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip()))
+    if not _parses(stripped):
+        head = re.search(r"^[ \t]*(?:import\s|from\s|@|def\s|class\s)", stripped, re.MULTILINE)
+        if head:
+            candidate = textwrap.dedent(stripped[head.start():]).strip()
+            if _parses(candidate):
+                return candidate
+    return stripped.strip()
 
 
 def parse_int_spec(spec: str) -> list[int]:

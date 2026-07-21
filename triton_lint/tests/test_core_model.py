@@ -6,6 +6,8 @@ a kernel worse, and this is what stops a run from shipping the regression.
 
 from __future__ import annotations
 
+import ast
+
 from kernel_gen.core.model import Attempt, Problem, Review, Trajectory
 from kernel_gen.core.text import extract_code_block, parse_int_spec, problem_id_from_name
 
@@ -39,6 +41,44 @@ def test_extract_code_block_takes_the_fenced_block():
 
 def test_extract_code_block_falls_back_to_the_whole_text():
     assert extract_code_block("import torch") == "import torch"
+
+
+def test_extract_code_block_dedents_an_indented_fence():
+    # The fence is nested under an explanation, so the whole block is indented. A bare
+    # `\s*` capture would eat only the first line's indent and leave the rest -> an
+    # IndentationError on line 2. The fix requires a newline then dedents.
+    raw = (
+        "Here is the solution:\n\n"
+        "    ```python\n"
+        "    import torch\n"
+        "    import triton\n"
+        "    ```\n"
+    )
+    out = extract_code_block(raw)
+    assert out == "import torch\nimport triton"
+    ast.parse(out)
+
+
+def test_extract_code_block_accepts_py_and_bare_language_tags():
+    assert extract_code_block("```py\nimport torch\n```") == "import torch"
+    assert extract_code_block("```\nimport torch\n```") == "import torch"
+
+
+def test_extract_code_block_drops_leading_prose_when_there_is_no_fence():
+    # The model emitted a plan and then code with no ```python fence; the old fallback
+    # returned the whole thing (prose is not valid Python). We resume at the first
+    # statement, but only because that makes it parse.
+    raw = "## Plan\n1. Analyze the model.\n2. Write it.\n\nimport torch\n@triton.jit\ndef k():\n    pass\n"
+    out = extract_code_block(raw)
+    assert out.startswith("import torch")
+    ast.parse(out)
+
+
+def test_extract_code_block_keeps_a_leading_comment_in_bare_code():
+    # Regression guard: a fence-less file that merely opens with a comment already
+    # parses, so the prose-skip must NOT fire and drop the comment.
+    raw = "# my fused kernel\nimport torch\n"
+    assert extract_code_block(raw) == "# my fused kernel\nimport torch"
 
 
 def test_parse_int_spec():

@@ -19,10 +19,12 @@ Example:
 """
 
 import argparse
+import ast
 import json
 import os
 import re
 import sys
+import textwrap
 
 import torch
 
@@ -58,10 +60,36 @@ def parse_problems(spec: str) -> list[int]:
 
 
 def extract_code_block(text: str) -> str:
-    match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
+    """The first ```python / ```py fenced block, dedented; else the text from its first
+    Python statement, with leading prose and stray fences removed.
+
+    A newline is required after the language tag so an *indented* fence (nested under
+    prose or a list item) does not have the first code line's indentation eaten while the
+    rest keep theirs -- ``textwrap.dedent`` then restores a uniform block. When no fence
+    is present, leading prose ("## Plan", a numbered list) is dropped by resuming at the
+    first Python statement, but only when that turns an unparseable blob into a parseable
+    one -- so a bare file that merely opens with a comment is returned untouched.
+    """
+
+    def _parses(src: str) -> bool:
+        try:
+            ast.parse(src)
+            return True
+        except (SyntaxError, ValueError):
+            return False
+
+    match = re.search(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", text, re.DOTALL)
     if match:
-        return match.group(1).strip()
-    return re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip())
+        return textwrap.dedent(match.group(1)).strip()
+
+    stripped = textwrap.dedent(re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip()))
+    if not _parses(stripped):
+        head = re.search(r"^[ \t]*(?:import\s|from\s|@|def\s|class\s)", stripped, re.MULTILINE)
+        if head:
+            candidate = textwrap.dedent(stripped[head.start():]).strip()
+            if _parses(candidate):
+                return candidate
+    return stripped.strip()
 
 
 def problem_id_from_name(name: str, fallback: int) -> int:
