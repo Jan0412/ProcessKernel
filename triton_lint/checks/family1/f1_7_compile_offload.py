@@ -12,24 +12,28 @@ from __future__ import annotations
 from ...model import Finding, ModuleModel
 from .. import register
 
-OFFLOAD_CALLS = (
-    "torch.compile",
-    "torch.jit.script",
-    "torch.jit.trace",
-    "torch._dynamo",
-    "torch._inductor",
-)
+#: Exact offloader names -- matched literally, never by prefix. `str.startswith` swept in
+#: every longer name in these namespaces: `torch.compile` caught the whole `torch.compiler.*`
+#: namespace (`torch.compiler.disable` *opts out* of compilation), and `torch.jit.script`
+#: caught `torch.jit.script_if_tracing` (a no-op outside tracing) -- see BUG-21.
+OFFLOAD_EXACT = frozenset({"torch.compile", "torch.jit.script", "torch.jit.trace"})
+
+#: Whole namespaces that are compilation machinery -- matched on a dot boundary so
+#: `torch._dynamo.optimize` hits but a hypothetical `torch._dynamox` would not.
+OFFLOAD_NAMESPACES = ("torch._dynamo", "torch._inductor")
+
+
+def _is_offload(name: str) -> bool:
+    if name in OFFLOAD_EXACT:
+        return True
+    return any(name == ns or name.startswith(ns + ".") for ns in OFFLOAD_NAMESPACES)
 
 
 @register("F1.7", "compile_offload", "fail")
 def check(model: ModuleModel) -> list[Finding]:
     # Not restricted to reachable code: a @torch.compile decorator runs at class
     # definition time and still routes the computation away from Triton.
-    hits = [
-        (c.qualname, c.lineno)
-        for c in model.host_calls
-        if any(c.qualname.startswith(prefix) for prefix in OFFLOAD_CALLS)
-    ]
+    hits = [(c.qualname, c.lineno) for c in model.host_calls if _is_offload(c.qualname)]
     if not hits:
         return []
 

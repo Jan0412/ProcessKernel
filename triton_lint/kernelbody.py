@@ -140,6 +140,35 @@ def _scalar_params(node: ast.FunctionDef, params: dict[str, ParamRole]) -> set[s
             for name in _names(operand):
                 if name in params:
                     scalars.add(name)
+
+    # A scalar offset parameter used *purely additively* -- on an address spine
+    # (`tl.store(dst_ptr + dst_offset + offs, v)`, BUG-29) or added onto a grid index in a
+    # local (`out_h = h + pad_top`, a padding relocation, BUG-32) -- is never multiplied or
+    # compared, so the pass above misses it and it is mistaken for a base pointer. Identify
+    # it structurally over *every* additive expression: the leading bare-Name parameter term
+    # is the base pointer; any further parameter term is a scalar offset. Because addresses
+    # are written `base + offset`, a hoisted base pointer (`inp = inp_ptr + rev_col`) is
+    # always the leading term and is protected -- so this never demotes a real pointer and
+    # corrupts kernel roles (a reversed `offset + base` spelling can only drop an offset).
+    base_params: set[str] = set()
+    offset_params: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.BinOp) and isinstance(sub.op, (ast.Add, ast.Sub)):
+            terms = _additive_terms(sub)
+            param_terms = [t.id for t in terms if isinstance(t, ast.Name) and t.id in params]
+            if not param_terms:
+                continue
+            # The base pointer is the *leading term* iff that term is a bare parameter
+            # (`base_ptr + offset`); its further parameter terms are offsets. When the
+            # leading term is not a parameter (`h + pad_top`: an index plus a shift), there
+            # is no base here and every parameter term is a scalar offset.
+            first = terms[0]
+            if isinstance(first, ast.Name) and first.id in params:
+                base_params.add(first.id)
+                offset_params.update(param_terms[1:])
+            else:
+                offset_params.update(param_terms)
+    scalars |= offset_params - base_params
     return scalars
 
 
@@ -153,6 +182,10 @@ class _BodyVisitor(ast.NodeVisitor):
         self.taint: dict[str, set[str]] = {}
         # local variable -> params it is a *pointer* into (see _pointer_operands)
         self.ptr_taint: dict[str, set[str]] = {}
+        # pointer local -> the offset signature carried by the address it was bound to
+        # (`inp = x_ptr + rev_col` -> {rev_col}); empty for a pure base. Preserves the
+        # offset when a full base+offset address is hoisted into a local (see BUG-22).
+        self.ptr_offset: dict[str, frozenset[str]] = {}
         # locals assigned straight from a tl.load with no arithmetic on the value,
         # mapped to the *offset signature* of the load address (see _offset_signature)
         self.pure_load: dict[str, frozenset[str]] = {}
@@ -163,6 +196,20 @@ class _BodyVisitor(ast.NodeVisitor):
         self.accum_in_loop = False
         # (stored value expr, is it a straight memcpy of a load at the same offset)
         self.stores: list[tuple[ast.expr, bool]] = []
+        # locals derived from tl.arange / tl.program_id -- the grid sweep (see coverage)
+        self.index_locals: set[str] = set()
+        # locals whose value depends (transitively) on a tl.load -- a data-dependent index
+        # (a scatter / one-hot target), even through a `.to()` cast
+        self.loaded_taint: set[str] = set()
+        # locals whose additive spine carries a scalar-parameter shift or a loaded index,
+        # i.e. a relocated / data-dependent address that does not cover the full buffer
+        self.relocated: set[str] = set()
+        # the kernel has a program_id-guarded early return (`if pid_m < pid_n: return`) --
+        # a data-dependent block skip, so no store covers every tile (BUG-36)
+        self.conditional_skip = False
+        # local -> the expression it was assigned, so a store's `mask=local` resolves to the
+        # predicate that defines it (`mask = off_m >= off_n`) -- see _is_conditional_mask
+        self.mask_defs: dict[str, ast.expr] = {}
 
     # -- taint ------------------------------------------------------------
 
@@ -210,12 +257,20 @@ class _BodyVisitor(ast.NodeVisitor):
         Two loads/stores address the same element iff their offset signatures match.
         A straight ``x_ptr + offs`` and ``out_ptr + offs`` share ``{offs}``; a gather
         ``x_ptr + offs*2`` does not match ``out_ptr + offs``.
+
+        A base-pointer term that is a *hoisted local* (``inp = x_ptr + rev_col``) carries
+        its own offset, which is part of the address and must not be stripped away with the
+        base -- otherwise the flip/gather offset vanishes and the kernel looks like a memcpy
+        (BUG-22). A pure base pointer carries the empty set and contributes nothing.
         """
-        return frozenset(
-            ast.dump(term)
-            for term in _additive_terms(addr)
-            if not self._is_base_ptr_term(term)
-        )
+        sig: set[str] = set()
+        for term in _additive_terms(addr):
+            if self._is_base_ptr_term(term):
+                if isinstance(term, ast.Name):
+                    sig |= self.ptr_offset.get(term.id, frozenset())
+            else:
+                sig.add(ast.dump(term))
+        return frozenset(sig)
 
     def _mark(self, node: ast.expr, *, stored=False, loaded=False, atomic=False) -> None:
         for name in self.pointers(node):
@@ -224,9 +279,75 @@ class _BodyVisitor(ast.NodeVisitor):
             role.loaded |= loaded
             role.atomic |= atomic
 
-    def _mark_partial(self, addr: ast.expr) -> None:
+    def _is_index_expr(self, node: ast.expr) -> bool:
+        """*node* is part of the grid sweep -- derived from ``tl.arange``/``tl.program_id``
+        (an index tensor), as opposed to a scalar size/param or a loaded value."""
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and _tl_func(sub) in ("arange", "program_id"):
+                return True
+        return any(n in self.index_locals for n in _names(node))
+
+    def _has_param_shift(self, value: ast.expr) -> bool:
+        """The additive spine of *value* adds a bare kernel parameter onto a grid index
+        (``h + pad_top``, ``channel_offset + c``) -- a relocation that shifts the write off
+        the full sweep. Only an *additive* bare-parameter term counts: a multiplicative
+        stride (``idx * stride``) is not a shift, and a hoisted base pointer term is harmless
+        (its local is a load/store base, never a store *offset* term)."""
+        terms = _additive_terms(value)
+        has_index = any(self._is_index_expr(t) for t in terms)
+        has_param = any(
+            isinstance(t, ast.Name) and t.id in self.kernel.params for t in terms
+        )
+        return has_index and has_param
+
+    def _is_data_dependent(self, value: ast.expr) -> bool:
+        return _contains_tl_mem(value) or any(n in self.loaded_taint for n in _names(value))
+
+    def _is_conditional_mask(self, mask: ast.expr | None) -> bool:
+        """A store mask comparing two grid indices (``off_m >= off_n``) restricts the write
+        to a data-dependent triangle -- the rest of the buffer keeps its zeros. A bounds mask
+        (``offs < n``: an index vs a scalar size) does not (BUG-36). Resolves a bound mask
+        local (``mask = off_m >= off_n``) and looks through ``&``/``|`` combinations."""
+        if isinstance(mask, ast.Name) and mask.id in self.mask_defs:
+            return self._is_conditional_mask(self.mask_defs[mask.id])
+        if isinstance(mask, ast.Compare):
+            operands = [mask.left, *mask.comparators]
+            return len(operands) >= 2 and all(self._is_index_expr(op) for op in operands)
+        if isinstance(mask, ast.BoolOp):
+            return any(self._is_conditional_mask(v) for v in mask.values)
+        if isinstance(mask, ast.BinOp) and isinstance(mask.op, (ast.BitAnd, ast.BitOr)):
+            return self._is_conditional_mask(mask.left) or self._is_conditional_mask(mask.right)
+        if isinstance(mask, ast.UnaryOp):
+            return self._is_conditional_mask(mask.operand)
+        return False
+
+    def _is_full_coverage_store(self, addr: ast.expr, mask: ast.expr | None) -> bool:
+        """The store provably writes every element of its buffer: a plain grid sweep with
+        no partial-coverage signal. Anything unproven defaults to *not* full -- the sound
+        direction, since F2.4's "use empty_like" advice corrupts an unwritten region."""
         offset_terms = [t for t in _additive_terms(addr) if not self._is_base_ptr_term(t)]
-        if not _is_partial_coverage(offset_terms):
+        if _is_partial_coverage(offset_terms):
+            return False  # repeated index (diagonal) or literal stride >= 2 (BUG-8)
+        for term in offset_terms:
+            if isinstance(term, ast.Name) and (
+                term.id in self.scalar_params  # additive scalar-param shift (concat)
+                or term.id in self.relocated   # a local built from such a shift (pad)
+            ):
+                return False
+            if any(n in self.loaded_taint for n in _names(term)):
+                return False  # a data-dependent (loaded) scatter / one-hot index
+            if _contains_tl_mem(term):
+                return False  # the term embeds a load -- a data-dependent address
+            if not self._is_index_expr(term):
+                return False  # not a grid-derived sweep term (an opaque / constant offset)
+        if self._is_conditional_mask(mask):
+            return False  # triangular / conditional store mask (BUG-36)
+        if self.conditional_skip:
+            return False  # a program_id-guarded early return skips whole tiles (BUG-36)
+        return True
+
+    def _mark_partial(self, addr: ast.expr, mask: ast.expr | None = None) -> None:
+        if self._is_full_coverage_store(addr, mask):
             return
         for name in self.pointers(addr):
             self.kernel.params[name].partial_store = True
@@ -238,6 +359,23 @@ class _BodyVisitor(ast.NodeVisitor):
         tainted = self.derived(node.value)
         pointed = self.pointers(node.value)
         load_sig = self._load_signature(node.value)
+        ptr_off = self._offset_signature(node.value) if pointed else None
+        is_index = self._is_index_expr(node.value)
+        is_data_dep = self._is_data_dependent(node.value)
+        # relocated: the value shifts the write off the full sweep. Either a parameter is
+        # added onto a grid index (`h + pad_top`), or it references an already-relocated
+        # local anywhere -- the shift survives any arithmetic (`(base + out_c) * stride`) --
+        # or a bare scalar/loaded term sits on its additive spine. A multiplicative stride
+        # (`idx * BLOCK`) is deliberately *not* a relocation, so only bare additive
+        # scalar_params count, never a stride buried in a product.
+        is_relocated = (
+            self._has_param_shift(node.value)
+            or any(n in self.relocated for n in _names(node.value))
+            or any(
+                isinstance(t, ast.Name) and (t.id in self.scalar_params or t.id in self.loaded_taint)
+                for t in _additive_terms(node.value)
+            )
+        )
 
         # A loop-carried self-reference (`acc = tl.maximum(acc, v)`) is a reduction,
         # just like `acc += v`. A pointer advance (`p = p + BLOCK`, `pointed` non-empty)
@@ -253,12 +391,27 @@ class _BodyVisitor(ast.NodeVisitor):
                 self.taint[name] = set(tainted)
                 if pointed:
                     self.ptr_taint[name] = set(pointed)
+                    self.ptr_offset[name] = ptr_off or frozenset()
                 else:
                     self.ptr_taint.pop(name, None)
+                    self.ptr_offset.pop(name, None)
                 if load_sig is not None:
                     self.pure_load[name] = load_sig
                 else:
                     self.pure_load.pop(name, None)
+                if is_index:
+                    self.index_locals.add(name)
+                else:
+                    self.index_locals.discard(name)
+                if is_data_dep:
+                    self.loaded_taint.add(name)
+                else:
+                    self.loaded_taint.discard(name)
+                if is_relocated:
+                    self.relocated.add(name)
+                else:
+                    self.relocated.discard(name)
+                self.mask_defs[name] = node.value
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
@@ -269,6 +422,17 @@ class _BodyVisitor(ast.NodeVisitor):
         for name in target_names:
             self.taint.setdefault(name, set()).update(self.derived(node.value))
             self.pure_load.pop(name, None)
+
+    def visit_If(self, node: ast.If) -> None:
+        # A program_id-guarded early return (`if pid_m < pid_n: return`) skips whole tiles,
+        # so no store covers the full buffer -- the un-written region keeps its zeros (BUG-36
+        # block-skip). A comparison of two grid indices, as opposed to a bounds guard
+        # (`if pid >= n_blocks: return`, an index vs a scalar).
+        if any(isinstance(s, ast.Return) for s in node.body) and isinstance(node.test, ast.Compare):
+            operands = [node.test.left, *node.test.comparators]
+            if len(operands) >= 2 and all(self._is_index_expr(op) for op in operands):
+                self.conditional_skip = True
+        self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
         self.loop_depth += 1
@@ -305,7 +469,13 @@ class _BodyVisitor(ast.NodeVisitor):
                 self._mark(ptr, loaded=True)
             elif fn == "store":
                 self._mark(ptr, stored=True)
-                self._mark_partial(ptr)
+                mask = None
+                for kw in node.keywords:
+                    if kw.arg == "mask":
+                        mask = kw.value
+                if mask is None and len(node.args) >= 3:
+                    mask = node.args[2]  # tl.store(ptr, value, mask)
+                self._mark_partial(ptr, mask)
                 if len(node.args) > 1:
                     value = node.args[1]
                     matching = self._is_matching_copy(value, self._offset_signature(ptr))

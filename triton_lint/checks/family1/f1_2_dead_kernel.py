@@ -45,8 +45,12 @@ def check(model: ModuleModel) -> list[Finding]:
     if not dead:
         return []
 
-    # Without a resolvable entry point we cannot prove unreachability.
-    severity = "fail" if model.entry else "info"
+    # A file with no entry-point class at all cannot be loaded by KernelBench's
+    # `getattr(module, "ModelNew")`, so every kernel is provably dead -- a hard fail (the
+    # strongest F1.2 instance, and the one the check used to mute to a non-actionable info).
+    # When we resolved the forward the benchmark enters we can likewise prove unreachability;
+    # only a model_class whose forward we could *not* resolve stays info (BUG-25).
+    severity = "fail" if (model.forward_entry or model.model_class is None) else "info"
     findings = []
     for name in sorted(dead):
         kernel = model.kernels[name]

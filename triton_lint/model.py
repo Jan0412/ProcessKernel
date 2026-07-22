@@ -146,7 +146,11 @@ class ModuleModel:
     functions: dict[str, ast.FunctionDef] = field(default_factory=dict)
 
     model_class: str | None = None
-    entry: str | None = None  # e.g. "ModelNew.forward"
+    entry: str | None = None  # e.g. "ModelNew.forward"; None when forward is inherited
+    #: the forward the benchmark actually enters: ``entry`` if spelled out, else the
+    #: inherited ``"{Base}.forward"`` resolved through in-file bases (see parsing). This
+    #: is the reachability root; ``entry`` stays None for an inherited forward.
+    forward_entry: str | None = None
     #: conservative over-approximation: every function that could possibly run
     reachable: set[str] = field(default_factory=set)
     #: precise under-approximation: what the benchmark's forward() call executes
@@ -157,11 +161,17 @@ class ModuleModel:
     noncontiguous: set[str] = field(default_factory=set)
     buffers: dict[str, Buffer] = field(default_factory=dict)
     host_calls: list[HostCall] = field(default_factory=list)
-    nn_modules_in_init: dict[str, str] = field(default_factory=dict)
+    #: `nn.*` submodules bound in __init__, keyed by owning class then attribute:
+    #: {"ModelNew": {"conv": "nn.Conv2d"}}. Per-class so an `nn.*` binding in one class
+    #: cannot decide how an identically named attribute is judged in another (BUG-24).
+    nn_modules_in_init: dict[str, dict[str, str]] = field(default_factory=dict)
     #: classes defined in this file, and their methods ("Cls" -> ["Cls.forward", ...])
     local_classes: dict[str, list[str]] = field(default_factory=dict)
     #: `self.attr = SomeLocalClass(...)` -> {"attr": ["SomeLocalClass"]}
     attr_classes: dict[str, list[str]] = field(default_factory=dict)
+    #: attrs whose container construction (`nn.Sequential(...)`) also builds a heavy
+    #: `nn.*` module, so it is a genuine fallback even though it wraps a local class too.
+    containers_with_torch: set[str] = field(default_factory=set)
 
     input_shapes: list[tuple[tuple[int, ...], str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -172,18 +182,18 @@ class ModuleModel:
     def reachable_launches(self) -> list[LaunchSite]:
         """Launches in code reachable from the entry point.
 
-        With no resolvable entry point we cannot prove anything is unreachable,
+        With no resolvable forward entry we cannot prove anything is unreachable,
         so every launch counts. Checks that would fire on emptiness must
-        therefore also consult :attr:`entry`.
+        therefore also consult :attr:`forward_entry`.
         """
-        if self.entry is None:
+        if self.forward_entry is None:
             return list(self.launches)
         return [ls for ls in self.launches if ls.enclosing in self.reachable]
 
     @property
     def timed_launches(self) -> list[LaunchSite]:
         """Launches the timed forward() actually executes (see :attr:`timed_scopes`)."""
-        if self.entry is None:
+        if self.forward_entry is None:
             return list(self.launches)
         return [ls for ls in self.launches if ls.enclosing in self.timed_scopes]
 

@@ -26,9 +26,10 @@ References: same as F1.4 -- AutoTriton (arXiv:2507.05687), TritonRL (arXiv:2510.
 
 from __future__ import annotations
 
+from ...hostflow import NN_CONTAINERS
 from ...model import Finding, ModuleModel
 from .. import register
-from .f1_4_torch_fallback import _host_scopes
+from .f1_4_torch_fallback import _host_scopes, _nn_binding
 
 #: Launch no kernel (or are an identity) at inference -- calling them is not cheating.
 INERT_MODULES = {
@@ -69,11 +70,21 @@ def check(model: ModuleModel) -> list[Finding]:
         if call.enclosing not in scopes or not call.qualname.startswith("self."):
             continue
         attr = call.qualname.split(".", 1)[1]
-        cls = model.nn_modules_in_init.get(attr)
+        cls = _nn_binding(model, call.enclosing.rsplit(".", 1)[0], attr)
         if not cls:
-            continue
+            continue  # not an nn.* binding in this class -- not a fallback (BUG-24)
 
         name = _module_name(cls)
+        # BUG-30: a container (Sequential/ModuleList) that wraps only the file's own Triton
+        # modules invokes only kernels. It owns no weights and skipping the call would skip
+        # the kernels, so the "keep it as a weight holder" advice is nonsense. A container
+        # that also builds a real nn module (`containers_with_torch`) is still a fallback.
+        if (
+            name in NN_CONTAINERS
+            and attr in model.attr_classes
+            and attr not in model.containers_with_torch
+        ):
+            continue
         if name in INERT_MODULES:
             continue  # a no-op at inference: launches nothing, computes nothing
         if name in HEAVY_MODULES:

@@ -37,7 +37,7 @@ from __future__ import annotations
 import ast
 
 from ...model import Finding, ModuleModel
-from ...hostflow import _base_name
+from ...hostflow import _base_name, scoped
 from .. import register
 
 #: Ops that dominate a task's FLOPs. Falling back on one of these means the model
@@ -145,6 +145,57 @@ def _is_scalar_expr(node: ast.expr) -> bool:
     return False
 
 
+#: Python builtins that collide with op tokens (``round``/``abs``/``pow`` in LIGHT_OPS,
+#: ``sum`` too). A *bare* call to one (no namespace, not a tensor method) doing scalar
+#: grid/shape math is not a torch op -- see BUG-31. ``min``/``max``/``int``/``float`` are
+#: already PLUMBING_OPS.
+PY_SCALAR_BUILTINS = {"round", "abs", "pow", "sum"}
+
+
+def _operand_is_tensor(model: ModuleModel, scope: str, node: ast.expr) -> bool:
+    """*node*'s leftmost name resolves to a tensor buffer (a forward input or a tensor a
+    kernel wrote) -- as close to type inference as we get without running anything."""
+    name = _base_name(node)
+    if name is None:
+        return False
+    buf = model.buffers.get(model.canonical(scoped(scope, name)))
+    return buf is not None and (buf.is_forward_input or bool(buf.stored_by))
+
+
+def _call_touches_tensor(model: ModuleModel, scope: str, node: ast.Call) -> bool:
+    """Any argument (recursing into list/tuple/generator elements) is a tensor. Used to
+    tell a genuine ``sum([t1, t2])`` fallback from bare-scalar ``sum(l*l for l in levels)``."""
+    for arg in list(node.args) + [kw.value for kw in node.keywords]:
+        for sub in ast.walk(arg):
+            if isinstance(sub, ast.Name):
+                buf = model.buffers.get(model.canonical(scoped(scope, sub.id)))
+                if buf is not None and (buf.is_forward_input or bool(buf.stored_by)):
+                    return True
+    return False
+
+
+def _is_bare_scalar_builtin(model: ModuleModel, call, op: str) -> bool:
+    if call.is_method or "." in call.qualname or op not in PY_SCALAR_BUILTINS:
+        return False
+    if call.node is None:
+        return True  # a bare builtin with no resolvable args is scalar math
+    return not _call_touches_tensor(model, call.enclosing, call.node)
+
+
+def _nn_binding(model: ModuleModel, cls: str | None, attr: str) -> str | None:
+    """The ``nn.*`` class bound to ``self.<attr>`` for a call made in class ``cls``.
+
+    Checked per class (BUG-24): a binding in an unrelated class no longer decides how a
+    same-named attribute is judged here. Falls back to the constructed entry class, where
+    ``__init__`` bindings live when the forward is inherited (call is in a base method).
+    """
+    for candidate in (cls, model.model_class):
+        binding = model.nn_modules_in_init.get(candidate or "", {})
+        if attr in binding:
+            return binding[attr]
+    return None
+
+
 def _is_local_call(model: ModuleModel, call) -> bool:
     """The call targets code the model wrote itself, not a torch op.
 
@@ -159,8 +210,9 @@ def _is_local_call(model: ModuleModel, call) -> bool:
         return True
     if qualname.startswith("self."):
         attr = qualname.split(".", 1)[1].split(".", 1)[0]
-        if attr in model.nn_modules_in_init:
-            return False  # a real nn.Module call -- still a fallback
+        cls = call.enclosing.rsplit(".", 1)[0]
+        if _nn_binding(model, cls, attr) is not None:
+            return False  # a real nn.Module call in this class -- still a fallback
         if attr in model.attr_classes:
             return True  # local submodule assigned a file-defined class
         if model.model_class and f"{model.model_class}.{attr}" in model.functions:
@@ -177,7 +229,7 @@ def _host_scopes(model: ModuleModel) -> set[str]:
     because weight prep is legitimate even when an inline ``MyModule()(x)`` drags
     one onto the timed path.
     """
-    scopes = model.timed_scopes if model.entry else set(model.functions)
+    scopes = model.timed_scopes if model.forward_entry else set(model.functions)
     return {s for s in scopes if not s.endswith(".__init__")}
 
 
@@ -196,7 +248,11 @@ def check(model: ModuleModel) -> list[Finding]:
             continue
         if _is_local_call(model, call):
             continue  # model-authored code, not a torch fallback (F1.5 handles nn modules)
+        if call.qualname.split(".", 1)[0] in ("tl", "triton"):
+            continue  # BUG-26: a Triton builtin (tl.sum/tl.dot/...) in host scope is not torch
         op = _op_of(call.qualname)
+        if _is_bare_scalar_builtin(model, call, op):
+            continue  # BUG-31: bare round/abs/pow/sum on non-tensors is Python scalar math
         functional = _is_functional(call.qualname)
         if op in PLUMBING_OPS and not functional:
             continue
@@ -251,8 +307,6 @@ def _tensor_binops(model: ModuleModel, scopes: set[str]) -> list[Finding]:
     a forward input or to a tensor a kernel wrote, which is as close to type inference
     as we get without running anything.
     """
-    from ...hostflow import scoped
-
     hits: list[tuple[str, int]] = []
 
     for qual in sorted(scopes):
@@ -268,11 +322,7 @@ def _tensor_binops(model: ModuleModel, scopes: set[str]) -> list[Finding]:
             for operand in (sub.left, sub.right):
                 if _is_scalar_expr(operand):
                     continue  # x.numel() // 4 is scalar grid math, not tensor arithmetic
-                name = _base_name(operand)
-                if name is None:
-                    continue
-                buf = model.buffers.get(model.canonical(scoped(qual, name)))
-                if buf is not None and (buf.is_forward_input or buf.stored_by):
+                if _operand_is_tensor(model, qual, operand):
                     hits.append((symbol, sub.lineno))
                     break
 

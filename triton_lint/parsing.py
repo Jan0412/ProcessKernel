@@ -140,7 +140,41 @@ def build_skeleton(source: str, path: str = "") -> ModuleModel:
     else:
         model.notes.append("no entry-point class found")
 
+    # The forward the benchmark actually enters -- the reachability root. If the entry
+    # class spells out its own forward, that is it; otherwise resolve the one it inherits
+    # through in-file base classes (`class ModelNew(Base): pass`). `entry` stays None in the
+    # inherited case (checks that need "is a forward spelled out" still see None); analyses
+    # that need "what does the timed forward run" use forward_entry.
+    if model.entry:
+        model.forward_entry = model.entry
+    elif model.model_class:
+        model.forward_entry = _inherited_forward(tree, model.model_class, model.functions)
+
     return model
+
+
+def _inherited_forward(
+    tree: ast.Module, cls_name: str, functions: dict[str, ast.FunctionDef]
+) -> str | None:
+    """``"{Base}.forward"`` inherited by *cls_name* from an in-file base, or ``None``.
+
+    BFS the class's bases (a base itself may inherit), matching only classes defined in
+    this file -- an external base's forward is not something we can scan.
+    """
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    seen: set[str] = set()
+    queue = [cls_name]
+    while queue:
+        name = queue.pop(0)
+        if name in seen or name not in classes:
+            continue
+        seen.add(name)
+        for base in _base_names(classes[name]):
+            base_name = base.rsplit(".", 1)[-1]
+            if f"{base_name}.forward" in functions:
+                return f"{base_name}.forward"
+            queue.append(base_name)
+    return None
 
 
 def _resolve_model_class(tree: ast.Module) -> str | None:

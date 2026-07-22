@@ -61,6 +61,36 @@ METADATA_NEW = {
     "new_empty", "new_zeros", "new_ones", "new_full", "new_tensor", "new_empty_strided",
 }
 
+#: ``nn.*`` names that are not callable compute modules -- tensor holders that launch
+#: nothing and cannot be invoked, so they are never a fallback (BUG-24: ``nn.Parameter``).
+NON_MODULE_NN = {
+    "Parameter", "ParameterList", "ParameterDict",
+    "UninitializedParameter", "UninitializedBuffer",
+}
+
+#: ``nn.*`` containers: they own no compute of their own, so what matters is their
+#: contents -- a container of the file's own Triton modules is not a fallback (BUG-30).
+NN_CONTAINERS = {"Sequential", "ModuleList", "ModuleDict"}
+
+
+def _is_nn_module_ctor(dotted: str) -> bool:
+    """``nn.Conv2d`` / ``torch.nn.Sequential`` -> True; ``nn.Parameter`` -> False."""
+    if not (dotted.startswith("nn.") or dotted.startswith("torch.nn.")):
+        return False
+    return dotted.rsplit(".", 1)[-1] not in NON_MODULE_NN
+
+
+def _builds_compute_nn_module(node: ast.expr) -> bool:
+    """A construction that builds a *non-container* ``nn.*`` compute module somewhere
+    inside (``nn.Sequential(TritonReLU(), nn.Linear(...))``) -- so it is a genuine fallback
+    even when it also wraps a local class (BUG-30's mixed case must keep firing)."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            dotted = _dotted(sub.func) or ""
+            if _is_nn_module_ctor(dotted) and dotted.rsplit(".", 1)[-1] not in NN_CONTAINERS:
+                return True
+    return False
+
 
 def scoped(func: str, name: str) -> str:
     return f"{func}::{name}"
@@ -145,25 +175,29 @@ class _FuncVisitor(ast.NodeVisitor):
                 src = _base_name(sub.value)
                 if src is not None:
                     pairs.append((sub.targets[0].id, src))
-        if not pairs:
-            return
-
         for launch in self.model.launches[start:]:
             kernel = self.model.kernels.get(launch.kernel_name)
             if kernel is None:
                 continue
             inputs: set[str] = set()
             outputs: set[str] = set()
+            in_place = False
             for param, expr in launch.arg_map.items():
                 role = kernel.params.get(param)
                 base = _base_name(expr)
                 if role is None or base is None:
                     continue
+                # A buffer both loaded and stored by the *same* launch, passed unchanged
+                # across the loop, carries state in place -- a recurrence with no host
+                # `h = h_new` rebind to detect (BUG-33). Gridding it races on the shared
+                # buffer, so the fix is to move the loop into the kernel, not into the grid.
+                if role.stored and role.loaded:
+                    in_place = True
                 if role.stored:
                     outputs.add(base)
                 elif role.loaded:
                     inputs.add(base)
-            if any(t in inputs and s in outputs for t, s in pairs):
+            if in_place or any(t in inputs and s in outputs for t, s in pairs):
                 launch.recurrence = True
 
     # -- statements -------------------------------------------------------
@@ -190,8 +224,12 @@ class _FuncVisitor(ast.NodeVisitor):
 
                 if isinstance(node.value, ast.Call):
                     cls = _dotted(node.value.func) or ""
-                    if cls.startswith("nn.") or cls.startswith("torch.nn."):
-                        self.model.nn_modules_in_init[t.attr] = cls
+                    if _is_nn_module_ctor(cls):
+                        # Keyed by owning class ("ModelNew.__init__" -> "ModelNew") so a
+                        # binding in one class cannot decide how a same-named attribute is
+                        # judged in another (BUG-24).
+                        owner = self.qual.rsplit(".", 1)[0]
+                        self.model.nn_modules_in_init.setdefault(owner, {})[t.attr] = cls
 
                 # self.layernorm = LayerNormTriton(...) -- a submodule defined in this
                 # file. Its forward() is where the kernel is actually launched, so
@@ -207,6 +245,8 @@ class _FuncVisitor(ast.NodeVisitor):
                         local.extend(self.param_default_classes[n.id])
                 if local:
                     self.model.attr_classes.setdefault(t.attr, []).extend(local)
+                    if _builds_compute_nn_module(node.value):
+                        self.model.containers_with_torch.add(t.attr)
 
         if len(targets) == 1:
             name = targets[0].id
@@ -259,6 +299,17 @@ class _FuncVisitor(ast.NodeVisitor):
         self.model.noncontiguous.discard(key)
 
         if isinstance(value, ast.Call):
+            # raw pointer: p = out.data_ptr() / p = out[i].data_ptr(). A common way to hand
+            # Triton a (per-slice) base address; the pointer local must alias its receiver's
+            # storage or the launched output reads as a phantom buffer (BUG-35). Handled
+            # before the dotted-name check: a subscript receiver (out[i]) makes _dotted give
+            # up, and `_base_name` walks the Subscript so out[i].data_ptr() resolves to `out`.
+            if isinstance(value.func, ast.Attribute) and value.func.attr == "data_ptr":
+                src = _base_name(value.func.value)
+                if src is not None:
+                    self.model.aliases[key] = scoped(self.qual, src)
+                    return
+
             fn = _dotted(value.func)
             if fn:
                 op = fn.rsplit(".", 1)[-1]
@@ -286,6 +337,15 @@ class _FuncVisitor(ast.NodeVisitor):
             self.model.aliases[key] = scoped(self.qual, value.id)
             if scoped(self.qual, value.id) in self.model.noncontiguous:
                 self.model.noncontiguous.add(key)
+
+        # subscript view: c = out[b] / out[b, 0] / out[b:b+1]. Writing a slice writes into
+        # the parent's storage, so the per-slice launch idiom must alias to `out` -- else its
+        # store target is a fresh buffer nobody reads and F1.3 calls the output discarded
+        # (BUG-23). `_base_name` walks the Subscript to its leftmost Name.
+        if isinstance(value, ast.Subscript):
+            src = _base_name(value)
+            if src is not None and src != name:
+                self.model.aliases[key] = scoped(self.qual, src)
 
     # -- calls ------------------------------------------------------------
 
@@ -407,6 +467,18 @@ def _returned_names(node: ast.expr) -> set[str]:
         return set().union(*(_returned_names(e) for e in node.elts)) if node.elts else set()
     if isinstance(node, ast.BinOp):
         return _returned_names(node.left) | _returned_names(node.right)
+    # An output returned through an operator node still flows out and is consumed on the
+    # host -- a ternary loss (`out.mean() if size_average else out.sum()`), a negated loss
+    # (`-out.sum()`), a boolean (`out.sum() > 0`). Recurse every operator, not just BinOp,
+    # or the buffer carries no use flag and F1.3 calls it discarded (BUG-34).
+    if isinstance(node, ast.IfExp):
+        return _returned_names(node.body) | _returned_names(node.orelse)
+    if isinstance(node, ast.UnaryOp):
+        return _returned_names(node.operand)
+    if isinstance(node, ast.Compare):
+        return set().union(_returned_names(node.left), *(_returned_names(c) for c in node.comparators))
+    if isinstance(node, ast.BoolOp):
+        return set().union(*(_returned_names(v) for v in node.values)) if node.values else set()
     if isinstance(node, (ast.Attribute, ast.Subscript)):
         return _returned_names(node.value)
     if isinstance(node, ast.Call):
@@ -472,7 +544,59 @@ def analyze_host(model: ModuleModel) -> None:
     # buffer and silently dropped.
     _propagate_interprocedural(model)
     _resolve_reads(model, visitors)
+    # Push the caller's use flags *down* to helper parameters -- runs after _resolve_reads
+    # because read_by_host is only known then.
+    _propagate_uses_to_params(model)
     _resolve_reachability(model, visitors)
+
+
+def _resolve_target_fn(model: ModuleModel, call: HostCall) -> str | None:
+    """The in-file function a host call targets (resolving ``self.m`` against the entry
+    class), or ``None`` if it is not a local function or has no AST node."""
+    target_fn = call.qualname
+    if target_fn.startswith("self.") and model.model_class:
+        target_fn = f"{model.model_class}.{target_fn.split('.', 1)[1]}"
+    if target_fn not in model.functions or call.node is None:
+        return None
+    return target_fn
+
+
+def _propagate_uses_to_params(model: ModuleModel) -> None:
+    """Push a caller's ``returned`` / ``read_by_host`` flags onto the helper *parameter*
+    buffers it passes them to.
+
+    F1.3 resolves a launch's store target in the launch's *enclosing* scope. When the
+    launch sits in a helper writing one of the helper's own parameters, that parameter
+    buffer never inherits the caller's use flags -- ``_propagate_interprocedural`` pushes
+    the store role *up* to the caller but nothing pushes the caller's use *down* -- so the
+    output reads as discarded though the caller returns or reads it (BUG-28). Iterated to a
+    fixpoint so the flags reach through ``forward -> outer -> inner`` chains.
+    """
+    for _ in range(4):
+        changed = False
+        for call in model.host_calls:
+            target_fn = _resolve_target_fn(model, call)
+            if target_fn is None:
+                continue
+            names = [a.arg for a in model.functions[target_fn].args.args if a.arg != "self"]
+            for i, arg in enumerate(call.node.args):
+                if i >= len(names):
+                    break
+                var = _base_name(arg)
+                if var is None:
+                    continue
+                caller = model.buffers.get(model.canonical(scoped(call.enclosing, var)))
+                param = model.buffers.get(model.canonical(scoped(target_fn, names[i])))
+                if caller is None or param is None:
+                    continue
+                if caller.returned and not param.returned:
+                    param.returned = True
+                    changed = True
+                if caller.read_by_host and not param.read_by_host:
+                    param.read_by_host = True
+                    changed = True
+        if not changed:
+            break
 
 
 def _param_default_classes(
@@ -685,7 +809,7 @@ def _resolve_reachability(model: ModuleModel, visitors: dict[str, _FuncVisitor])
       ``backward``/``jvp``/``vmap`` never run under the benchmark's forward call,
       and torch ops there would otherwise be reported as cheating.
     """
-    if model.entry is None:
+    if model.forward_entry is None:
         return
 
     def all_methods(name: str) -> list[str]:
@@ -707,7 +831,7 @@ def _walk(
     visitors: dict[str, _FuncVisitor],
     expand_class: Callable[[str], list[str]],
 ) -> set[str]:
-    worklist = [model.entry]
+    worklist = [model.forward_entry]
     seen: set[str] = set()
 
     while worklist:
