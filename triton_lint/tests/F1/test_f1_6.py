@@ -179,12 +179,10 @@ def test_inline_gather_is_not_a_copy(analyze):
     assert analyze(_GATHER_INLINE).kernels["gather_kernel"].kind == "elementwise"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG22_REASON)
 def test_hoisted_gather_is_not_a_copy(analyze):
     assert analyze(_GATHER_HOISTED).kernels["gather_kernel"].kind == "elementwise"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG22_REASON)
 def test_f1_6_silent_on_hoisted_gather(fired):
     body = _GATHER_HOISTED + '''
 
@@ -197,7 +195,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.6", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG22_REASON)
 def test_hoisted_hflip_is_not_a_copy(analyze):
     # p369_s5's shape: reads the reversed column, writes the forward one. The
     # reversal IS the task, and it lives entirely in the hoisted addresses.
@@ -231,7 +228,6 @@ def copy_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
     assert analyze(source).kernels["copy_kernel"].kind == "copy"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG22_REASON)
 def test_hoisted_roll_is_not_a_copy(analyze):
     # A circular shift: reads column `(col + shift) % width`, writes column `col`. Like
     # the hflip, the whole task lives in the two hoisted addresses, which both collapse
@@ -292,12 +288,10 @@ def cat_kernel(src_ptr, dst_ptr, dst_offset, n, BLOCK: tl.constexpr):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
 def test_concat_at_scalar_param_offset_is_not_a_copy(analyze):
     assert analyze(_CONCAT_AT_PARAM_OFFSET).kernels["cat_kernel"].kind != "copy"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
 def test_f1_6_silent_on_concat_at_scalar_param_offset(fired):
     body = _CONCAT_AT_PARAM_OFFSET + '''
 
@@ -356,12 +350,10 @@ def slice_kernel(src_ptr, src_offset, dst_ptr, n, BLOCK: tl.constexpr):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
 def test_slice_at_scalar_load_offset_is_not_a_copy(analyze):
     assert analyze(_SLICE_AT_LOAD_OFFSET).kernels["slice_kernel"].kind != "copy"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
 def test_f1_6_silent_on_slice_at_scalar_load_offset(fired):
     body = _SLICE_AT_LOAD_OFFSET + '''
 

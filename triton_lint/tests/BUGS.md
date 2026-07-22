@@ -1,13 +1,23 @@
 # Linter bugs — audit history
 
-**BUG-1…BUG-20 are fixed; BUG-21…BUG-36 are open.** Each bug was first encoded as
+**BUG-1…BUG-36 are all fixed.** Each bug was first encoded as
 one or more `@pytest.mark.xfail(strict=True, reason="BUG-N: ...")` tests. Fixing a
 bug flips its tests to XPASS (an error under `strict=True`), which forces removing
-the marker — so the register and the suite cannot drift apart. For the fixed bugs
-the assertions remain as permanent regression tests (in `tests/F1/`, `tests/F2/`,
-`tests/test_kernelbody.py`, and `tests/real_samples/`); for the open bugs the
-xfail markers are still in place and pin the confirmed false positive/negative. The
-tables below record what each bug was and where it came from.
+the marker — so the register and the suite cannot drift apart. Every bug's assertions
+now remain as permanent regression tests (in `tests/F1/`, `tests/F2/`,
+`tests/test_kernelbody.py`, and `tests/real_samples/`). The tables below record what
+each bug was and where it came from.
+
+BUG-21…BUG-36 were fixed on 2026-07-22, grouped by root-cause layer (not patched at the
+point of symptom): a resolved reachability root `model.forward_entry` that resolves an
+inherited forward and treats a missing entry class as a hard fail (BUG-25, BUG-27);
+per-class `nn_modules_in_init` keying plus a Triton/scalar-builtin provenance guard in
+F1.4/F1.5 (BUG-24, BUG-26, BUG-30, BUG-31) and exact/dot-boundary offload matching in F1.7
+(BUG-21); alias completeness for subscript/`data_ptr` views, operator-node return recursion,
+and a caller→helper use-flag propagation pass in hostflow (BUG-23, BUG-28, BUG-34, BUG-35),
+plus in-place recurrence detection (BUG-33); and in `kernelbody` a hoisted-offset signature,
+an additive scalar-offset parameter rule, and a positive full-coverage proof for F2.4
+(BUG-22, BUG-29, BUG-32, BUG-36). See `.claude/plans/` for the layer-by-layer design.
 
 The fixes are grouped by root-cause layer, not patched at the point of symptom:
 kernel discovery (`parsing.py`), per-kernel classification (`kernelbody.py`),
@@ -64,7 +74,7 @@ a clear logic error, each with a passing control that pins the boundary).
 | BUG-19 | hostflow `noncontiguous` / F2.3 | `model.noncontiguous` is a monotonic taint set with no kill on rebinding. A name made non-contiguous (`x = x.permute(...)`) and then rebound to a fresh contiguous tensor (`x = torch.relu(x)`, or any non-alias call) stays in the set, so a later bare `x.contiguous()` — an actual no-op — is flagged as a full-tensor copy and the model is told to pass strides for an already-contiguous layout. Synthetic; the control (same code without the permute) is correctly silent, pinning the bug to the stale flag. | F2.3 (FP) |
 | BUG-20 | F2.4 | The `accumulating` guard scans *every* stored param of the writing kernel instead of the parameter the zeroed buffer is bound to. An atomic on a sibling output (`hist`) sets `accumulating` and suppresses the finding for a different, genuinely-wasted zeros buffer (`out`) that the same kernel unconditionally overwrites. The docstring's contract is per-buffer ("fire only when the kernel stores to it, never loads it, and performs no atomic on it"); the check is per-kernel. (The atomic branch is dead for the buffer's own role — an atomic target is already excluded by the earlier `buf.loaded_by` guard — so it only ever suppresses cross-param.) Synthetic. | F2.4 (FN) |
 
-## Open bugs (encoded as strict-xfail, not yet fixed)
+## BUG-21…BUG-36 (found as strict-xfail; fixed 2026-07-22)
 
 Bugs BUG-21…BUG-27 came from a Family-1 audit against the gpt-oss level-5 run and the
 Qwen3.6-27B lintloop runs; BUG-28…BUG-31 are from the 2026-07-21 F1 audit,

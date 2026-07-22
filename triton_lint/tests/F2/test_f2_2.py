@@ -255,7 +255,6 @@ def test_inplace_recurrence_launch_in_loop_still_fires():
     assert fs[0].severity == "fail"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG33_REASON)
 def test_inplace_recurrence_is_not_told_to_move_the_loop_into_the_grid():
     fs = [f for f in lint_raw(INPLACE_RECURRENCE, "F2.2")
           if f.data.get("kind") == "launch_in_loop"]
@@ -297,7 +296,6 @@ def test_inplace_recurrence_while_launch_in_loop_still_fires():
     assert fs[0].severity == "fail"
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG33_REASON)
 def test_inplace_recurrence_while_is_not_told_to_move_the_loop_into_the_grid():
     fs = [f for f in lint_raw(INPLACE_RECURRENCE_WHILE, "F2.2")
           if f.data.get("kind") == "launch_in_loop"]

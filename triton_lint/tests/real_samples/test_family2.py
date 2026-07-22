@@ -141,34 +141,14 @@ def test_f2_4_gather_conv_transpose_zeros_are_really_wasted():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-32: one_hot_kernel stores a single 1.0 per row at a data-dependent "
-    "column and leaves every other column at its zero value -- the zeros ARE the "
-    "one-hot encoding. F2.4 reports the `torch.zeros` a wasted memset and prescribes "
-    "`empty_like`, which would fill the non-selected entries with garbage",
-)
 def test_f2_4_one_hot_scatter_needs_its_zero_init():
     assert findings(1229, 4, "F2.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-32: pad_same_kernel grids over the input and scatters each element into "
-    "a larger padded output at `(h + pad_top, w + pad_left)`; the border is never "
-    "written and must stay zero. F2.4 flags the `torch.zeros` and tells the model to use "
-    "`empty_like`, which leaves the padding as garbage",
-)
 def test_f2_4_pad_into_larger_output_needs_its_zero_init():
     assert findings(15104, 6, "F2.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-32: avg_pool_pad_kernel writes pooled values into a `torch.zeros((N, 2*C, "
-    "H_out, W_out))` output at padded coordinates; the border stays zero. F2.4 flags the "
-    "memset and prescribes `empty_like`, which leaves the padding as garbage",
-)
 def test_f2_4_avg_pool_pad_needs_its_zero_init():
     assert findings(17549, 4, "F2.4") == []
 
@@ -181,51 +161,18 @@ def test_f2_4_avg_pool_pad_needs_its_zero_init():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-36: matmul_lower_tril_kernel stores acc to `C + off_m * stride_cm + "
-    "off_n * stride_cn` -- the full N*N index space -- under the mask `off_m >= off_n`, "
-    "and skips strictly-upper blocks with `if pid_m < pid_n: return`; the upper triangle "
-    "keeps its `torch.zeros` value, which IS the tril result. F2.4's address-only "
-    "`_is_partial_coverage` sees both indices span the buffer, so it reports the memset "
-    "wasted and prescribes `empty_like`, which would leave the upper triangle as garbage "
-    "(a correctness bug). Distinct from BUG-32 (there the store address is itself a subset)",
-)
 def test_f2_4_triangular_matmul_needs_its_zero_init():
     assert findings(15, 1, "F2.4", level=1) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-36 (pure-mask spelling): triu_matmul_kernel has no block skip -- every "
-    "block runs and computes the full tile -- and stores to `out + row_idx * N + col_idx` "
-    "(the full N*N range) under `valid_mask = row_mask & col_mask & (col_idx >= row_idx)`. "
-    "The strictly-lower triangle keeps its `torch.zeros((N, N))` value. F2.4 flags the "
-    "memset and prescribes `empty_like`, corrupting the lower triangle",
-)
 def test_f2_4_triu_pure_mask_matmul_needs_its_zero_init():
     assert findings(14, 9, "F2.4", level=1) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-36 (strided-address spelling, second run): upper_triangular_matmul_kernel "
-    "stores to `C + offs_am * stride_cm + offs_bn * stride_cn` under the triangular mask "
-    "`offs_am <= offs_bn`; the strictly-lower triangle stays at its `torch.zeros((N, N))` "
-    "value. The stride-scaled address still covers the full buffer, so `_is_partial_coverage` "
-    "sees full coverage and F2.4 wrongly reports the memset wasted",
-)
 def test_f2_4_upper_tri_strided_matmul_needs_its_zero_init():
     assert findings(14, 7, "F2.4", level=1) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-36 (`zeros_like` spelling): lower_triangular_matmul_kernel stores to "
-    "`C + m_store * N + n_store` under `m_store >= n_store`; the strictly-upper triangle "
-    "keeps the value from `C = torch.zeros_like(A)`. F2.4 flags the memset and prescribes "
-    "`empty_like`, corrupting the upper triangle",
-)
 def test_f2_4_lower_tri_zeros_like_matmul_needs_its_zero_init():
     assert findings(15, 5, "F2.4", level=1) == []
 
@@ -236,15 +183,6 @@ def test_f2_4_lower_tri_zeros_like_matmul_needs_its_zero_init():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-33: `for _ in range(iterations): sinkhorn_iter_kernel[grid](Q, ...)` "
-    "refines Q in place each iteration -- a sequential fixed-point loop with no data "
-    "dimension to grid at all. Q is loaded and stored by the kernel and passed unchanged "
-    "across the loop, but there is no host rebind, so _detect_recurrence leaves "
-    "recurrence=False and F2.2 tells the model to move the iteration count into the "
-    "launch grid, which is incoherent and a correctness bug.",
-)
 def test_f2_2_inplace_sinkhorn_iteration_is_not_told_to_grid_the_loop():
     fs = [
         f

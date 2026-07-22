@@ -79,10 +79,10 @@ def test_f1_2_stub_dispatch_kernels_are_dead():
     assert sorted(f.severity for f in fs) == ["fail", "fail"]
 
 
-def test_f1_2_truncated_file_downgrades_to_info():
-    # 8-line fragment: a kernel def and nothing else -- no entry point, so
-    # unreachability cannot be proven.
-    assert [f.severity for f in findings(4053, 0, "F1.2")] == ["info"]
+def test_f1_2_truncated_file_with_no_entry_class_is_a_fail():
+    # 8-line fragment: a kernel def and nothing else -- no ModelNew, so KernelBench
+    # cannot load it and the kernel is provably dead. Fail, not a muted info (BUG-25).
+    assert [f.severity for f in findings(4053, 0, "F1.2")] == ["fail"]
 
 
 def test_f1_2_default_arg_activation_is_live():
@@ -235,58 +235,22 @@ def test_f1_4_local_triton_submodule_is_not_a_fallback():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-21: `@torch.jit.script_if_tracing` on the preserved PyTorch training "
-    "path is swept up by the `torch.jit.script` startswith prefix. It compiles only "
-    "under torch.jit.trace, so the timed forward -- which dispatches to the Triton "
-    "inference path -- offloads nothing",
-)
 def test_f1_7_script_if_tracing_is_not_an_offload():
     assert findings(1510, 9, "F1.7") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-22: gather_kernel decomposes a flat index (`w = idx % W`, `h = idx // W`) "
-    "and gathers through the hoisted address `inp_ptr`; the address arithmetic is the "
-    "task. Both addresses are hoisted into locals, so both offset signatures collapse "
-    "to frozenset() and the kernel is classified `copy`",
-)
 def test_f1_6_hoisted_gather_is_not_a_decoy():
     assert findings(17827, 1, "F1.6") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-22: hflip_kernel loads column `rev_col = width - 1 - col` and stores "
-    "column `col` -- a horizontal flip, where the reversal lives entirely in the two "
-    "hoisted addresses. Reported as performing none of the task's computation",
-)
 def test_f1_6_hoisted_hflip_is_not_a_decoy():
     assert findings(369, 5, "F1.6") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-29: triton_cat implements torch.cat by launching cat_kernel once per "
-    "source, each `tl.store(dst_ptr + dst_offset + offs, val)` placing a source at its "
-    "column offset in the concatenated output. dst_offset is a scalar param used only "
-    "additively, so _scalar_params misses it, _is_base_ptr_term strips it, and the store "
-    "offset collapses to {offs} matching the load -- cat_kernel is classified copy and "
-    "reported at fail as performing none of the task's computation",
-)
 def test_f1_6_concat_at_param_offset_is_not_a_decoy():
     assert findings(7404, 4, "F1.6") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-29 (load-side): copy_kernel reads a slice with a scalar `src_offset` on "
-    "the LOAD spine (`tl.load(src_ptr + src_offset + offs)`) and stores at `offs`; the "
-    "offset param is stripped, load and store signatures both collapse to {offs}, and "
-    "the slice-extraction is classified copy and reported at fail",
-)
 def test_f1_6_load_side_slice_offset_is_not_a_decoy():
     assert findings(992, 2, "F1.6") == [] and findings(17118, 2, "F1.6") == []
 
@@ -297,78 +261,30 @@ def test_f1_6_load_side_slice_offset_is_not_a_decoy():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-31: `scale_int = max(1, int(round(scale)))` -- `round(scale)` is the "
-    "Python builtin on a float, pure launch-grid arithmetic. It collides with the "
-    "LIGHT_OPS token `round` and forward is told it 'still uses PyTorch operators'",
-)
 def test_f1_4_builtin_round_on_a_scalar_is_not_a_fallback():
     assert findings(749, 0, "F1.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-31: `int(round(scale_factor))` and `abs(scale_factor - scale_int) < 1e-6` "
-    "-- both Python builtins on scalars, graded PyTorch fallbacks via the round/abs tokens",
-)
 def test_f1_4_builtin_round_and_abs_on_scalars_are_not_a_fallback():
     assert findings(122, 0, "F1.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-31: `C * sum(l * l for l in levels)` -- the Python builtin `sum` over a "
-    "generator of ints, a channel-count computation, graded a PyTorch `sum` fallback",
-)
 def test_f1_4_builtin_sum_over_a_generator_is_not_a_fallback():
     assert findings(65, 0, "F1.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-23: the per-batch loop binds `c_ptr = out[b]`, a subscript view into "
-    "the allocated `out`, which the helper returns two lines below the loop. The "
-    "subscript alias is not recorded, so the matmul's output reads as discarded",
-)
 def test_f1_3_kernel_writing_a_batch_slice_is_not_discarded():
     assert findings(2141, 4, "F1.3") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-28: a 3-kernel GroupNorm whose launch_sum / launch_sumsq / launch_norm "
-    "helpers each take the output tensor as a bare parameter and launch a kernel into "
-    "it; forward allocates those tensors, reads sum/sumsq on the host and returns the "
-    "normalized `out`. F1.3 resolves each store target in the helper scope, where the "
-    "parameter buffer never inherits the caller's returned/read_by_host flags, so all "
-    "three kernels are reported at fail as writing a discarded output",
-)
 def test_f1_3_group_norm_out_parameter_helpers_are_not_discarded():
     assert findings(17053, 6, "F1.3") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-34: the wrapper ends `return out.mean() if size_average else out.sum()`. "
-    "`_returned_names` has no ast.IfExp case, so `out` is never marked returned, and "
-    "visit_Return's `_count` still books both loads as return_loads, cancelling "
-    "read_by_host -- the kernel's output carries no use flag and F1.3 reports the focal "
-    "loss discarded at fail, though its per-element result is reduced on the host and "
-    "returned",
-)
 def test_f1_3_output_returned_through_a_ternary_is_not_discarded():
     assert findings(4416, 2, "F1.3") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-35: the per-batch launch loop binds `out_batch_ptr = out[i].data_ptr()` "
-    "and hands the raw pointer to the kernel. `_record_binding` aliases view methods and "
-    "plain rebinds but not `.data_ptr()`, so out_batch_ptr is a phantom buffer with no "
-    "use flag and no alias to `out`; F1.3 reports the fused GroupNorm/LogSumExp output "
-    "discarded at fail while `out` is allocated and returned right after the loop",
-)
 def test_f1_3_output_launched_through_a_data_ptr_is_not_discarded():
     assert findings(92, 7, "F1.3", level=2) == []
 
@@ -378,15 +294,6 @@ def test_f1_3_output_launched_through_a_data_ptr_is_not_discarded():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-24: Conv3x3Triton holds nn.Conv2d only to own the weights and calls "
-    "triton_conv3x3_elu(x, self.conv.weight, self.conv.bias); ModelNew.forward calls "
-    "that module. No nn.Conv2d is ever invoked in the file -- the conv is the Triton "
-    "kernel. The holder's `self.conv` poisons the module-wide nn_modules_in_init, so "
-    "ModelNew's own module is reported at fail as invoking nn.Conv2d, and the advice "
-    "prescribes the weight-holder pattern the file already implements",
-)
 def test_f1_5_local_submodule_sharing_the_holders_attr_name():
     assert findings(2179, 3, "F1.5") == []
 
@@ -414,16 +321,9 @@ def test_f1_2_real_generation_with_no_entry_class_is_loadable_ground_truth():
     """
     report = full_report(100, 0, level=1)
     assert report.parse_status == "ok"
-    assert [f.check_id + ":" + f.severity for f in report.findings] == ["F1.2:info"]
+    assert [f.check_id + ":" + f.severity for f in report.findings] == ["F1.2:fail"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-25: the whole generation is one @triton.jit hinge-loss kernel with no "
-    "ModelNew, so KernelBench's getattr(module, 'ModelNew') cannot load it and the "
-    "sample scores zero. F1.2 reports info, which is not actionable, so the lintloop "
-    "marked this slot clean and stopped at round 0",
-)
 def test_f1_2_real_generation_with_no_entry_class_is_a_fail():
     assert [f.severity for f in findings(100, 0, "F1.2", level=1)] == ["fail"]
 
@@ -436,17 +336,8 @@ def test_f1_2_level2_lintloop_truncated_kernel_is_loadable_ground_truth():
     fail-F1.2 fell to zero."""
     report = full_report(100, 3, level=2)
     assert report.parse_status == "ok"
-    assert [f.check_id + ":" + f.severity for f in report.findings] == ["F1.2:info"]
+    assert [f.check_id + ":" + f.severity for f in report.findings] == ["F1.2:fail"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-25 (level-2 lintloop face): clamp_div_kernel is the whole 21-line file -- "
-    "no ModelNew, so KernelBench's getattr(module, 'ModelNew') cannot load it and the "
-    "sample scores zero. F1.2 reports info, not actionable, so the loop marked the slot "
-    "clean. The kernel is genuinely never launched (0 launch sites), so this is not a "
-    "false positive -- the defect is the info severity, which hides the most severe "
-    "outcome (an unloadable file) from the very loop meant to fix it.",
-)
 def test_f1_2_level2_lintloop_truncated_kernel_is_a_fail():
     assert [f.severity for f in findings(100, 3, "F1.2", level=2)] == ["fail"]

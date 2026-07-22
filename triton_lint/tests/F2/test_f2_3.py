@@ -290,14 +290,6 @@ class ModelNew(Base):                # inherits forward -> entry is None
 '''
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-27 (F2.3 face): F2.3 shares `_host_scopes` with F1.4/F1.5, so when "
-    "ModelNew inherits its forward and entry resolves to None, the fallback scans every "
-    "function in the file. The dead `Reference` class -- the original PyTorch model, "
-    "which nothing constructs -- is scanned and its permute+contiguous reported as a "
-    "hidden copy the timed forward pays for. The blast radius of BUG-27 includes F2.3.",
-)
 def test_layout_churn_in_dead_class_is_not_scanned_when_forward_is_inherited():
     assert lint_raw(CHURN_IN_INHERITED_FORWARD_DEADCLASS, "F2.3") == []
 

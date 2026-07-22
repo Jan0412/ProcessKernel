@@ -146,14 +146,6 @@ class ModelNew(nn.Module):
         return self.conv(x)
 '''
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-24: Conv3x3Triton holds nn.Conv2d purely to own the weights and "
-        "passes .weight to its kernel -- exactly what F1.5's own advice prescribes and "
-        "what its docstring calls a legitimate weight holder. But `conv` lands in the "
-        "module-wide nn_modules_in_init, so ModelNew.forward calling its own "
-        "Conv3x3Triton is reported at fail as invoking nn.Conv2d (real sample: p2179_s3)",
-    )
     def test_local_submodule_is_not_an_nn_call_when_it_shares_an_attr_name(self, fired):
         assert not fired("F1.5", src(ELEMENTWISE_KERNEL + self.HOLDER))
 
@@ -185,13 +177,6 @@ class ModelNew(nn.Module):
         )
         assert [f.severity for f in found] == ["fail"]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-27: F1.5 shares _host_scopes with F1.4, so it inherits the same "
-        "all-functions fallback. ModelNew inherits its forward -> entry is None -> the "
-        "dead Reference class is scanned and its nn.Linear call reported at fail as "
-        "something the timed forward does",
-    )
     def test_dead_reference_class_is_not_scanned_when_forward_is_inherited(self, fired):
         assert not fired(
             "F1.5",
@@ -220,13 +205,6 @@ class ModelNew(Base):
             ),
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-24: nn_modules_in_init is filled by a `nn.`/`torch.nn.` namespace "
-        "prefix test, which admits things that are not modules at all. nn.Parameter is "
-        "a tensor: it launches nothing and cannot be called. Reported as a PyTorch "
-        "module the forward should fold into a kernel (real sample: p16312_s1)",
-    )
     def test_nn_parameter_is_not_a_module(self, fired):
         assert not fired(
             "F1.5",
@@ -277,14 +255,6 @@ class TritonReLU(nn.Module):
         return out
 '''
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-30: self.net = nn.Sequential(TritonReLU(), TritonReLU()) wraps only "
-        "file-defined Triton modules; self.net(x) runs their kernels and no torch "
-        "compute. F1.5 records self.net as nn.Sequential (HEAVY) and reports ModelNew "
-        "at fail as invoking a PyTorch module -- the F1.4 BUG-16/BUG-24 fault, for which "
-        "F1.5 has no local-class guard",
-    )
     def test_sequential_of_local_triton_modules_is_not_a_fallback(self, fired):
         assert not fired(
             "F1.5",
@@ -353,14 +323,6 @@ class ModelNew(nn.Module):
         return self.net(x)
 '''
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-30 (unpacked-comprehension construction): "
-        "`nn.Sequential(*[TritonReLU() for _ in range(3)])` still wraps only file-defined "
-        "Triton modules, but is recorded as nn.Sequential (HEAVY) and reported at fail. "
-        "The construction spelling does not change the fault -- F1.5 has no local-class "
-        "guard regardless of how the container is built",
-    )
     def test_sequential_built_by_unpacking_local_modules_is_not_a_fallback(self, fired):
         assert not fired(
             "F1.5", src(ELEMENTWISE_KERNEL + self._LOCAL_TRITON_BLOCK + self._SEQ_COMPREHENSION)
@@ -374,4 +336,64 @@ class ModelNew(nn.Module):
             src(ELEMENTWISE_KERNEL + self._LOCAL_TRITON_BLOCK + self._SEQ_COMPREHENSION), "<t>"
         )
         assert model.attr_classes["net"] == ["TritonReLU"]
-        assert model.nn_modules_in_init["net"] == "nn.Sequential"
+        assert model.nn_modules_in_init["ModelNew"]["net"] == "nn.Sequential"
+
+
+# ---------------------------------------------------------------------------
+# Fix-hardening regression tests (Phase 1): pin the false negatives the fail-safe
+# rules were designed to avoid. See tests/BUGS.md (BUG-24, BUG-30).
+# ---------------------------------------------------------------------------
+
+_LOCAL_TRITON_RELU = '''
+class TritonReLU(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, x, out, x.numel(), BLOCK=128)
+        return out
+'''
+
+
+def test_mixed_sequential_of_local_and_torch_modules_still_fires(check):
+    # BUG-30 boundary: a Sequential that wraps a local Triton module AND a real nn.Linear
+    # genuinely invokes torch (cuDNN/gemm) -- the container guard must NOT mute it.
+    found = check(
+        "F1.5",
+        src(
+            ELEMENTWISE_KERNEL
+            + _LOCAL_TRITON_RELU
+            + '''
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(TritonReLU(), nn.Linear(8, 8))
+
+    def forward(self, x):
+        return self.net(x)
+'''
+        ),
+    )
+    assert [f.severity for f in found] == ["fail"]
+
+
+def test_child_binds_nn_module_and_inherits_forward_still_fires(check):
+    # BUG-24 MRO: the nn.Linear binding lives in the child's __init__ while the forward that
+    # calls self.fc is inherited from Base -- the per-class lookup must resolve the binding
+    # through the constructed class, or a genuine fallback is silently muted.
+    found = check(
+        "F1.5",
+        src(
+            ELEMENTWISE_KERNEL
+            + '''
+class Base(nn.Module):
+    def forward(self, x):
+        return self.fc(x)
+
+
+class ModelNew(Base):
+    def __init__(self, n):
+        super().__init__()
+        self.fc = nn.Linear(n, n)
+'''
+        ),
+    )
+    assert [f.severity for f in found] == ["fail"]

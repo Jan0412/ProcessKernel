@@ -229,12 +229,10 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG32_REASON)
 def test_one_hot_scatter_needs_its_zero_init():
     assert lint_raw(_ONE_HOT, "F2.4") == []
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG32_REASON)
 def test_pad_into_larger_output_needs_its_zero_init():
     assert lint_raw(_PAD_INTO_LARGER, "F2.4") == []
 
@@ -292,7 +290,6 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG32_REASON)
 def test_data_dependent_scatter_needs_its_zero_init():
     assert lint_raw(_DATA_DEPENDENT_SCATTER, "F2.4") == []
 
@@ -377,7 +374,6 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG36_REASON)
 def test_triangular_masked_store_needs_its_zero_init():
     assert lint_raw(_TRIANGULAR_MASKED_STORE, "F2.4") == []
 
@@ -431,12 +427,10 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG36_REASON)
 def test_triangular_block_skip_store_needs_its_zero_init():
     assert lint_raw(_TRIANGULAR_BLOCK_SKIP, "F2.4") == []
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG36_REASON)
 def test_upper_triangular_masked_store_needs_its_zero_init():
     # The upper-triangular mirror (`off_m <= off_n`) leaves the strictly-lower triangle at
     # its zeros. Same full-address / conditional-mask shape, opposite triangle.
@@ -528,3 +522,40 @@ class ModelNew(nn.Module):
     assert len(f2_4_zeroed_overwritten_buffer.check(model)) == 1  # a wasted zero-fill...
     model.kernels["exp_kernel"].params["out_ptr"].atomic = True
     assert f2_4_zeroed_overwritten_buffer.check(model) == []  # ...until it accumulates
+
+
+def test_computed_data_dependent_scatter_needs_its_zero_init():
+    # BUG-32 class coverage: the scatter index is *computed* from a load (`pos = base + idx`,
+    # idx loaded) rather than being the bare load -- the loaded-taint must survive arithmetic.
+    source = '''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def scatter_kernel(idx_ptr, val_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    idx = tl.load(idx_ptr + offs, mask=mask)
+    v = tl.load(val_ptr + offs, mask=mask)
+    pos = idx * 2 + 1
+    tl.store(out_ptr + pos, v, mask=mask)
+
+class ModelNew(nn.Module):
+    def forward(self, idx, val):
+        out = torch.zeros(100, device=val.device, dtype=val.dtype)
+        scatter_kernel[(1,)](idx, val, out, idx.numel(), BLOCK=128)
+        return out
+'''
+    assert lint_raw(source, "F2.4") == []
+
+
+def test_strict_lower_triangular_mask_needs_its_zero_init():
+    # BUG-36 class coverage: the strict `off_m > off_n` mask (excluding the diagonal) is the
+    # same conditional-mask shape as `>=`, opposite inclusivity.
+    strict = _TRIANGULAR_MASKED_STORE.replace(
+        "    mask = off_m[:, None] >= off_n[None, :]      # strictly-upper triangle stays zero",
+        "    mask = off_m[:, None] > off_n[None, :]       # diagonal + upper stay zero",
+    )
+    assert lint_raw(strict, "F2.4") == []

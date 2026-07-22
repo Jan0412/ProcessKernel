@@ -429,15 +429,6 @@ class Reference(nn.Module):
 '''
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-24: appending an unreachable reference class that binds "
-    "`self.layer_norm = nn.LayerNorm(n)` poisons the module-wide nn_modules_in_init, "
-    "so _is_local_call returns False for ModelNew's own LayerNormTriton and F1.4 "
-    "grades it a heavy fallback at fail -- re-opening BUG-16 for this spelling. The "
-    "class never runs; test_local_triton_submodule_is_not_a_fallback is the same file "
-    "without it and passes",
-)
 def test_dead_reference_class_does_not_make_a_local_submodule_a_fallback():
     assert lint(LOCAL_SUBMODULE + DEAD_REFERENCE_CLASS, "F1.4") == []
 
@@ -470,26 +461,10 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-26: `tl.sum` is a Triton builtin, not a PyTorch operator. Telling the "
-    "model to 'fold it into the Triton kernel so no work is left to PyTorch' describes "
-    "an op already spelled `tl.` and is not actionable -- p98_s6 of the Qwen3-Coder "
-    "lintloop run carried it through every round of the loop unchanged",
-)
 def test_triton_builtin_in_host_code_is_not_a_torch_fallback():
     assert lint(TL_IN_HOST.replace("REPL", "tl.sum(out)"), "F1.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-26 severity face: `tl.dot` reduces to the op token `dot`, which is in "
-    "HEAVY_OPS, so a Triton builtin is reported at fail as 'the dominant cost of the "
-    "task -- it must be implemented as a Triton kernel'. Real sample p15299_s5 forgot "
-    "the @triton.jit decorator, so F1.1 correctly fails it; this co-finding points at "
-    "the tl.dot inside the kernel body and can send the model rewriting the kernel "
-    "rather than adding the decorator",
-)
 def test_triton_dot_in_host_code_is_not_a_heavy_torch_fallback():
     assert lint(TL_IN_HOST.replace("REPL", "tl.dot(out, out)"), "F1.4") == []
 
@@ -501,13 +476,6 @@ def test_control_torch_sum_in_the_same_position_still_fires():
     assert found[0].data["ops"] == ["torch.sum"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-26 (light-token face): `tl.sigmoid` reduces to the op token `sigmoid`, "
-    "which is in LIGHT_OPS, so a Triton builtin in host-visible scope is graded a warn "
-    "PyTorch fallback and told to fold an op already spelled `tl.` into the kernel. Same "
-    "root cause as the tl.sum/tl.dot faces -- _op_of never checks the `tl.` namespace",
-)
 def test_triton_light_builtin_in_host_code_is_not_a_torch_fallback():
     assert lint(TL_IN_HOST.replace("REPL", "tl.sigmoid(out)"), "F1.4") == []
 
@@ -577,26 +545,10 @@ def test_inherited_forward_leaves_entry_unresolved():
     assert model.notes == ["ModelNew has no forward()"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-27: ModelNew inherits its forward, so entry is None and _host_scopes "
-    "falls back to every function in the file. The dead `Reference` class -- the "
-    "original PyTorch model, which nothing constructs -- is scanned and its "
-    "torch.matmul reported at fail as what the timed forward computes",
-)
 def test_dead_reference_class_is_not_scanned_when_forward_is_inherited():
     assert lint(INHERITED_FORWARD, "F1.4") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-27: the fallback scans the autograd `backward` that the _host_scopes "
-    "docstring explicitly names as excluded ('backward/jvp/vmap never run under the "
-    "benchmark's forward call, so a torch op there is not a fallback'). This re-opens "
-    "the founding false positive of this whole audit history -- the pure-Triton Mish "
-    "with a torch backward, p32_s6 -- for any solution that inherits its forward. "
-    "Real sample: p14770_s6",
-)
 def test_autograd_backward_is_not_scanned_when_forward_is_inherited():
     assert lint(AUTOGRAD_BACKWARD, "F1.4") == []
 
@@ -633,14 +585,6 @@ class ModelNew(Base):
 '''
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-27 (module-level dead function face): ModelNew inherits its forward, so "
-    "entry is None and _host_scopes falls back to set(model.functions) -- every function "
-    "in the file, including the unreferenced module-level `reference_impl`. Its "
-    "torch.matmul is reported at fail as what the timed forward computes, though nothing "
-    "calls it. Same root cause as the dead-class face, reached through a free function",
-)
 def test_dead_module_level_helper_is_not_scanned_when_forward_is_inherited():
     assert lint(INHERITED_FORWARD_DEAD_HELPER, "F1.4") == []
 
@@ -689,12 +633,10 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
 def test_builtin_round_on_a_scalar_is_not_a_torch_fallback():
     assert lint(_ROUND_SCALAR, "F1.4") == []
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
 def test_builtin_sum_over_a_generator_is_not_a_torch_fallback():
     assert lint(_SUM_GENERATOR, "F1.4") == []
 
@@ -758,14 +700,12 @@ class ModelNew(nn.Module):
 '''
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
 def test_builtin_abs_on_a_scalar_is_not_a_torch_fallback():
     # `abs(self.a - self.b)` is the Python builtin on floats -- a launch-grid predicate,
     # not a tensor op -- but collides with the LIGHT_OPS token `abs`.
     assert lint(_ABS_SCALAR, "F1.4") == []
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
 def test_builtin_pow_on_a_scalar_is_not_a_torch_fallback():
     # `pow(self.k, 2)` is scalar channel-count math, colliding with the LIGHT_OPS `pow`.
     assert lint(_POW_SCALAR, "F1.4") == []

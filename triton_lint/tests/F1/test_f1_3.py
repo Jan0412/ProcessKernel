@@ -216,7 +216,6 @@ _BUG23_REASON = (
 )
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG23_REASON)
 def test_kernel_writing_a_subscript_view_is_not_discarded(fired):
     body = src(
         ELEMENTWISE_KERNEL
@@ -265,7 +264,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.3", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG23_REASON)
 def test_kernel_writing_a_tuple_index_view_is_not_discarded(fired):
     # A multi-axis subscript `out[b, 0]` is still an ast.Subscript that reaches neither
     # alias branch -- the same gap for the (b, c)-indexed per-slice launch.
@@ -284,7 +282,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.3", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG23_REASON)
 def test_kernel_writing_a_bound_slice_view_is_not_discarded(fired):
     # A slice `out[b:b+1]` is an ast.Subscript too (with a Slice index); it writes into
     # the parent storage exactly like `out[b]`, and the alias is likewise never recorded.
@@ -351,12 +348,10 @@ class ModelNew(nn.Module):
 )
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG28_REASON)
 def test_out_parameter_of_a_launch_helper_that_is_returned_is_not_discarded(fired):
     assert not fired("F1.3", _OUT_PARAM_RETURNED)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG28_REASON)
 def test_out_parameter_of_a_launch_helper_that_is_host_read_is_not_discarded(fired):
     assert not fired("F1.3", _OUT_PARAM_HOST_READ)
 
@@ -407,7 +402,6 @@ def outer(a, b, out):
 """
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG28_REASON)
 def test_out_parameter_through_two_helper_hops_is_not_discarded(fired):
     body = src(
         _OUT_PARAM_TWO_HOPS
@@ -422,7 +416,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.3", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG28_REASON)
 def test_out_parameter_of_a_launch_helper_read_via_subscript_is_not_discarded(fired):
     # The caller consumes the helper-written tensor by a subscript host read rather than
     # returning it -- another use flag that never reaches the helper's parameter buffer.
@@ -473,7 +466,6 @@ class ModelNew(nn.Module):
 )
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG34_REASON)
 def test_output_returned_through_a_ternary_is_not_discarded(fired):
     assert not fired("F1.3", _TERNARY_RETURN)
 
@@ -498,7 +490,6 @@ class ModelNew(nn.Module):
 # BUGS.md notes ~78 further files return the output through BoolOp/UnaryOp/Compare, which
 # the same missing recursion drops -- a complete fix recurses every operator node, not
 # only ast.IfExp. These pin the wider blast radius so a narrow IfExp-only fix stays red.
-@pytest.mark.xfail(strict=True, reason=_BUG34_REASON)
 def test_output_returned_through_a_unary_op_is_not_discarded(fired):
     # `return -out.sum()` (a negated loss): _returned_names has no ast.UnaryOp case.
     body = src(
@@ -514,7 +505,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.3", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG34_REASON)
 def test_output_returned_through_a_compare_is_not_discarded(fired):
     # `return out.sum() > 0`: _returned_names has no ast.Compare case either.
     body = src(
@@ -530,7 +520,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.3", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG34_REASON)
 def test_ternary_with_a_bare_output_branch_is_not_discarded(fired):
     # Even the plainest IfExp branch -- a bare `out` -- is missed: the IfExp recursion
     # never runs, so the bare Name never marks `out` returned.
@@ -596,7 +585,6 @@ class ModelNew(nn.Module):
 )
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG35_REASON)
 def test_output_launched_through_a_bound_data_ptr_is_not_discarded(fired):
     assert not fired("F1.3", _DATAPTR_TARGET)
 
@@ -618,7 +606,6 @@ class ModelNew(nn.Module):
     assert not fired("F1.3", body)
 
 
-@pytest.mark.xfail(strict=True, reason=_BUG35_REASON)
 def test_output_launched_through_a_per_slice_data_ptr_is_not_discarded(fired):
     # The real p92_s7 shape: a per-batch loop binds `p = out[i].data_ptr()` and hands the
     # raw pointer to the kernel. Because `_base_name` walks Subscript, aliasing a
@@ -683,3 +670,19 @@ class ModelNew(nn.Module):
     )
     del model.kernels["add_kernel"]
     assert f1_3_discarded_output.check(model) == []
+
+
+def test_output_returned_through_a_boolop_is_not_discarded(fired):
+    # BUG-34 class coverage: `return (out.sum() > 0) and flag` routes the output through a
+    # BoolOp -- the same missing-recursion class as IfExp/UnaryOp/Compare.
+    body = src(
+        ELEMENTWISE_KERNEL
+        + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return (out.sum() > 0) and bool(x.numel())
+"""
+    )
+    assert not fired("F1.3", body)

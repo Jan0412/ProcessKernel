@@ -257,23 +257,9 @@ class TestF12MissingEntryClass:
         assert model.notes == ["no entry-point class found"]
         assert model.reachable_launches == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-25: with no entry-point class the file cannot be loaded by the "
-        "harness at all, yet F1.2 downgrades itself from fail to info. info is never "
-        "actionable (feedback.py), so the file is reported clean and the lintloop "
-        "stops on round 0 without telling the model anything. 393 of 1000 slots in "
-        "the Qwen3.6-27B lintloop run went clean this way (real sample: level 1 "
-        "p100_s0)",
-    )
     def test_missing_entry_class_is_a_fail(self, check):
         assert [f.severity for f in check("F1.2", self.KERNEL_ONLY)] == ["fail"]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-25: the loop's stop signal. render() returns None because the only "
-        "finding is info, so critics.py sets clean=True on an unloadable file",
-    )
     def test_missing_entry_class_is_not_clean(self):
         assert render(analyze_source(self.KERNEL_ONLY, "<t>")) is not None
 
@@ -326,14 +312,6 @@ def scale_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
 """
     )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-25 (every kernel, not just one): with no entry class the file is "
-        "unloadable, so *both* kernels are provably dead -- yet F1.2 downgrades every "
-        "finding to info and the loop marks the slot clean. A fix must raise all of them "
-        "to fail, not merely the first, so the reported count is asserted alongside the "
-        "severity",
-    )
     def test_all_kernels_in_a_no_entry_file_are_fails(self, check):
         found = check("F1.2", self.TWO_KERNELS_NO_ENTRY)
         assert sorted(f.severity for f in found) == ["fail", "fail"]

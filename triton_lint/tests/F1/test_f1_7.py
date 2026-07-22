@@ -65,15 +65,6 @@ class ModelNew(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-21: F1.7 matches host-call qualnames with str.startswith against the "
-    "OFFLOAD_CALLS prefixes, so every longer name in those namespaces is swept in -- "
-    "torch.jit.script_if_tracing (a no-op outside tracing; 11 of the run's 26 F1.7 "
-    "findings, real sample p1510_s9) and the whole torch.compiler.* namespace, "
-    "including torch.compiler.disable, which opts OUT of compilation. Reported at "
-    "fail, the check's hardest verdict, on files with a genuine launched kernel",
-)
 def test_script_if_tracing_is_not_a_compile_offload():
     # torch.jit.script_if_tracing compiles only when the function is called under
     # torch.jit.trace; in an ordinary eager forward it is a no-op passthrough and
@@ -109,15 +100,6 @@ class ModelNew(nn.Module):
     assert [f.severity for f in lint(body, "F1.7")] == ["fail"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-21: F1.7 matches host-call qualnames with str.startswith against the "
-    "OFFLOAD_CALLS prefixes, so every longer name in those namespaces is swept in -- "
-    "torch.jit.script_if_tracing (a no-op outside tracing; 11 of the run's 26 F1.7 "
-    "findings, real sample p1510_s9) and the whole torch.compiler.* namespace, "
-    "including torch.compiler.disable, which opts OUT of compilation. Reported at "
-    "fail, the check's hardest verdict, on files with a genuine launched kernel",
-)
 def test_torch_compiler_query_is_not_a_compile_offload():
     # torch.compiler.is_compiling() asks a question; it compiles nothing. It is
     # caught only because "torch.compiler." starts with "torch.compile".
@@ -133,15 +115,6 @@ class ModelNew(nn.Module):
     assert lint(body, "F1.7") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-21: F1.7 matches host-call qualnames with str.startswith against the "
-    "OFFLOAD_CALLS prefixes, so every longer name in those namespaces is swept in -- "
-    "torch.jit.script_if_tracing (a no-op outside tracing; 11 of the run's 26 F1.7 "
-    "findings, real sample p1510_s9) and the whole torch.compiler.* namespace, "
-    "including torch.compiler.disable, which opts OUT of compilation. Reported at "
-    "fail, the check's hardest verdict, on files with a genuine launched kernel",
-)
 def test_torch_compiler_disable_is_not_a_compile_offload():
     # The inverted case: @torch.compiler.disable explicitly opts the forward OUT
     # of torch.compile, and is reported as delegating compilation to torch.compile.
@@ -170,14 +143,6 @@ class ModelNew(nn.Module):
     assert lint_raw(source, "F1.7") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-21 (decorator spelling): `@torch.jit.script_if_tracing` on a preserved "
-    "eager helper is a no-op outside torch.jit.trace, but the module-level decorator "
-    "sweep records it and the startswith prefix `torch.jit.script` sweeps it in -- "
-    "reported at fail though the timed forward launches a Triton kernel. The check must "
-    "not fire on names that merely *begin* with an offload prefix",
-)
 def test_script_if_tracing_as_a_decorator_is_not_a_compile_offload():
     # Same no-op as the assignment form above, spelled as a decorator on a helper the
     # forward keeps for its eager training path. Exercises the decorator sweep, not the
@@ -196,14 +161,6 @@ class ModelNew(nn.Module):
     assert lint(body, "F1.7") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG-21 (compiler namespace, second member): "
-    "`torch.compiler.cudagraph_mark_step_begin()` marks a CUDA-graph step boundary and "
-    "compiles nothing, but `torch.compiler.` begins with the `torch.compile` prefix, so "
-    "it is swept in and reported at fail. Pairs with is_compiling/disable to pin that the "
-    "whole torch.compiler.* namespace is over-matched, not one stray name",
-)
 def test_torch_compiler_namespace_noop_is_not_a_compile_offload():
     body = '''
 class ModelNew(nn.Module):
