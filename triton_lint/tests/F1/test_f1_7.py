@@ -168,3 +168,76 @@ class ModelNew(nn.Module):
         return out
 '''
     assert lint_raw(source, "F1.7") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-21 (decorator spelling): `@torch.jit.script_if_tracing` on a preserved "
+    "eager helper is a no-op outside torch.jit.trace, but the module-level decorator "
+    "sweep records it and the startswith prefix `torch.jit.script` sweeps it in -- "
+    "reported at fail though the timed forward launches a Triton kernel. The check must "
+    "not fire on names that merely *begin* with an offload prefix",
+)
+def test_script_if_tracing_as_a_decorator_is_not_a_compile_offload():
+    # Same no-op as the assignment form above, spelled as a decorator on a helper the
+    # forward keeps for its eager training path. Exercises the decorator sweep, not the
+    # call sweep, so a prefix fix must cover both.
+    body = '''
+@torch.jit.script_if_tracing
+def fn(x):
+    return x + 1
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+    assert lint(body, "F1.7") == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-21 (compiler namespace, second member): "
+    "`torch.compiler.cudagraph_mark_step_begin()` marks a CUDA-graph step boundary and "
+    "compiles nothing, but `torch.compiler.` begins with the `torch.compile` prefix, so "
+    "it is swept in and reported at fail. Pairs with is_compiling/disable to pin that the "
+    "whole torch.compiler.* namespace is over-matched, not one stray name",
+)
+def test_torch_compiler_namespace_noop_is_not_a_compile_offload():
+    body = '''
+class ModelNew(nn.Module):
+    def forward(self, x):
+        torch.compiler.cudagraph_mark_step_begin()
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+    assert lint(body, "F1.7") == []
+
+
+def test_jit_trace_offload_still_fires():
+    # Passing control: `torch.jit.trace` is a genuine offload (the prefix's intended
+    # target). A prefix fix that whitelists longer names must keep the base names firing.
+    body = '''
+def plain(x):
+    return x * 2
+
+traced = torch.jit.trace(plain, torch.zeros(1))
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        return traced(x)
+'''
+    assert [f.severity for f in lint(body, "F1.7")] == ["fail"]
+
+
+def test_dynamo_optimize_offload_still_fires():
+    # Passing control: `torch._dynamo.optimize` really does route compilation to Dynamo.
+    body = '''
+class ModelNew(nn.Module):
+    def forward(self, x):
+        f = torch._dynamo.optimize()(lambda t: t * 2)
+        return f(x)
+'''
+    assert [f.severity for f in lint(body, "F1.7")] == ["fail"]

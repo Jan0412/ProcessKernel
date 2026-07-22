@@ -6,6 +6,7 @@ from conftest import src
 from helpers import lint, lint_raw
 
 from triton_lint import build_model
+from triton_lint.checks.family2 import f2_1_dead_intermediate
 
 from ._fixtures import NBYTES, REDUCE_KERNEL, SHAPES, THREE_LAUNCHES, TWO_ELEMENTWISE
 
@@ -290,3 +291,75 @@ def test_diamond_shares_no_kernel_across_findings():
     findings = lint_raw(DIAMOND, "F2.1")
     # The four launches are one connected component -> exactly one finding.
     assert len(findings) == 1
+
+
+# ---------------------------------------------------------------------------
+# Only reachable launches count: a round-trip that lives in dead code is not a cost.
+# ---------------------------------------------------------------------------
+
+
+def test_dead_intermediate_in_unreachable_code_is_skipped(check):
+    """`_is_dead_intermediate` runs over every buffer, but the producer and consumer
+    must be *reachable* launches. A round-trip confined to a helper the entry point
+    never calls resolves to no reachable producer, so it is skipped -- exercising the
+    `producer is None or not consumers` branch.
+    """
+    found = check(
+        "F2.1",
+        src(
+            TWO_ELEMENTWISE
+            + """
+def unused(x):
+    n = x.numel()
+    tmp = torch.empty_like(x)
+    exp_kernel[(1,)](x, tmp, n, BLOCK=128)
+    out = torch.empty_like(x)
+    scale_kernel[(1,)](tmp, out, n, BLOCK=128)
+    return out
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        n = x.numel()
+        a = torch.empty_like(x)
+        exp_kernel[(1,)](x, a, n, BLOCK=128)
+        b = torch.empty_like(x)
+        scale_kernel[(1,)](x, b, n, BLOCK=128)
+        return a + b
+""",
+        ),
+        SHAPES,
+    )
+    # forward has the two reachable launches (so the < 2 early-out is not taken), but its
+    # buffers are both returned; the only round-trip, `tmp`, is in unreachable `unused`.
+    assert found == []
+
+
+def test_chain_kernel_absent_from_the_model_is_skipped():
+    """`_finding_for` resolves each launch's kernel through `model.kernels`; after a
+    normal build every reachable launch has one. The `pk is None or ck is None` guard
+    covers a broken mapping -- exercise it directly and confirm the finding degrades
+    gracefully (no fusible pair, so it is reported as materialisation cost).
+    """
+    model = build_model(
+        src(
+            TWO_ELEMENTWISE
+            + """
+class ModelNew(nn.Module):
+    def forward(self, x):
+        n = x.numel()
+        tmp = torch.empty_like(x)
+        exp_kernel[(1,)](x, tmp, n, BLOCK=128)
+        out = torch.empty_like(x)
+        scale_kernel[(1,)](tmp, out, n, BLOCK=128)
+        return out
+"""
+        ),
+        "<t>",
+        SHAPES,
+    )
+    assert len(f2_1_dead_intermediate.check(model)) == 1  # the intermediate is real
+    del model.kernels["exp_kernel"]
+    del model.kernels["scale_kernel"]
+    findings = f2_1_dead_intermediate.check(model)
+    assert len(findings) == 1
+    assert findings[0].data["kernels"] == []  # every pair dropped by the guard

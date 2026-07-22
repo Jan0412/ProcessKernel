@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from conftest import src
 from helpers import lint, lint_raw
 
@@ -251,6 +253,53 @@ class ModelNew(nn.Module):
 def test_layout_churn_in_backward_ignored():
     """The transpose only ever runs during training, never in the timed forward."""
     assert lint(CHURN_IN_BACKWARD, "F2.3") == []
+
+
+# `_host_scopes` (shared with F1.4/F1.5) is `timed_scopes if entry else all functions`.
+# When ModelNew *inherits* its forward, entry is None and the fallback scans every
+# function -- including a dead `Reference` class whose permute+contiguous never runs.
+# This is BUG-27's mechanism, whose blast radius includes F2.3, not just F1.4/F1.5.
+CHURN_IN_INHERITED_FORWARD_DEADCLASS = '''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def work_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=m) * 2.0, mask=m)
+
+
+class Reference(nn.Module):          # dead: nothing constructs it
+    def forward(self, x):
+        return x.permute(0, 2, 1).contiguous()   # a real copy, but never runs
+
+
+class Base(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+
+
+class ModelNew(Base):                # inherits forward -> entry is None
+    pass
+'''
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-27 (F2.3 face): F2.3 shares `_host_scopes` with F1.4/F1.5, so when "
+    "ModelNew inherits its forward and entry resolves to None, the fallback scans every "
+    "function in the file. The dead `Reference` class -- the original PyTorch model, "
+    "which nothing constructs -- is scanned and its permute+contiguous reported as a "
+    "hidden copy the timed forward pays for. The blast radius of BUG-27 includes F2.3.",
+)
+def test_layout_churn_in_dead_class_is_not_scanned_when_forward_is_inherited():
+    assert lint_raw(CHURN_IN_INHERITED_FORWARD_DEADCLASS, "F2.3") == []
 
 
 # ---------------------------------------------------------------------------

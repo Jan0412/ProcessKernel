@@ -229,3 +229,146 @@ def copy_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
     tl.store(dst, v, mask=mask)
 '''
     assert analyze(source).kernels["copy_kernel"].kind == "copy"
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG22_REASON)
+def test_hoisted_roll_is_not_a_copy(analyze):
+    # A circular shift: reads column `(col + shift) % width`, writes column `col`. Like
+    # the hflip, the whole task lives in the two hoisted addresses, which both collapse
+    # to the empty signature -- a third distinct address-arithmetic kernel BUG-7 excludes.
+    source = _PRE + '''
+@triton.jit
+def roll_kernel(inp_ptr, out_ptr, shift, width, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    mask = col < width
+    src_col = (col + shift) % width
+    inp = inp_ptr + row * width + src_col
+    out = out_ptr + row * width + col
+    val = tl.load(inp, mask=mask)
+    tl.store(out, val, mask=mask)
+'''
+    assert analyze(source).kernels["roll_kernel"].kind != "copy"
+
+
+# ---------------------------------------------------------------------------
+# BUG-29 -- open. See tests/BUGS.md.
+# ---------------------------------------------------------------------------
+
+_BUG29_REASON = (
+    "BUG-29: a scalar offset *parameter* used purely additively on a load or store "
+    "address's additive spine (`tl.store(dst_ptr + dst_offset + offs, v)`, or the load "
+    "form `tl.load(src_ptr + src_offset + offs)`) is not recognised as a scalar -- "
+    "_scalar_params only flags params used in a multiplicative or comparison context, so "
+    "an offset that is only ever ADDED escapes it. _is_base_ptr_term then accepts the "
+    "offset param as a base pointer, so _offset_signature strips it and the address's "
+    "offset reduces to {offs}, matching the other side. _is_matching_copy calls the "
+    "kernel a memcpy, so a slice-copy / torch.cat kernel that places its source at a "
+    "parameter-controlled offset is classified `copy` and F1.6 reports it at fail as "
+    "performing none of the task's computation -- exactly the concat/layout case BUG-7 "
+    "excludes. (the offset param is also marked a phantom stored/loaded param, re-opening "
+    "BUG-10 for the additive-only spelling; store form p7404_s4, load form p992_s2 / "
+    "p17118_s2.) 147 of the run's 524 F1.6 findings. Real sample: p7404_s4 (a Triton "
+    "torch.cat)."
+)
+
+_PRE29 = """\
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+"""
+
+# A concat/scatter: copies src into dst at a parameter-controlled offset. The value is
+# a raw load, but the dst_offset placement is the task (this is how a Triton torch.cat
+# is written). The address is INLINE (not hoisted -- that path is BUG-22).
+_CONCAT_AT_PARAM_OFFSET = _PRE29 + '''
+@triton.jit
+def cat_kernel(src_ptr, dst_ptr, dst_offset, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    val = tl.load(src_ptr + offs, mask=mask)
+    tl.store(dst_ptr + dst_offset + offs, val, mask=mask)
+'''
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
+def test_concat_at_scalar_param_offset_is_not_a_copy(analyze):
+    assert analyze(_CONCAT_AT_PARAM_OFFSET).kernels["cat_kernel"].kind != "copy"
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
+def test_f1_6_silent_on_concat_at_scalar_param_offset(fired):
+    body = _CONCAT_AT_PARAM_OFFSET + '''
+
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty(x.numel() + y.numel(), device=x.device, dtype=x.dtype)
+        cat_kernel[(1,)](x, out, 0, x.numel(), BLOCK=128)
+        cat_kernel[(1,)](y, out, x.numel(), y.numel(), BLOCK=128)
+        return out
+'''
+    assert not fired("F1.6", body)
+
+
+def test_concat_at_multiplied_offset_is_not_a_copy(analyze):
+    # Passing control: the same placement written with a multiplied offset
+    # (`row * stride`) is caught by _scalar_params, so the offset survives the
+    # signature and the kernel classifies correctly. Pins the bug to the
+    # purely-additive scalar param, not to the placement itself.
+    source = _PRE29 + '''
+@triton.jit
+def cat_kernel(src_ptr, dst_ptr, row, stride, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    val = tl.load(src_ptr + offs, mask=mask)
+    tl.store(dst_ptr + row * stride + offs, val, mask=mask)
+'''
+    assert analyze(source).kernels["cat_kernel"].kind != "copy"
+
+
+def test_true_memcpy_with_offset_param_unused_is_still_a_copy(analyze):
+    # Passing control the other way: when the offset param is genuinely not on the
+    # store spine, the kernel is a real memcpy and must stay classified copy.
+    source = _PRE29 + '''
+@triton.jit
+def copy_kernel(src_ptr, dst_ptr, dst_offset, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    val = tl.load(src_ptr + offs, mask=mask)
+    tl.store(dst_ptr + offs, val, mask=mask)
+'''
+    assert analyze(source).kernels["copy_kernel"].kind == "copy"
+
+
+# The load-side face of BUG-29: the scalar offset param sits on the LOAD spine
+# (`tl.load(src_ptr + src_offset + offs)`) rather than the store spine. Same mechanism --
+# _scalar_params misses a purely-additive param, _is_base_ptr_term strips it, and the load
+# signature collapses to {offs}, matching the store's {offs}. A slice-extraction copy that
+# reads from a parameter-controlled offset. Real samples: p992_s2, p17118_s2.
+_SLICE_AT_LOAD_OFFSET = _PRE29 + '''
+@triton.jit
+def slice_kernel(src_ptr, src_offset, dst_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    val = tl.load(src_ptr + src_offset + offs, mask=mask)
+    tl.store(dst_ptr + offs, val, mask=mask)
+'''
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
+def test_slice_at_scalar_load_offset_is_not_a_copy(analyze):
+    assert analyze(_SLICE_AT_LOAD_OFFSET).kernels["slice_kernel"].kind != "copy"
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG29_REASON)
+def test_f1_6_silent_on_slice_at_scalar_load_offset(fired):
+    body = _SLICE_AT_LOAD_OFFSET + '''
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        out = torch.empty(x.numel() // 2, device=x.device, dtype=x.dtype)
+        slice_kernel[(1,)](x, x.numel() // 2, out, out.numel(), BLOCK=128)
+        return out
+'''
+    assert not fired("F1.6", body)

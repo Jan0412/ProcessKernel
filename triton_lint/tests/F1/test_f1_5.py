@@ -6,6 +6,8 @@ import pytest
 
 from conftest import ELEMENTWISE_KERNEL, src
 
+from triton_lint import build_model
+
 
 class TestF15NnModuleCall:
     def test_fires_when_module_called(self, check):
@@ -253,3 +255,123 @@ class ModelNew(nn.Module):
 '''
             ),
         )
+
+
+class TestF15SequentialOfLocalModules:
+    """BUG-30: F1.5 treats any constructed-and-called ``nn.*`` module as a torch
+    fallback, but a container (``nn.Sequential`` / ``nn.ModuleList``) that wraps the
+    file's *own* Triton modules invokes only Triton kernels. Unlike F1.4 -- which grew
+    ``_is_local_call`` to stop grading model-authored submodules as fallbacks
+    (BUG-16 / BUG-24) -- F1.5 never consults ``local_classes`` / ``attr_classes``, so
+    the container lands in ``nn_modules_in_init`` as ``nn.Sequential`` and forward
+    calling it is reported at fail. The advice ("keep it only as a weight holder, do
+    not call it") is nonsense for a Sequential of compute modules: it owns no weights,
+    and not calling it skips the kernels. Synthetic -- the run's Sequential findings
+    were torch-layer stacks (real) or externally-supplied ``fn`` (ambiguous)."""
+
+    _LOCAL_TRITON_BLOCK = '''
+class TritonReLU(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, x, out, x.numel(), BLOCK=128)
+        return out
+'''
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="BUG-30: self.net = nn.Sequential(TritonReLU(), TritonReLU()) wraps only "
+        "file-defined Triton modules; self.net(x) runs their kernels and no torch "
+        "compute. F1.5 records self.net as nn.Sequential (HEAVY) and reports ModelNew "
+        "at fail as invoking a PyTorch module -- the F1.4 BUG-16/BUG-24 fault, for which "
+        "F1.5 has no local-class guard",
+    )
+    def test_sequential_of_local_triton_modules_is_not_a_fallback(self, fired):
+        assert not fired(
+            "F1.5",
+            src(
+                ELEMENTWISE_KERNEL
+                + self._LOCAL_TRITON_BLOCK
+                + '''
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(TritonReLU(), TritonReLU())
+
+    def forward(self, x):
+        return self.net(x)
+'''
+            ),
+        )
+
+    def test_sequential_of_torch_layers_still_fires(self, check):
+        # Passing control: a Sequential of real torch layers IS a fallback and must
+        # keep firing -- the fix must inspect the container's contents, not mute it.
+        found = check(
+            "F1.5",
+            src(
+                ELEMENTWISE_KERNEL
+                + '''
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
+
+    def forward(self, x):
+        return self.net(x)
+'''
+            ),
+        )
+        assert [f.severity for f in found] == ["fail"]
+
+    def test_directly_held_local_module_is_already_silent(self, fired):
+        # Passing control: held without the nn.Sequential wrapper, the same local
+        # Triton module is correctly not flagged -- pinning the bug to the container.
+        assert not fired(
+            "F1.5",
+            src(
+                ELEMENTWISE_KERNEL
+                + self._LOCAL_TRITON_BLOCK
+                + '''
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = TritonReLU()
+
+    def forward(self, x):
+        return self.block(x)
+'''
+            ),
+        )
+
+    _SEQ_COMPREHENSION = '''
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(*[TritonReLU() for _ in range(3)])
+
+    def forward(self, x):
+        return self.net(x)
+'''
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="BUG-30 (unpacked-comprehension construction): "
+        "`nn.Sequential(*[TritonReLU() for _ in range(3)])` still wraps only file-defined "
+        "Triton modules, but is recorded as nn.Sequential (HEAVY) and reported at fail. "
+        "The construction spelling does not change the fault -- F1.5 has no local-class "
+        "guard regardless of how the container is built",
+    )
+    def test_sequential_built_by_unpacking_local_modules_is_not_a_fallback(self, fired):
+        assert not fired(
+            "F1.5", src(ELEMENTWISE_KERNEL + self._LOCAL_TRITON_BLOCK + self._SEQ_COMPREHENSION)
+        )
+
+    def test_control_the_linter_resolves_the_sequential_to_local_classes(self):
+        """The linter *has* what a fix needs: `attr_classes['net']` records that `net`
+        wraps the file-defined TritonReLU. F1.5 simply never consults it (unlike F1.4's
+        `_is_local_call`). Mirrors the F1.4 BUG-24 control -- premise for the fix."""
+        model = build_model(
+            src(ELEMENTWISE_KERNEL + self._LOCAL_TRITON_BLOCK + self._SEQ_COMPREHENSION), "<t>"
+        )
+        assert model.attr_classes["net"] == ["TritonReLU"]
+        assert model.nn_modules_in_init["net"] == "nn.Sequential"

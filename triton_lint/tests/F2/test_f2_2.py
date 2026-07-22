@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from conftest import src
 from helpers import lint, lint_raw
 
@@ -198,5 +200,105 @@ def test_recurrence_launch_in_loop_still_fires():
 
 def test_recurrence_is_not_told_to_move_the_loop_into_the_grid():
     fs = [f for f in lint_raw(SEQUENTIAL_RECURRENCE, "F2.2")
+          if f.data.get("kind") == "launch_in_loop"]
+    assert fs and "into the launch grid" not in fs[0].message
+
+
+# ---------------------------------------------------------------------------
+# BUG-33 -- open. See tests/BUGS.md.
+# ---------------------------------------------------------------------------
+
+_BUG33_REASON = (
+    "BUG-33: _detect_recurrence only recognises a carried dependency in the host-rebind "
+    "spelling -- it pairs a launch input to a launch output via an Assign `h = h_new`. A "
+    "recurrence carried IN PLACE inside the kernel (the same buffer both loaded and "
+    "stored by the launch, passed unchanged across the loop) has no such Assign, so "
+    "recurrence stays False and F2.2 emits 'Move that dimension into the launch grid and "
+    "launch the kernel once.' Gridding the loop races on the shared buffer and runs every "
+    "iteration from the initial state -- a correctness bug. This is the F2.2 analogue of "
+    "BUG-13/BUG-18: the recurrence is real but only its rebind spelling is detected. 33 "
+    "of 935 recurrence=False launch-in-loop files carry an in-place buffer. Real sample: "
+    "p6918_s3 (`for _ in range(iterations): sinkhorn_iter_kernel[grid](Q, ...)`, a "
+    "sequential fixed-point iteration with no data dimension to grid at all)."
+)
+
+#: The same recurrence as SEQUENTIAL_RECURRENCE, carried IN PLACE: `state` is loaded and
+#: stored by the launch every iteration and passed unchanged across the loop. There is no
+#: host rebind, so _detect_recurrence never sees the dependency.
+INPLACE_RECURRENCE = '''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def scan_kernel(x_ptr, state_ptr, n, BLOCK: tl.constexpr):
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK); m = o < n
+    tl.store(state_ptr + o, tl.load(state_ptr + o, mask=m) + tl.load(x_ptr + o, mask=m), mask=m)
+
+class ModelNew(nn.Module):
+    def forward(self, x):            # x: (T, N)
+        n = x.shape[1]
+        state = torch.zeros((n,), device=x.device, dtype=x.dtype)
+        for t in range(x.shape[0]):
+            scan_kernel[(1,)](x[t], state, n, BLOCK=128)   # state += x_t, in place
+        return state
+'''
+
+
+def test_inplace_recurrence_launch_in_loop_still_fires():
+    """Control for BUG-33: the loop launch IS a real cost -- the finding is legitimate,
+    only its prescription is wrong. It must keep firing."""
+    fs = [f for f in lint_raw(INPLACE_RECURRENCE, "F2.2")
+          if f.data.get("kind") == "launch_in_loop"]
+    assert len(fs) == 1
+    assert fs[0].severity == "fail"
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG33_REASON)
+def test_inplace_recurrence_is_not_told_to_move_the_loop_into_the_grid():
+    fs = [f for f in lint_raw(INPLACE_RECURRENCE, "F2.2")
+          if f.data.get("kind") == "launch_in_loop"]
+    assert fs and "into the launch grid" not in fs[0].message
+
+
+#: The same in-place recurrence carried by a `while` loop rather than `for`. Neither loop
+#: form produces the host `h = h_new` rebind that _detect_recurrence looks for, so the
+#: while spelling is dropped for the same reason -- the fix must key on the shared
+#: load+store buffer, not on the loop construct.
+INPLACE_RECURRENCE_WHILE = '''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def scan_kernel(x_ptr, state_ptr, n, BLOCK: tl.constexpr):
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK); m = o < n
+    tl.store(state_ptr + o, tl.load(state_ptr + o, mask=m) + tl.load(x_ptr + o, mask=m), mask=m)
+
+class ModelNew(nn.Module):
+    def forward(self, x):            # x: (T, N)
+        n = x.shape[1]
+        state = torch.zeros((n,), device=x.device, dtype=x.dtype)
+        t = 0
+        while t < x.shape[0]:
+            scan_kernel[(1,)](x[t], state, n, BLOCK=128)   # state += x_t, in place
+            t += 1
+        return state
+'''
+
+
+def test_inplace_recurrence_while_launch_in_loop_still_fires():
+    """Control for BUG-33: the loop launch is a real cost -- the finding stays legitimate."""
+    fs = [f for f in lint_raw(INPLACE_RECURRENCE_WHILE, "F2.2")
+          if f.data.get("kind") == "launch_in_loop"]
+    assert len(fs) == 1
+    assert fs[0].severity == "fail"
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG33_REASON)
+def test_inplace_recurrence_while_is_not_told_to_move_the_loop_into_the_grid():
+    fs = [f for f in lint_raw(INPLACE_RECURRENCE_WHILE, "F2.2")
           if f.data.get("kind") == "launch_in_loop"]
     assert fs and "into the launch grid" not in fs[0].message

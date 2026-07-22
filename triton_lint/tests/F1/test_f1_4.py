@@ -448,6 +448,15 @@ def test_control_attr_classes_still_resolves_the_local_submodule():
     assert model.attr_classes["layer_norm"] == ["LayerNormTriton"]
 
 
+def test_control_renaming_the_dead_reference_attr_silences_it():
+    """Passing control for BUG-24: rename the dead class's binding from `self.layer_norm`
+    to `self.ln` and the false positive vanishes -- the two attributes no longer collide
+    in the module-wide table. Pins the FP to the shared attribute name, and guards that a
+    fix keys the table by class rather than blanket-trusting every `self.<heavy>` call."""
+    renamed = DEAD_REFERENCE_CLASS.replace("self.layer_norm", "self.ln")
+    assert lint(LOCAL_SUBMODULE + renamed, "F1.4") == []
+
+
 # BUG-26: BUG-16 diagnosed `_op_of` as matching op tokens "without checking the call
 # actually targets torch", and the fix (`_is_local_call`) whitelisted the code the
 # model wrote itself. A `tl.*` call is neither torch nor model-authored, so it still
@@ -490,6 +499,17 @@ def test_control_torch_sum_in_the_same_position_still_fires():
     found = lint(TL_IN_HOST.replace("REPL", "torch.sum(out)"), "F1.4")
     assert [f.severity for f in found] == ["warn"]
     assert found[0].data["ops"] == ["torch.sum"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-26 (light-token face): `tl.sigmoid` reduces to the op token `sigmoid`, "
+    "which is in LIGHT_OPS, so a Triton builtin in host-visible scope is graded a warn "
+    "PyTorch fallback and told to fold an op already spelled `tl.` into the kernel. Same "
+    "root cause as the tl.sum/tl.dot faces -- _op_of never checks the `tl.` namespace",
+)
+def test_triton_light_builtin_in_host_code_is_not_a_torch_fallback():
+    assert lint(TL_IN_HOST.replace("REPL", "tl.sigmoid(out)"), "F1.4") == []
 
 
 # BUG-27: `_host_scopes` is `model.timed_scopes if model.entry else set(model.functions)`.
@@ -590,3 +610,208 @@ def test_control_an_explicit_delegating_forward_is_silent():
     model = build_model(src(ELEMENTWISE_KERNEL + EXPLICIT_FORWARD), "<t>")
     assert model.entry == "ModelNew.forward"
     assert lint(EXPLICIT_FORWARD, "F1.4") == []
+
+
+# A module-level dead *function* (not a class), reached only by the all-functions
+# fallback. Nothing calls `reference_impl`, but with entry=None `_host_scopes` returns
+# `set(model.functions)`, which includes it -- so its torch.matmul is reported at fail.
+# A distinct spelling from the dead Reference *class* above, sharing the same root cause.
+INHERITED_FORWARD_DEAD_HELPER = '''
+def reference_impl(x):
+    return torch.matmul(x, x)
+
+
+class Base(nn.Module):
+    def forward(self, x):
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+
+
+class ModelNew(Base):
+    pass
+'''
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG-27 (module-level dead function face): ModelNew inherits its forward, so "
+    "entry is None and _host_scopes falls back to set(model.functions) -- every function "
+    "in the file, including the unreferenced module-level `reference_impl`. Its "
+    "torch.matmul is reported at fail as what the timed forward computes, though nothing "
+    "calls it. Same root cause as the dead-class face, reached through a free function",
+)
+def test_dead_module_level_helper_is_not_scanned_when_forward_is_inherited():
+    assert lint(INHERITED_FORWARD_DEAD_HELPER, "F1.4") == []
+
+
+# ---------------------------------------------------------------------------
+# BUG-31 -- open. See tests/BUGS.md.
+# ---------------------------------------------------------------------------
+
+_BUG31_REASON = (
+    "BUG-31: F1.4's call scan matches op tokens by name and never checks the call is on "
+    "a tensor (or even targets torch) -- the scalar guard BUG-9 added (`_is_scalar_expr`) "
+    "lives only in the BinOp pass, not the call scan. So a bare Python builtin doing "
+    "scalar grid/shape math -- `int(round(scale))`, `abs(a - b) < eps`, "
+    "`sum(l*l for l in levels)` -- collides with the LIGHT_OPS tokens round/abs/pow/sum "
+    "and is reported as a PyTorch operator the forward should 'fold into the Triton "
+    "kernel'. Not actionable: there is no torch op to fold. Bare `round`: 202 of the "
+    "run's files (essentially all scalar); abs/pow/sum add ~3000 more (real samples "
+    "p749_s0, p122_s0, p65_s0). sum is mixed with the genuine `sum([t1, t2])` residual "
+    "case, which must keep firing."
+)
+
+_ROUND_SCALAR = '''
+class ModelNew(nn.Module):
+    def __init__(self, scale=2.0):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        n = int(round(self.scale))
+        out = torch.empty_like(x)
+        work_kernel[(n,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+
+_SUM_GENERATOR = '''
+class ModelNew(nn.Module):
+    def __init__(self, levels=(1, 2, 3)):
+        super().__init__()
+        self.levels = levels
+
+    def forward(self, x):
+        total = sum(l * l for l in self.levels)
+        out = torch.empty_like(x)
+        work_kernel[(total,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
+def test_builtin_round_on_a_scalar_is_not_a_torch_fallback():
+    assert lint(_ROUND_SCALAR, "F1.4") == []
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
+def test_builtin_sum_over_a_generator_is_not_a_torch_fallback():
+    assert lint(_SUM_GENERATOR, "F1.4") == []
+
+
+def test_control_torch_round_on_a_tensor_still_fires():
+    # Pins BUG-31 to the bare Python builtin: the real torch op in the same role fires.
+    body = '''
+class ModelNew(nn.Module):
+    def forward(self, x):
+        y = torch.round(x)
+        out = torch.empty_like(y)
+        work_kernel[(1,)](y, out, y.numel(), BLOCK=1024)
+        return out
+'''
+    found = lint(body, "F1.4")
+    assert [f.severity for f in found] == ["warn"]
+    assert "torch.round" in found[0].data["ops"]
+
+
+def test_control_tensor_sum_method_still_fires():
+    # The genuine reduction `x.sum()` is a real light fallback and must keep firing --
+    # the fix targets the bare Python builtin, not the op token `sum`.
+    body = '''
+class ModelNew(nn.Module):
+    def forward(self, x):
+        s = x.sum()
+        out = torch.empty_like(x)
+        work_kernel[(1,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+    found = lint(body, "F1.4")
+    assert [f.severity for f in found] == ["warn"]
+    assert "x.sum" in found[0].data["ops"]
+
+
+_ABS_SCALAR = '''
+class ModelNew(nn.Module):
+    def __init__(self, a=2.0, b=1.0):
+        super().__init__()
+        self.a = a
+        self.b = b
+
+    def forward(self, x):
+        n = 1 if abs(self.a - self.b) < 1e-6 else 2
+        out = torch.empty_like(x)
+        work_kernel[(n,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+
+_POW_SCALAR = '''
+class ModelNew(nn.Module):
+    def __init__(self, k=3):
+        super().__init__()
+        self.k = k
+
+    def forward(self, x):
+        n = pow(self.k, 2)
+        out = torch.empty_like(x)
+        work_kernel[(n,)](x, out, x.numel(), BLOCK=1024)
+        return out
+'''
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
+def test_builtin_abs_on_a_scalar_is_not_a_torch_fallback():
+    # `abs(self.a - self.b)` is the Python builtin on floats -- a launch-grid predicate,
+    # not a tensor op -- but collides with the LIGHT_OPS token `abs`.
+    assert lint(_ABS_SCALAR, "F1.4") == []
+
+
+@pytest.mark.xfail(strict=True, reason=_BUG31_REASON)
+def test_builtin_pow_on_a_scalar_is_not_a_torch_fallback():
+    # `pow(self.k, 2)` is scalar channel-count math, colliding with the LIGHT_OPS `pow`.
+    assert lint(_POW_SCALAR, "F1.4") == []
+
+
+def test_control_tensor_abs_method_still_fires():
+    # Pins BUG-31 to the bare builtin: the genuine `x.abs()` on a tensor keeps firing.
+    body = '''
+class ModelNew(nn.Module):
+    def forward(self, x):
+        y = x.abs()
+        out = torch.empty_like(y)
+        work_kernel[(1,)](y, out, y.numel(), BLOCK=1024)
+        return out
+'''
+    found = lint(body, "F1.4")
+    assert [f.severity for f in found] == ["warn"]
+    assert "x.abs" in found[0].data["ops"]
+
+
+def test_full_functional_namespace_spelling_is_compute():
+    # `torch.nn.functional.softplus(...)` reaches `_is_functional` through the
+    # `nn.functional.` branch rather than the `F.` prefix -- the two spellings of the
+    # same op must classify identically. This covers the `nn.functional.` split.
+    findings = lint(forward_with("torch.nn.functional.softplus(out)"), "F1.4")
+    assert [f.severity for f in findings] == ["warn"]
+    assert "torch.nn.functional.softplus" in findings[0].data["ops"]
+
+
+def test_binop_scope_without_a_function_node_is_skipped():
+    """`_tensor_binops` walks `_host_scopes`, which is a subset of `model.functions` by
+    construction. The `node is None` guard protects the walk if `timed_scopes` ever
+    carries a scope name with no matching function node -- exercise it directly.
+    """
+    model = build_model(
+        src(
+            ELEMENTWISE_KERNEL
+            + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return out
+"""
+        ),
+        "<t>",
+    )
+    model.timed_scopes.add("Ghost.forward")
+    assert f1_4_torch_fallback.check(model) == []

@@ -8,6 +8,7 @@ from conftest import ELEMENTWISE_KERNEL, src
 from helpers import lint, lint_raw
 
 from triton_lint import analyze_source, build_model
+from triton_lint.checks.family1 import f1_2_dead_kernel
 from triton_lint.feedback import render
 
 
@@ -312,3 +313,67 @@ class ModelNew(Base):
         model = analyze(source)
         assert model.entry is None and model.model_class == "ModelNew"
         assert check("F1.2", source) == []
+
+    #: Two kernels, no entry class -- both are provably unlaunchable.
+    TWO_KERNELS_NO_ENTRY = src(
+        ELEMENTWISE_KERNEL
+        + """
+@triton.jit
+def scale_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * 2.0, mask=mask)
+"""
+    )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="BUG-25 (every kernel, not just one): with no entry class the file is "
+        "unloadable, so *both* kernels are provably dead -- yet F1.2 downgrades every "
+        "finding to info and the loop marks the slot clean. A fix must raise all of them "
+        "to fail, not merely the first, so the reported count is asserted alongside the "
+        "severity",
+    )
+    def test_all_kernels_in_a_no_entry_file_are_fails(self, check):
+        found = check("F1.2", self.TWO_KERNELS_NO_ENTRY)
+        assert sorted(f.severity for f in found) == ["fail", "fail"]
+        assert {f.data["kernel"] for f in found} == {"add_kernel", "scale_kernel"}
+
+    def test_control_two_kernels_with_an_entry_that_launches_both_stay_silent(self, check):
+        """Boundary: the same two kernels, both launched from a real ModelNew, must stay
+        silent -- the fix keys on the missing entry class, not on kernel count."""
+        source = self.TWO_KERNELS_NO_ENTRY + """
+class ModelNew(nn.Module):
+    def forward(self, x):
+        tmp = torch.empty_like(x)
+        add_kernel[(1,)](x, x, tmp, x.numel(), BLOCK=128)
+        out = torch.empty_like(x)
+        scale_kernel[(1,)](tmp, out, x.numel(), BLOCK=128)
+        return out
+"""
+        assert check("F1.2", source) == []
+
+
+def test_call_edge_to_a_missing_kernel_is_skipped():
+    """The live-set closure walks `kernel.calls` (a @triton.jit device function that
+    another kernel inlines rather than [grid]-launches). The parser only records edges
+    to *defined* kernels, so an edge whose target is absent from `model.kernels` is
+    reachable only by constructing that state directly -- and when it is, the walk must
+    skip it, not dereference `None`. This exercises the `kernel is None` guard.
+    """
+    model = analyze(
+        src(
+            ELEMENTWISE_KERNEL
+            + """
+class ModelNew(nn.Module):
+    def forward(self, x, y):
+        out = torch.empty_like(x)
+        add_kernel[(1,)](x, y, out, x.numel(), BLOCK=128)
+        return out
+"""
+        )
+    )
+    model.kernels["add_kernel"].calls.add("ghost_dev")
+    # The ghost edge is followed off the launched kernel, found missing, and skipped;
+    # the one live kernel stays live, so nothing is reported and nothing raises.
+    assert f1_2_dead_kernel.check(model) == []
