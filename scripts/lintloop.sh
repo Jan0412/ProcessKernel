@@ -6,8 +6,12 @@
 #SBATCH --account=YOUR_ACCOUNT
 #SBATCH --qos=YOUR_QOS
 #SBATCH --nodes=1
-#SBATCH --nodelist=node01
 #SBATCH --gres=gpu:h100:1
+#
+# No --nodelist. The pin to node01 reached 4 of the ~60 H100s on YOUR_PARTITION (node[02-08]
+# are 8x H100 each) and made every run queue behind whatever held that one node. Nothing
+# here needs a specific node. Pass one on the command line if you ever do:
+#     sbatch --nodelist=node01 scripts/lintloop.sh 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
