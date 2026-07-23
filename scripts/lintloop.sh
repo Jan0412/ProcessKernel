@@ -45,7 +45,8 @@ SMOKE="${SMOKE:-0}"
 
 MODEL_SLUG=$(basename "$MODEL")
 TAG=$([ "$DATASET" = "kernelbook" ] && echo "kb" || echo "level")
-OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_no_think"
+# OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
+OUTPUT_DIR="/path/to/workdir/KernelBench/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
 
 if [ "$SMOKE" = "1" ]; then
     SCOPE=(--problems 0-4 --num-samples 2)
@@ -87,10 +88,10 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
         --backend triton \
         --option one_shot \
         --temperature 0.6 \
-        --think-temperature 0 \
+        --think-temperature 1.0 \
         --max-num-seqs "${MAX_NUM_SEQS:-10}" \
         --max-new-tokens 16384 \
-        --max-model-len 32768 \
+        --max-model-len 40960 \
         --output-dir "$OUTPUT_DIR" \
         --skip-existing; then
         echo "--- generation finished on attempt $attempt"
