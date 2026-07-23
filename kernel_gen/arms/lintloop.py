@@ -28,10 +28,23 @@ construction; "findings went down" is circular. The claim is made on eval_result
 F1.6 passthrough kernels start appearing once a feedback loop exists, as the check notes
 predict), not for the headline.
 
+``--trace`` adds a second output, and changes nothing about the first. Alongside the
+kernels it writes ``traces/round_{r}/``: one ``.npz`` per attempt holding the token ids
+and the top-20 alternatives the model weighed at every step, and an ``attempts.jsonl``
+holding the ``## Plan`` prose, the linter's findings with their line numbers, the
+plan/code seam offsets and DeepConf's group-confidence summaries. That is training data
+for a process reward model -- which step of a generation went wrong, and whether the
+model showed any sign of knowing. It costs no extra generation: the numbers were always
+computed and always thrown away at ``backend.py``'s ``complete``.
+
 Examples:
     # KernelBench level 1, the real run
     uv run python -m kernel_gen.arms.lintloop --model Qwen/Qwen3-Coder-30B-A3B-Instruct \\
         --level 1 --all --rounds 3 --num-samples 10
+
+    # The same, capturing PRM training data
+    uv run python -m kernel_gen.arms.lintloop --model Qwen/Qwen3.6-27B \\
+        --level 1 --all --rounds 3 --num-samples 10 --trace
 
     # KernelBook, same loop, pseudo-level 5
     uv run python -m kernel_gen.arms.lintloop --model Qwen/Qwen3-Coder-30B-A3B-Instruct \\
@@ -91,6 +104,28 @@ def build_parser() -> argparse.ArgumentParser:
              "The other two exist so this choice is ablatable.",
     )
     parser.add_argument("--max-findings", type=int, default=8)
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Record per-token model internals to traces/ -- token ids, the top-K "
+             "alternatives at each step, the plan prose and the linter's line numbers. "
+             "This is PRM training data; it changes nothing about what is generated.",
+    )
+    parser.add_argument(
+        "--trace-topk",
+        type=int,
+        default=20,
+        help="Alternatives kept per token (default: 20, which is also vLLM's "
+             "max_logprobs). Costs ~6 bytes per token per alternative on disk.",
+    )
+    parser.add_argument(
+        "--trace-window",
+        type=int,
+        default=512,
+        help="Sliding window for the DeepConf group-confidence summaries (default: "
+             "512). DeepConf's own 2048 was tuned on math traces; a plan here is "
+             "300-800 tokens and a 2048-wide window would average it away entirely.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument(
         "--skip-existing",
@@ -170,7 +205,7 @@ def main() -> None:
         keys=["model", "arm", "dataset", "dataset_name", "level", "num_problems",
               "num_slots", "num_samples", "rounds", "feedback_policy", "lint_checks",
               "temperature", "think_temperature", "max_new_tokens", "max_model_len",
-              "output_dir"],
+              "trace", "trace_topk", "output_dir"],
         title="Lint-feedback loop (A5)",
     )
 
@@ -214,6 +249,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         trust_remote_code=args.trust_remote_code,
         max_num_seqs=args.max_num_seqs,
+        max_logprobs=args.trace_topk,
     )
 
     spec = SamplingSpec(
@@ -221,7 +257,24 @@ def main() -> None:
         temperature=args.temperature,
         max_new_tokens=args.max_new_tokens,
         think_temperature=args.think_temperature if args.think_temperature > 0 else None,
+        trace_topk=args.trace_topk if args.trace else None,
     )
+    if args.trace:
+        # The run-level facts a reader needs and cannot recover from the arrays. Written
+        # before the first round, so a crashed run's partial traces are still readable.
+        cfg = artifacts.write_trace_config(
+            out_dir,
+            {
+                "model": args.model,
+                "logprobs_mode": "raw_logprobs",
+                "trace_topk": args.trace_topk,
+                "trace_window": args.trace_window,
+                "vocab_size": getattr(backend, "vocab_size", None),
+                "temperature": args.temperature,
+                "think_temperature": args.think_temperature,
+            },
+        )
+        print(f"Saved trace cfg  : {cfg}")
     critic = lint_critic(
         only=set(args.lint_checks.split(",")) if args.lint_checks else None,
         policy=args.feedback_policy,
@@ -241,6 +294,19 @@ def main() -> None:
         finished = [t for t in active if t.done]
         artifacts.write_kernels(out_dir, finished)
         artifacts.append_jsonl(lint_log_path(out_dir), [t.to_dict() for t in finished])
+        if args.trace:
+            # Every slot that ran this round, not only the finished ones: a slot's
+            # round-1 attempt is training data whether or not round 2 improved on it,
+            # and it is unreachable once the trajectory moves on. Journaled per round
+            # for the same reason the kernels are -- a crash costs only what is
+            # in flight.
+            artifacts.write_traces(
+                out_dir,
+                active,
+                round_index,
+                window=args.trace_window,
+                vocab_size=getattr(backend, "vocab_size", None),
+            )
 
     trajectories = run_rounds(
         backend,

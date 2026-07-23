@@ -214,7 +214,7 @@ class CrashingBackend(FakeBackend):
         return super().complete_traced(prompts, **kwargs)
 
 
-def drive_main(monkeypatch, out_dir, backend, *, skip_existing):
+def drive_main(monkeypatch, out_dir, backend, *, skip_existing, extra=()):
     from kernel_gen.arms import lintloop
     from kernel_gen.core import backend as backend_module
 
@@ -224,7 +224,7 @@ def drive_main(monkeypatch, out_dir, backend, *, skip_existing):
     # CrashingBackend's batch index is the round index.
     argv = ["lintloop", "--model", "fake", "--level", "1", "--problems", "19,20",
             "--num-samples", "2", "--rounds", "3", "--think-temperature", "0",
-            "--output-dir", out_dir]
+            "--output-dir", out_dir, *extra]
     if skip_existing:
         argv.append("--skip-existing")
     monkeypatch.setattr(sys, "argv", argv)
@@ -283,3 +283,122 @@ def test_round_dirs_stay_invisible_to_the_non_recursive_eval_glob(tmp_path):
     # …while round_0 is a complete, separately-evaluable baseline of the same 2 slots.
     round_0 = os.listdir(artifacts.round_dir(str(tmp_path), 0))
     assert len([f for f in round_0 if f.endswith("_kernel.py")]) == 2
+
+
+# -- --trace ---------------------------------------------------------------
+#
+# The claim --trace has to earn is that it is a pure addition: same prompts, same
+# kernels, same journal, plus a directory that was not there before. So these run the
+# whole arm twice and diff it, rather than inspecting the new files in isolation.
+
+
+def _run_dir_fingerprint(out_dir):
+    """Every non-trace file under the run dir, with its bytes."""
+    seen = {}
+    for root, dirs, files in os.walk(out_dir):
+        dirs[:] = [d for d in dirs if d != "traces"]
+        for name in files:
+            path = os.path.join(root, name)
+            seen[os.path.relpath(path, out_dir)] = open(path, "rb").read()
+    return seen
+
+
+def test_trace_off_writes_no_traces_directory(tmp_path, monkeypatch):
+    out = str(tmp_path)
+    drive_main(monkeypatch, out, FakeBackend(rules=CRASH_RULES), skip_existing=False)
+
+    assert not os.path.exists(os.path.join(out, "traces"))
+
+
+def test_trace_on_changes_nothing_else_in_the_run_dir(tmp_path, monkeypatch):
+    # THE non-regression. A traced run and an untraced run must be byte-identical
+    # everywhere except traces/ -- the kernels, the round dirs and lint_loop.jsonl all
+    # included. If this ever fails, --trace stopped being free.
+    off, on = str(tmp_path / "off"), str(tmp_path / "on")
+    drive_main(monkeypatch, off, FakeBackend(rules=CRASH_RULES), skip_existing=False)
+    drive_main(monkeypatch, on, FakeBackend(rules=CRASH_RULES), skip_existing=False,
+               extra=["--trace", "--trace-topk", "4"])
+
+    baseline, traced = _run_dir_fingerprint(off), _run_dir_fingerprint(on)
+    assert set(baseline) == set(traced)
+    for name, content in baseline.items():
+        if name.endswith("generation_config.yaml"):
+            continue  # records the flags themselves, so it is expected to differ
+        assert traced[name] == content, name
+
+
+def test_the_journal_record_does_not_grow_when_tracing(tmp_path, monkeypatch):
+    # lint_loop.jsonl is read end-to-end by --skip-existing before every resumed run;
+    # the findings and the arrays must not leak into it.
+    from kernel_gen.arms import lintloop
+
+    off, on = str(tmp_path / "off"), str(tmp_path / "on")
+    drive_main(monkeypatch, off, FakeBackend(rules=CRASH_RULES), skip_existing=False)
+    drive_main(monkeypatch, on, FakeBackend(rules=CRASH_RULES), skip_existing=False,
+               extra=["--trace", "--trace-topk", "4"])
+
+    baseline = artifacts.read_jsonl(lintloop.lint_log_path(off))
+    traced = artifacts.read_jsonl(lintloop.lint_log_path(on))
+    assert baseline == traced
+
+
+def test_a_traced_run_writes_one_npz_per_attempt_that_ran(tmp_path, monkeypatch):
+    out = str(tmp_path)
+    drive_main(monkeypatch, out, FakeBackend(rules=CRASH_RULES), skip_existing=False,
+               extra=["--trace", "--trace-topk", "4"])
+
+    # Round 0 ran all 4 slots; problem 20's 2 slots carried into rounds 1 and 2.
+    assert len(_npz(out, 0)) == 4
+    assert len(_npz(out, 1)) == 2
+    for round_index, expected in ((0, 4), (1, 2)):
+        records = artifacts.read_jsonl(
+            os.path.join(artifacts.trace_dir(out, round_index), "attempts.jsonl")
+        )
+        assert len(records) == expected
+        assert all(r["trace"] is not None for r in records)
+
+
+def _npz(out_dir, round_index):
+    directory = artifacts.trace_dir(out_dir, round_index)
+    return sorted(f for f in os.listdir(directory) if f.endswith(".npz"))
+
+
+def test_the_trace_config_records_what_the_arrays_cannot(tmp_path, monkeypatch):
+    import json
+
+    out = str(tmp_path)
+    drive_main(monkeypatch, out, FakeBackend(rules=CRASH_RULES), skip_existing=False,
+               extra=["--trace", "--trace-topk", "4"])
+
+    config = json.loads(open(os.path.join(out, "traces", "trace_config.json")).read())
+    assert config["logprobs_mode"] == "raw_logprobs"
+    assert config["trace_topk"] == 4
+    assert config["vocab_size"] == FakeBackend().vocab_size
+
+
+def test_traces_are_journaled_per_round_so_a_crash_keeps_what_finished(tmp_path, monkeypatch):
+    out = str(tmp_path)
+    with pytest.raises(RuntimeError, match="unspecified launch failure"):
+        drive_main(monkeypatch, out, CrashingBackend(rules=CRASH_RULES),
+                   skip_existing=False, extra=["--trace", "--trace-topk", "4"])
+
+    # The process died in round 1, but round 0's four traces survived it.
+    assert len(_npz(out, 0)) == 4
+    assert not os.path.exists(artifacts.trace_dir(out, 1))
+
+
+def test_a_dirty_attempt_is_traced_even_though_it_is_never_journaled(tmp_path, monkeypatch):
+    # Slots that carry into another round are training data too -- arguably the most
+    # valuable, since a repair round is evidence about what went wrong. write_traces
+    # takes every active slot, not only the finished ones.
+    out = str(tmp_path)
+    drive_main(monkeypatch, out, FakeBackend(rules=CRASH_RULES), skip_existing=False,
+               extra=["--trace", "--trace-topk", "4"])
+
+    round_0 = artifacts.read_jsonl(
+        os.path.join(artifacts.trace_dir(out, 0), "attempts.jsonl")
+    )
+    dirty = [r for r in round_0 if not r["clean"]]
+    assert dirty, "the cheating variant should have failed round 0"
+    assert all(r["findings"] for r in dirty)
+    assert any(f["data"].get("lineno") for r in dirty for f in r["findings"])
