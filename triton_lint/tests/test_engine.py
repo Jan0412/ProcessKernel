@@ -192,3 +192,49 @@ def test_on_round_end_sees_the_slots_that_ran_that_round():
     )
 
     assert seen == [(0, 6), (1, 2)]
+
+
+# -- tracing ---------------------------------------------------------------
+
+
+def test_a_trace_reaches_the_attempt_it_belongs_to():
+    backend = FakeBackend(default=GOOD)
+    spec = SamplingSpec(think_temperature=None, trace_topk=4)
+    trajs = run_rounds(
+        backend, slots(problems(2), 2), build_prompt, build_repair_prompt, spec, rounds=1
+    )
+
+    for traj in trajs:
+        trace = traj.attempts[0].trace
+        assert trace is not None and len(trace) > 0
+        assert trace.k == 4
+
+
+def test_a_repair_round_gets_its_own_trace_not_the_first_rounds():
+    backend = FakeBackend(rules=[(REPAIR_MARKER, GOOD)], default=BAD)
+    spec = SamplingSpec(think_temperature=None, trace_topk=4)
+    trajs = run_rounds(
+        backend, slots(problems(1), 1), build_prompt, build_repair_prompt, spec,
+        critic=critic, rounds=2,
+    )
+
+    first, second = trajs[0].attempts
+    assert first.trace.token_ids.tolist() != second.trace.token_ids.tolist()
+
+
+def test_tracing_off_leaves_the_attempt_text_identical():
+    # The non-regression that matters: --trace must be a pure addition, so an untraced
+    # run and a traced run must produce the same kernels from the same fake.
+    off = run(FakeBackend(default=GOOD), rounds=1, critic_fn=critic, n_problems=2, num_samples=2)
+    on = run_rounds(
+        FakeBackend(default=GOOD),
+        slots(problems(2), 2),
+        build_prompt,
+        build_repair_prompt,
+        SamplingSpec(think_temperature=None, trace_topk=8),
+        critic=critic,
+        rounds=1,
+    )
+
+    assert [t.final().code for t in off] == [t.final().code for t in on]
+    assert [t.final().raw for t in off] == [t.final().raw for t in on]

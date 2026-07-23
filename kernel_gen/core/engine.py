@@ -6,7 +6,7 @@ choose between. A driver loop that calls the critic itself is smaller, determini
 and keeps the one property an agent framework would have destroyed:
 
 **Round-major batching.** A round collects every still-active slot across every
-problem into ONE :func:`generate_batch` call. The existing arms loop per problem,
+problem into ONE :func:`generate_batch_traced` call. The existing arms loop per problem,
 which is affordable exactly once; at 10 samples x 3 rounds it is not. This is the
 engine's reason to exist, and ``test_engine.py`` pins it -- a future "just loop over
 the problems" refactor must fail a test, not merely be slower.
@@ -27,7 +27,7 @@ from typing import Callable
 
 from .backend import Backend
 from .model import Attempt, Problem, Review, Trajectory
-from .sampling import SamplingSpec, generate_batch
+from .sampling import SamplingSpec, TracedCompletion, generate_batch_traced
 from .text import extract_code_block
 
 #: A critic sees a problem, the code one slot just produced, and what it complained
@@ -88,16 +88,16 @@ def run_rounds(
             else build_repair_prompt(t.problem, t.last)
             for t in active
         ]
-        raws = generate_batch(backend, prompts, spec)
+        completions = generate_batch_traced(backend, prompts, spec)
 
-        if len(raws) != len(active):  # a backend that reorders or drops is a hard bug
+        if len(completions) != len(active):  # a backend that reorders or drops is a hard bug
             raise RuntimeError(
-                f"backend returned {len(raws)} completions for {len(active)} prompts"
+                f"backend returned {len(completions)} completions for {len(active)} prompts"
             )
 
         n_clean = 0
-        for traj, raw in zip(active, raws):
-            attempt = _review(traj, raw, round_index, critic)
+        for traj, completion in zip(active, completions):
+            attempt = _review(traj, completion, round_index, critic)
             traj.attempts.append(attempt)
 
             clean = attempt.review is not None and attempt.review.clean
@@ -119,16 +119,22 @@ def run_rounds(
     return trajectories
 
 
-def _review(traj: Trajectory, raw: str, round_index: int, critic: Critic | None) -> Attempt:
+def _review(
+    traj: Trajectory, completion: TracedCompletion, round_index: int, critic: Critic | None
+) -> Attempt:
     """One completion -> one Attempt, degrading rather than raising."""
     problem = traj.problem
+    raw = completion.text
     try:
         code = extract_code_block(raw)
     except Exception as exc:  # noqa: BLE001 - defensive by design
         print(f"[WARN] could not extract code for problem {problem.problem_id}: {exc}")
         code = ""
 
-    attempt = Attempt(round=round_index, raw=raw, code=code)
+    # completion.trace is already None when tracing is off or the backend had nothing to
+    # give -- carried through as-is, so an untraced run reaches exactly the code an
+    # untraced run reached before.
+    attempt = Attempt(round=round_index, raw=raw, code=code, trace=completion.trace)
     if critic is None:
         return attempt
 
