@@ -57,6 +57,20 @@ def test_pack_keeps_the_sampled_token_even_when_it_is_not_the_argmax():
     assert trace.token_ids.tolist() == [3]
     assert trace.topk_ids[0, 0] == 7  # argmax, unchanged
     assert trace.sampled_lp[0] == pytest.approx(math.log(0.3), abs=1e-6)
+    assert trace.sampled_rank[0] == 2
+
+
+def test_pack_sorts_rows_because_vllm_puts_the_sampled_token_first():
+    # vLLM builds each position as {token_id: Logprob} with the SAMPLED token inserted
+    # before the top-K, and a dict keeps first-insertion order even when the duplicate
+    # key is overwritten. So a row genuinely arrives with the argmax in position 1, not
+    # 0, whenever sampling took a runner-up. Trusting that order would file the sampled
+    # token's logprob under top1_lp for exactly the tokens where the difference matters.
+    as_vllm_returns_it = [[(3, math.log(0.3)), (7, math.log(0.6)), (9, math.log(0.1))]]
+    trace = pack([3], as_vllm_returns_it, k=3)
+
+    assert trace.topk_ids[0].tolist() == [7, 3, 9]
+    assert derive_scalars(trace.topk_lp)["top1_lp"][0] == pytest.approx(math.log(0.6), abs=1e-3)
 
 
 def test_pack_truncates_to_k_but_reads_the_sampled_logprob_first():
@@ -68,6 +82,7 @@ def test_pack_truncates_to_k_but_reads_the_sampled_logprob_first():
     assert trace.topk_ids.shape == (1, 2)
     assert 99 not in trace.topk_ids
     assert trace.sampled_lp[0] == pytest.approx(math.log(0.01), abs=1e-5)
+    assert trace.sampled_rank[0] == 3  # rank survives even though the entry is dropped
 
 
 def test_pack_pads_short_rows_rather_than_going_ragged():
@@ -108,7 +123,14 @@ def test_every_array_stays_the_same_length_after_concat():
     trace = concat_passes(pack([1, 2], _rows(_flat(4), _flat(4)), k=4), pack([3], None, k=4))
 
     n = len(trace)
-    for array in (trace.token_ids, trace.topk_ids, trace.topk_lp, trace.sampled_lp, trace.seg):
+    for array in (
+        trace.token_ids,
+        trace.topk_ids,
+        trace.topk_lp,
+        trace.sampled_lp,
+        trace.sampled_rank,
+        trace.seg,
+    ):
         assert array.shape[0] == n
 
 
@@ -299,6 +321,7 @@ def test_trace_round_trips_through_disk_without_allow_pickle(tmp_path):
 
     assert restored.token_ids.tolist() == original.token_ids.tolist()
     assert restored.seg.tolist() == original.seg.tolist()
+    assert restored.sampled_rank.tolist() == original.sampled_rank.tolist()
     assert restored.meta == original.meta
     np.testing.assert_allclose(
         np.asarray(restored.topk_lp, dtype=np.float32),

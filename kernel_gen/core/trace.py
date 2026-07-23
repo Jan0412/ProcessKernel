@@ -56,6 +56,7 @@ class TokenTrace:
     topk_ids: np.ndarray  # int32[T, K], PAD_ID where the model returned fewer
     topk_lp: np.ndarray  # float16[T, K], -inf on the padding
     sampled_lp: np.ndarray  # float32[T]
+    sampled_rank: np.ndarray  # int16[T], 1-based; 0 = unknown
     seg: np.ndarray  # int8[T], SEG_PLAN / SEG_CODE
     meta: dict = field(default_factory=dict)
 
@@ -76,10 +77,21 @@ def pack(
 ) -> TokenTrace:
     """Backend output -> a :class:`TokenTrace`, one segment, no seam handling.
 
-    ``topk[t]`` is the alternatives at step ``t``, best first. vLLM returns K entries
-    *plus the sampled token when it fell outside the top-K*, so rows arrive ragged at
-    K or K+1; they are truncated to K here and the sampled token's logprob is kept
-    separately, which is why nothing downstream has to reason about ragged rows.
+    ``topk[t]`` is the alternatives at step ``t`` as ``(token_id, logprob)``. Two
+    properties of vLLM's actual output are handled here rather than trusted:
+
+    **Order.** vLLM builds each position as ``{token_id: Logprob}`` with the *sampled*
+    token inserted first and the top-K after it, so when sampling took a runner-up --
+    routine at ``--think-temperature 1.0`` -- the first entry is NOT the argmax and a
+    dict preserves that insertion order even though the duplicate key is overwritten.
+    Rows are therefore sorted by logprob here, descending. Trusting the incoming order
+    would put the sampled token in the ``top1_lp`` column for exactly the tokens where
+    the distinction matters.
+
+    **Width.** The same construction yields K+1 entries whenever the sampled token
+    ranked outside the top-K. Rows are truncated to K *after* the sampled token's
+    logprob and rank have been read off, so the ragged case costs no information and
+    nothing downstream has to reason about ragged rows.
 
     ``topk=None`` (a backend with no internals to give) still produces a valid trace --
     the arrays are empty in the K dimension rather than absent, so callers never branch.
@@ -90,17 +102,18 @@ def pack(
     topk_ids = np.full((n, k), PAD_ID, dtype=np.int32)
     topk_lp = np.full((n, k), -np.inf, dtype=np.float16)
     sampled_lp = np.zeros(n, dtype=np.float32)
+    sampled_rank = np.zeros(n, dtype=np.int16)
 
     for t, row in enumerate(topk or []):
         if t >= n:  # a backend that returned more logprob rows than tokens
             break
-        # The sampled token's own logprob, found before truncation: if it ranked
-        # outside the top-K it is the entry that truncation is about to drop.
-        for token_id, logprob in row:
+        ordered = sorted(row, key=lambda entry: entry[1], reverse=True)
+        for rank, (token_id, logprob) in enumerate(ordered, start=1):
             if token_id == ids[t]:
                 sampled_lp[t] = logprob
+                sampled_rank[t] = rank
                 break
-        head = row[:k]
+        head = ordered[:k]
         topk_ids[t, : len(head)] = [i for i, _ in head]
         topk_lp[t, : len(head)] = [lp for _, lp in head]
 
@@ -109,6 +122,7 @@ def pack(
         topk_ids=topk_ids,
         topk_lp=topk_lp,
         sampled_lp=sampled_lp,
+        sampled_rank=sampled_rank,
         seg=np.full(n, seg, dtype=np.int8),
         meta=dict(meta or {}),
     )
@@ -141,6 +155,7 @@ def concat_passes(plan: TokenTrace, code: TokenTrace, meta: dict | None = None) 
         topk_ids=np.concatenate([plan.topk_ids, code.topk_ids]),
         topk_lp=np.concatenate([plan.topk_lp, code.topk_lp]),
         sampled_lp=np.concatenate([plan.sampled_lp, code.sampled_lp]),
+        sampled_rank=np.concatenate([plan.sampled_rank, code.sampled_rank]),
         seg=np.concatenate([
             np.full(len(plan), SEG_PLAN, dtype=np.int8),
             np.full(len(code), SEG_CODE, dtype=np.int8),
@@ -281,6 +296,7 @@ def write_trace(path: str, trace: TokenTrace) -> None:
         topk_ids=trace.topk_ids,
         topk_lp=trace.topk_lp,
         sampled_lp=trace.sampled_lp,
+        sampled_rank=trace.sampled_rank,
         seg=trace.seg,
         meta=np.array(json.dumps(trace.meta)),
     )
@@ -293,6 +309,7 @@ def read_trace(path: str) -> TokenTrace:
             topk_ids=data["topk_ids"],
             topk_lp=data["topk_lp"],
             sampled_lp=data["sampled_lp"],
+            sampled_rank=data["sampled_rank"],
             seg=data["seg"],
             meta=json.loads(str(data["meta"])),
         )
