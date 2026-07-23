@@ -37,14 +37,58 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+import numpy as np  # noqa: E402
+
 from kernel_gen.core import artifacts  # noqa: E402
-from kernel_gen.core.trace import SEG_CODE, SEG_PLAN, derive_scalars, read_trace  # noqa: E402
+from kernel_gen.core.trace import (  # noqa: E402
+    SEG_CODE,
+    SEG_PLAN,
+    derive_scalars,
+    rank1_calibration,
+    read_trace,
+)
 
 
 def load_records(run_dir: str, round_index: int) -> list[dict]:
     return artifacts.read_jsonl(
         os.path.join(artifacts.trace_dir(run_dir, round_index), "attempts.jsonl")
     )
+
+
+def check_calibration(run_dir: str, records: list[dict], round_index: int, limit: int = 20) -> None:
+    """Prove from the data that the logprobs are pre-temperature. See rank1_calibration.
+
+    Reads the arrays rather than the summaries, so it is the one part of the read-out
+    that opens ``.npz`` files -- capped at ``limit`` traces, which is far more than
+    enough for a rate over tens of thousands of tokens.
+    """
+    traced = [r for r in records if r["trace"]][:limit]
+    if not traced:
+        return
+
+    columns: dict[int, list[np.ndarray]] = {SEG_PLAN: [], SEG_CODE: []}
+    temperatures = {}
+    for record in traced:
+        path = os.path.join(artifacts.trace_dir(run_dir, round_index), record["trace"]["file"])
+        trace = read_trace(path)
+        temperatures[SEG_PLAN] = record["trace"].get("plan_temperature")
+        temperatures[SEG_CODE] = record["trace"].get("code_temperature")
+        for seg in (SEG_PLAN, SEG_CODE):
+            mask = trace.seg == seg
+            if mask.any():
+                columns[seg].append((trace.topk_lp[mask], trace.sampled_rank[mask]))
+
+    print(f"  calibration (over {len(traced)} traces):")
+    for seg, name in ((SEG_PLAN, "plan"), (SEG_CODE, "code")):
+        if not columns[seg]:
+            continue
+        lp = np.concatenate([c[0] for c in columns[seg]])
+        rank = np.concatenate([c[1] for c in columns[seg]])
+        recorded, observed = rank1_calibration(lp, rank)
+        ratio = observed / recorded if recorded else float("nan")
+        print(f"    {name} (T={temperatures[seg]}): recorded p1 {recorded:.4f}  "
+              f"observed rank-1 {observed:.4f}  ratio {ratio:.3f}  (n={lp.shape[0]})")
+    print("    ratio ~1.00 at T=1.0 and >1.00 at T<1.0 => the record is raw_logprobs")
 
 
 def load_trace_config(run_dir: str) -> dict:
@@ -115,7 +159,11 @@ def inspect(run_dir: str, record: dict, round_index: int, n_tokens: int) -> None
             columns = f"{values[plan_mask].mean():12.4f} {columns}"
         print(f"  {name:<16s} {columns}")
     if two_pass:
-        print("  ^ comparable halves => raw_logprobs; a large gap => temperature leaked in")
+        # The halves are NOT expected to match. Prose is genuinely less predictable than
+        # Triton boilerplate, so a real gap here is the model, not a bug -- which is
+        # exactly why the temperature question is settled by check_calibration's rank
+        # statistic instead of by comparing these two columns.
+        print("  (a gap here is prose vs code, not temperature -- see the calibration check)")
 
     # -- the join that credit assignment needs -------------------------------
     print(f"\nfindings ({len(record['findings'])}):")
@@ -157,13 +205,16 @@ def main() -> None:
         for round_index in range(16):
             if not os.path.isdir(artifacts.trace_dir(args.run_dir, round_index)):
                 break
-            summarize_round(load_records(args.run_dir, round_index), round_index)
+            records = load_records(args.run_dir, round_index)
+            summarize_round(records, round_index)
+            check_calibration(args.run_dir, records, round_index)
         return
 
     records = load_records(args.run_dir, args.round)
     if not records:
         raise SystemExit(f"no traces in {artifacts.trace_dir(args.run_dir, args.round)}")
     summarize_round(records, args.round)
+    check_calibration(args.run_dir, records, args.round)
 
     traced = [r for r in records if r["trace"]]
     if not traced:

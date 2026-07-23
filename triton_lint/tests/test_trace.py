@@ -20,6 +20,7 @@ from kernel_gen.core.trace import (
     concat_passes,
     derive_scalars,
     pack,
+    rank1_calibration,
     read_trace,
     summarize,
     write_trace,
@@ -327,3 +328,48 @@ def test_trace_round_trips_through_disk_without_allow_pickle(tmp_path):
         np.asarray(restored.topk_lp, dtype=np.float32),
         np.asarray(original.topk_lp, dtype=np.float32),
     )
+
+
+# ------------------------------------------------------------------- calibration
+
+
+#: Deliberately skewed. Temperature is a no-op on a uniform distribution -- sharpening
+#: it just gives it back -- so a uniform fixture would make the T<1 arm below pass
+#: whatever the code did.
+SKEWED = [0.4, 0.3, 0.2, 0.1]
+
+
+def _sampled_at(temperature: float, n: int, seed: int) -> tuple:
+    """n draws from SKEWED sharpened by 1/T, packed against the UNSHARPENED record."""
+    rng = np.random.default_rng(seed)
+    sharpened = np.array(SKEWED) ** (1 / temperature)
+    sharpened /= sharpened.sum()
+    rows = [[(i, math.log(p)) for i, p in enumerate(SKEWED)] for _ in range(n)]
+    trace = pack(list(rng.choice(4, size=n, p=sharpened)), rows, k=4)
+    return rank1_calibration(trace.topk_lp, trace.sampled_rank)
+
+
+def test_calibration_agrees_when_the_record_is_what_was_sampled_from():
+    # The T=1.0 arm: the sampler drew from exactly the recorded distribution, so the
+    # rank-1 rate must match the recorded p1. This is the reference.
+    recorded, observed = _sampled_at(1.0, 20000, seed=0)
+
+    assert recorded == pytest.approx(0.4, abs=1e-3)
+    assert observed == pytest.approx(0.4, abs=0.02)
+
+
+def test_calibration_detects_sampling_sharper_than_the_record():
+    # The T<1 arm, and the whole point: the record still says p1=0.4 but the sampler
+    # took rank 1 far more often, which can only happen if the record is PRE-temperature.
+    # Were it processed, this ratio would read 1.00 and the tempering would be invisible
+    # in every trace ever written.
+    recorded, observed = _sampled_at(0.5, 20000, seed=1)
+
+    assert recorded == pytest.approx(0.4, abs=1e-3)
+    assert observed / recorded > 1.2
+
+
+def test_calibration_of_an_empty_trace_is_nan_not_a_crash():
+    trace = pack([], None, k=20)
+    recorded, observed = rank1_calibration(trace.topk_lp, trace.sampled_rank)
+    assert math.isnan(recorded) and math.isnan(observed)

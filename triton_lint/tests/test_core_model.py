@@ -143,3 +143,89 @@ def test_to_dict_carries_the_per_round_history():
     assert record["clean"] is True
     assert [r["round"] for r in record["rounds"]] == [0, 1]
     assert record["rounds"][0]["n_fail"] == 2
+
+
+# -- extract_code_block: the model revises in the open ---------------------
+#
+# Reasoning models do not answer once. They write a kernel, notice something ("Wait,
+# tl.dot expects..."), and write it again -- so a completion holds several fenced
+# blocks and only the last is the answer. Taking the first shipped the model's first
+# draft, and sometimes an illustrative fragment that came before it, for every run this
+# repo has ever done. Fixtures below are reduced from real Qwen3.6-27B completions.
+
+REVISION = '''\
+Here is my first attempt.
+
+```python
+import torch
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x):
+        return x  # first draft
+```
+
+Wait, `tl.dot` expects `a` to be `(BLOCK_K, 1)`. Let me fix that.
+
+```python
+import torch
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x):
+        return x * 2  # revised
+```
+'''
+
+
+def test_the_last_complete_block_is_the_answer_not_the_first():
+    assert "revised" in extract_code_block(REVISION)
+    assert "first draft" not in extract_code_block(REVISION)
+
+
+def test_a_leading_fragment_never_wins_over_a_complete_file():
+    # The worst observed case: an interrupted snippet comes first, so the run shipped a
+    # loop body with no imports and no class, which scores zero at eval.
+    raw = (
+        "Sketching the inner loop:\n\n"
+        "```python\n    acc = tl.zeros((1, BLOCK_L), dtype=tl.float32)\n```\n\n"
+        "Now the whole file:\n\n"
+        "```python\nimport torch\n\n\nclass ModelNew(torch.nn.Module):\n    pass\n```\n"
+    )
+    out = extract_code_block(raw)
+
+    assert out.startswith("import torch")
+    assert "class ModelNew" in out
+
+
+def test_a_later_block_that_does_not_parse_cannot_displace_a_good_one():
+    raw = (
+        "```python\nimport torch\n\n\nclass ModelNew:\n    pass\n```\n"
+        "and a broken afterthought:\n"
+        "```python\nclass ModelNew(nn.Module:\n```\n"
+    )
+    assert extract_code_block(raw) == "import torch\n\n\nclass ModelNew:\n    pass"
+
+
+def test_a_later_block_without_the_entry_class_cannot_displace_the_submission():
+    # Models often close with a usage example or a benchmark snippet. It parses, but it
+    # is not the file being submitted.
+    raw = (
+        "```python\nimport torch\n\n\nclass ModelNew:\n    pass\n```\n"
+        "Usage:\n"
+        "```python\nm = ModelNew()\nprint(m)\n```\n"
+    )
+    assert "class ModelNew" in extract_code_block(raw)
+
+
+def test_a_single_block_is_returned_exactly_as_before():
+    # 2 of the 14 traced completions had one block; those must not move at all.
+    raw = "```python\nimport torch\n\n\nclass ModelNew:\n    pass\n```"
+    assert extract_code_block(raw) == "import torch\n\n\nclass ModelNew:\n    pass"
+
+
+def test_when_nothing_parses_the_first_block_is_still_returned():
+    # The historical fallback, kept deliberately: a completion where every block is
+    # broken must degrade the way it always did, not start returning a different one.
+    raw = "```python\nclass A(nn.Module:\n```\ntext\n```python\nclass B(nn.Module:\n```"
+    assert extract_code_block(raw) == "class A(nn.Module:"

@@ -49,15 +49,14 @@ def parse_problems(spec: str) -> list[int]:
 
 
 def extract_code_block(text: str) -> str:
-    """The first ```python / ```py fenced block, dedented; else the text from its first
-    Python statement, with leading prose and stray fences removed.
+    """The model's **final** complete kernel file, dedented; else its best effort.
 
-    A newline is required after the language tag so an *indented* fence (nested under
-    prose or a list item) does not have the first code line's indentation eaten while the
-    rest keep theirs -- ``textwrap.dedent`` then restores a uniform block. When no fence
-    is present, leading prose ("## Plan", a numbered list) is dropped by resuming at the
-    first Python statement, but only when that turns an unparseable blob into a parseable
-    one -- so a bare file that merely opens with a comment is returned untouched.
+    Not the first fenced block, which is what this used to return. Reasoning models
+    revise in the open: they write a kernel, then "Wait, ``tl.dot`` expects ``a`` to be
+    ``(BLOCK_K, 1)``...", then write it again. Measured on the first traced run
+    (Qwen3.6-27B, KernelBench level 1), 12 of 14 completions had a later, better block
+    than the one taken, and four took a bare fragment with no imports and no class.
+    See ``kernel_gen/core/text.py``, which is the copy under test.
     """
 
     def _parses(src: str) -> bool:
@@ -67,9 +66,14 @@ def extract_code_block(text: str) -> str:
         except (SyntaxError, ValueError):
             return False
 
-    match = re.search(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", text, re.DOTALL)
-    if match:
-        return textwrap.dedent(match.group(1)).strip()
+    blocks = [
+        textwrap.dedent(m.group(1)).strip()
+        for m in re.finditer(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", text, re.DOTALL)
+    ]
+    if blocks:
+        parseable = [b for b in blocks if _parses(b)]
+        submissions = [b for b in parseable if "class ModelNew" in b]
+        return (submissions or parseable or blocks[:1])[-1]
 
     stripped = textwrap.dedent(re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip()))
     if not _parses(stripped):

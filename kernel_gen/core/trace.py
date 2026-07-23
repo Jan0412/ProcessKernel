@@ -274,6 +274,34 @@ def summarize(scalars: dict[str, np.ndarray], window: int = 512) -> dict[str, fl
     return out
 
 
+def rank1_calibration(topk_lp: np.ndarray, sampled_rank: np.ndarray) -> tuple[float, float]:
+    """``(recorded mean p1, observed P(sampled was rank 1))`` -- is the record tempered?
+
+    This is the one check that can tell ``raw_logprobs`` from ``processed_logprobs``
+    after the fact, using nothing but data already on disk, and it matters because the
+    two are indistinguishable by eye: both produce plausible confidence numbers, and
+    only one of them is a property of the model rather than of a CLI flag.
+
+    The argument is simple. Sampling at temperature ``T`` draws from the distribution
+    sharpened by ``1/T``. If the *recorded* distribution is raw (pre-temperature), then
+    at ``T = 1`` the sampler drew from exactly what was recorded and the two numbers
+    must agree, while at ``T < 1`` it drew from something sharper and the observed
+    rank-1 rate must come out *higher* than the record predicts. If instead the record
+    were processed, the temperature would already be baked into it and both halves would
+    agree regardless of ``T``.
+
+    So: agreement on a ``T = 1`` span and a ratio above 1 on a ``T < 1`` span is proof
+    the record is raw. Measured on the first traced run (Qwen3.6-27B): 1.008 on the plan
+    at ``T = 1.0``, 1.032 on the code at ``T = 0.6``.
+    """
+    lp = np.asarray(topk_lp, dtype=np.float64)
+    if lp.size == 0 or lp.shape[1] == 0:
+        return float("nan"), float("nan")
+    recorded = float(np.exp(lp[:, 0]).mean())
+    observed = float((np.asarray(sampled_rank) == 1).mean())
+    return recorded, observed
+
+
 def _sliding_mean(values: np.ndarray, window: int) -> np.ndarray:
     """Mean over every window of ``window`` tokens, stride 1. Short input -> one group."""
     w = min(window, values.size)

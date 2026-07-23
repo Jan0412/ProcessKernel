@@ -14,9 +14,31 @@ import textwrap
 _LEADING_ID = re.compile(r"(\d+)")
 
 
+#: The class KernelBench instantiates. A fenced block without it is not a submission --
+#: see ``triton_lint.parsing.ENTRY_CLASSES``.
+ENTRY_CLASS = "class ModelNew"
+
+_FENCE = re.compile(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+
 def extract_code_block(text: str) -> str:
-    """The first ```python / ```py fenced block, dedented; else the text from its first
-    Python statement, with leading prose and stray fences removed.
+    """The model's **final** complete kernel file, dedented; else its best effort.
+
+    Not the first fenced block, which is what this used to return. Reasoning models
+    revise in the open: they write a kernel, then "Wait, ``tl.dot`` expects ``a`` to be
+    ``(BLOCK_K, 1)``…", then write it again, several times, and only the last block is
+    the answer. Measured on the first traced run (Qwen3.6-27B, KernelBench level 1),
+    **12 of 14 completions had a later, better block than the one taken**, and four of
+    those took a bare fragment -- a loop body with no imports and no class -- because an
+    interrupted illustrative snippet happened to come first. Every one of the 14 did
+    contain a complete block. So the rule is:
+
+    1. the LAST fenced block that parses *and* defines :data:`ENTRY_CLASS`;
+    2. failing that, the last that parses at all;
+    3. failing that, the first block -- the historical behaviour, kept so a completion
+       where nothing parses degrades exactly as it always did rather than newly
+       returning something different;
+    4. and with no fence at all, the text from its first Python statement.
 
     A newline is required after the language tag so an *indented* fence (nested under
     prose or a list item) does not have the first code line's indentation eaten while the
@@ -33,9 +55,11 @@ def extract_code_block(text: str) -> str:
         except (SyntaxError, ValueError):
             return False
 
-    match = re.search(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", text, re.DOTALL)
-    if match:
-        return textwrap.dedent(match.group(1)).strip()
+    blocks = [textwrap.dedent(m.group(1)).strip() for m in _FENCE.finditer(text)]
+    if blocks:
+        parseable = [b for b in blocks if _parses(b)]
+        submissions = [b for b in parseable if ENTRY_CLASS in b]
+        return (submissions or parseable or blocks[:1])[-1]
 
     stripped = textwrap.dedent(re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip()))
     if not _parses(stripped):
