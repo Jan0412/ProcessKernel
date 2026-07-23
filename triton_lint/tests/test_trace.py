@@ -1,0 +1,306 @@
+"""The per-token trace: packing, the two-pass seam, and the confidence arithmetic.
+
+Every number here is checked against a hand-computed value, because there is no
+downstream signal that would catch these being wrong. A misaligned seam or an inverted
+confidence measure produces arrays of exactly the right shape full of exactly the wrong
+values, and the first symptom would be a PRM that trains and does not work.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pytest
+
+from kernel_gen.core.trace import (
+    PAD_ID,
+    SEG_CODE,
+    SEG_PLAN,
+    concat_passes,
+    derive_scalars,
+    pack,
+    read_trace,
+    summarize,
+    write_trace,
+)
+
+VOCAB = 151936  # Qwen3's, so the self-certainty scale is the one we will really see
+
+
+def _rows(*distributions: list[float]) -> list[list[tuple[int, float]]]:
+    """Probability rows -> vLLM-shaped ``[(token_id, logprob), ...]``, best first."""
+    return [
+        [(i, math.log(p)) for i, p in enumerate(sorted(probs, reverse=True))]
+        for probs in distributions
+    ]
+
+
+def _peaked(k: int = 20) -> list[float]:
+    rest = (1.0 - 0.999) / (k - 1)
+    return [0.999] + [rest] * (k - 1)
+
+
+def _flat(k: int = 20) -> list[float]:
+    return [1.0 / k] * k
+
+
+# --------------------------------------------------------------------------- packing
+
+
+def test_pack_keeps_the_sampled_token_even_when_it_is_not_the_argmax():
+    # Sampling at temperature 1.0 regularly takes a runner-up; which one it took is the
+    # signal, so surprisal must come from the sampled token and not from the top-1.
+    topk = [[(7, math.log(0.6)), (3, math.log(0.3)), (9, math.log(0.1))]]
+    trace = pack([3], topk, k=3)
+
+    assert trace.token_ids.tolist() == [3]
+    assert trace.topk_ids[0, 0] == 7  # argmax, unchanged
+    assert trace.sampled_lp[0] == pytest.approx(math.log(0.3), abs=1e-6)
+
+
+def test_pack_truncates_to_k_but_reads_the_sampled_logprob_first():
+    # vLLM returns the top-K *plus* the sampled token when it ranked outside; the extra
+    # entry is dropped from the rectangular array, so its logprob must be taken before.
+    topk = [[(1, math.log(0.7)), (2, math.log(0.29)), (99, math.log(0.01))]]
+    trace = pack([99], topk, k=2)
+
+    assert trace.topk_ids.shape == (1, 2)
+    assert 99 not in trace.topk_ids
+    assert trace.sampled_lp[0] == pytest.approx(math.log(0.01), abs=1e-5)
+
+
+def test_pack_pads_short_rows_rather_than_going_ragged():
+    trace = pack([1, 2], [[(5, -0.1)], [(6, -0.2), (7, -3.0)]], k=4)
+
+    assert trace.topk_ids.shape == (2, 4)
+    assert trace.topk_ids[0].tolist() == [5, PAD_ID, PAD_ID, PAD_ID]
+    assert np.isneginf(np.asarray(trace.topk_lp[0, 1:], dtype=np.float64)).all()
+
+
+def test_pack_without_logprobs_still_produces_a_valid_trace():
+    # A backend with no internals to give must not force every caller to branch.
+    trace = pack([1, 2, 3], None, k=20)
+
+    assert len(trace) == 3
+    assert trace.topk_ids.shape == (3, 20)
+    assert (trace.topk_ids == PAD_ID).all()
+
+
+# ------------------------------------------------------------------------ the seam
+
+
+def test_concat_passes_flips_seg_exactly_at_the_plan_code_boundary():
+    plan = pack([1, 2, 3], None, k=4)
+    code = pack([4, 5], None, k=4)
+    trace = concat_passes(plan, code)
+
+    assert len(trace) == 5
+    assert trace.token_ids.tolist() == [1, 2, 3, 4, 5]
+    assert trace.seg.tolist() == [SEG_PLAN] * 3 + [SEG_CODE] * 2
+    assert trace.meta["n_plan_tokens"] == 3
+    assert trace.meta["n_code_tokens"] == 2
+
+
+def test_every_array_stays_the_same_length_after_concat():
+    # The one invariant the whole file format rests on: token position t means the same
+    # thing in all five arrays.
+    trace = concat_passes(pack([1, 2], _rows(_flat(4), _flat(4)), k=4), pack([3], None, k=4))
+
+    n = len(trace)
+    for array in (trace.token_ids, trace.topk_ids, trace.topk_lp, trace.sampled_lp, trace.seg):
+        assert array.shape[0] == n
+
+
+def test_concat_passes_rejects_passes_that_disagree_on_k():
+    with pytest.raises(ValueError, match="disagree on K"):
+        concat_passes(pack([1], None, k=4), pack([2], None, k=8))
+
+
+def test_caller_supplied_meta_survives_and_wins():
+    trace = concat_passes(
+        pack([1], None, k=2, meta={"pass": "plan"}),
+        pack([2], None, k=2),
+        meta={"plan_char_end": 42},
+    )
+    assert trace.meta["plan_char_end"] == 42
+    assert trace.meta["pass"] == "plan"
+
+
+# ------------------------------------------------------------------- the arithmetic
+
+
+def test_entropy_of_a_uniform_top_k_is_log_k():
+    scalars = derive_scalars(pack([0], _rows(_flat(8)), k=8).topk_lp)
+    assert scalars["entropy"][0] == pytest.approx(math.log(8), abs=1e-3)
+
+
+def test_entropy_of_a_one_hot_distribution_is_zero():
+    row = [[(0, 0.0)] + [(i, -30.0) for i in range(1, 8)]]
+    scalars = derive_scalars(pack([0], row, k=8).topk_lp)
+    assert scalars["entropy"][0] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_deepconf_scores_a_peaked_distribution_higher_than_a_flat_one():
+    # THE sign test. DeepConf's C is a *mean negative logprob over the top-K*, so it
+    # rises when the runners-up collapse -- the opposite direction from entropy. An
+    # inverted deepconf_c would flip every downstream conclusion while looking fine.
+    peaked = derive_scalars(pack([0], _rows(_peaked()), k=20).topk_lp)["deepconf_c"][0]
+    flat = derive_scalars(pack([0], _rows(_flat()), k=20).topk_lp)["deepconf_c"][0]
+
+    assert peaked > flat
+    assert flat == pytest.approx(math.log(20), abs=1e-2)  # -(1/K) sum log(1/K) = log K
+
+
+def test_deepconf_alone_cannot_tell_confident_from_diffuse():
+    # The trap, pinned so nobody "simplifies" the scalar set down to deepconf_c. A
+    # distribution smeared over the WHOLE vocabulary has top-K logprobs near log(1/V),
+    # so its deepconf_c (11.9) beats a flat top-K's (3.0) despite being maximally
+    # uncertain. tail_mass and self_cert are what disambiguate, so all three are stored.
+    diffuse = _rows([1.0 / VOCAB] * 20)
+    flat = _rows(_flat())
+    d = derive_scalars(pack([0], diffuse, k=20).topk_lp, vocab_size=VOCAB)
+    f = derive_scalars(pack([0], flat, k=20).topk_lp, vocab_size=VOCAB)
+
+    assert d["deepconf_c"][0] > f["deepconf_c"][0]  # misleading on its own ...
+    assert d["tail_mass"][0] > 0.99 and f["tail_mass"][0] < 0.01  # ... caught here ...
+    assert d["self_cert"][0] < f["self_cert"][0]  # ... and ranked correctly here
+
+
+def test_self_certainty_is_monotone_across_the_whole_confidence_range():
+    # The one measure of the set that orders every case correctly, which is why it is
+    # worth the vocab_size argument the others do not need.
+    ladder = [
+        [1.0 - 1e-9] + [1e-9 / 19] * 19,
+        [0.99] + [0.01 / 19] * 19,
+        [0.5, 0.2, 0.1, 0.05] + [0.15 / 16] * 16,
+        _flat(),
+        [1.0 / VOCAB] * 20,
+    ]
+    values = [
+        derive_scalars(pack([0], _rows(p), k=20).topk_lp, vocab_size=VOCAB)["self_cert"][0]
+        for p in ladder
+    ]
+    assert values == sorted(values, reverse=True)
+
+
+def test_deepconf_averages_over_present_entries_not_over_k():
+    # A row padded to K must not be dragged toward zero by entries it never had.
+    short = derive_scalars(pack([0], [[(0, -2.0), (1, -4.0)]], k=20).topk_lp)
+    assert short["deepconf_c"][0] == pytest.approx(3.0, abs=1e-3)
+
+
+def test_tail_mass_measures_what_the_top_k_did_not_see():
+    row = [[(0, math.log(0.5)), (1, math.log(0.2))]]  # 0.3 unaccounted for
+    scalars = derive_scalars(pack([0], row, k=2).topk_lp)
+    assert scalars["tail_mass"][0] == pytest.approx(0.3, abs=1e-3)
+
+
+def test_entropy_renormalizes_so_truncation_does_not_read_as_confidence():
+    # Two tokens at 0.5/0.2 have the same *shape* over the top-2 as 0.5/0.2 renormalized
+    # to 0.714/0.286; entropy reports the latter, which is why tail_mass is stored too.
+    scalars = derive_scalars(pack([0], [[(0, math.log(0.5)), (1, math.log(0.2))]], k=2).topk_lp)
+    q = 0.5 / 0.7
+    expected = -(q * math.log(q) + (1 - q) * math.log(1 - q))
+    assert scalars["entropy"][0] == pytest.approx(expected, abs=1e-3)
+
+
+def test_margin_is_p1_minus_p2():
+    scalars = derive_scalars(pack([0], [[(0, math.log(0.6)), (1, math.log(0.25))]], k=2).topk_lp)
+    assert scalars["margin"][0] == pytest.approx(0.35, abs=1e-3)
+
+
+def test_surprisal_follows_the_sampled_token_not_the_argmax():
+    topk = [[(7, math.log(0.9)), (3, math.log(0.1))]]
+    trace = pack([3], topk, k=2)
+    scalars = derive_scalars(trace.topk_lp, trace.sampled_lp)
+
+    assert scalars["surprisal"][0] == pytest.approx(-math.log(0.1), abs=1e-3)
+    assert scalars["top1_lp"][0] == pytest.approx(math.log(0.9), abs=1e-3)
+
+
+def test_self_certainty_is_zero_for_a_uniform_full_vocabulary():
+    # KL(P || U) = 0 when P *is* U. The tail is charged at maximum entropy, which for a
+    # genuinely uniform distribution is exactly right -- so this case is tight, not a bound.
+    k = 20
+    row = [[(i, -math.log(VOCAB)) for i in range(k)]]
+    scalars = derive_scalars(pack([0], row, k=k).topk_lp, vocab_size=VOCAB)
+    assert scalars["self_cert"][0] == pytest.approx(0.0, abs=1e-2)
+
+
+def test_self_certainty_is_near_log_vocab_for_a_one_hot_distribution():
+    row = [[(0, 0.0)] + [(i, -40.0) for i in range(1, 20)]]
+    scalars = derive_scalars(pack([0], row, k=20).topk_lp, vocab_size=VOCAB)
+    assert scalars["self_cert"][0] == pytest.approx(math.log(VOCAB), abs=1e-2)
+
+
+def test_self_certainty_is_omitted_rather_than_guessed_without_a_vocab_size():
+    assert "self_cert" not in derive_scalars(pack([0], _rows(_flat()), k=20).topk_lp)
+
+
+def test_scalars_are_finite_even_for_a_trace_with_no_logprobs_at_all():
+    # An untraced backend must yield zeros, never NaNs that poison every later mean.
+    trace = pack([1, 2, 3], None, k=20)
+    scalars = derive_scalars(trace.topk_lp, trace.sampled_lp, vocab_size=VOCAB)
+
+    for name, values in scalars.items():
+        assert np.isfinite(values).all() or name == "top1_lp", name
+
+
+def test_every_scalar_has_one_value_per_token():
+    trace = pack([1, 2, 3], _rows(_flat(), _peaked(), _flat()), k=20)
+    scalars = derive_scalars(trace.topk_lp, trace.sampled_lp, vocab_size=VOCAB)
+
+    assert {v.shape for v in scalars.values()} == {(3,)}
+
+
+def test_derive_scalars_rejects_a_one_dimensional_array():
+    with pytest.raises(ValueError, match=r"2-D"):
+        derive_scalars(np.array([-1.0, -2.0]))
+
+
+# ---------------------------------------------------------------------- summarizing
+
+
+def test_c_least_finds_the_worst_window_not_the_worst_token():
+    # DeepConf's claim is that a trace fails on a confidently-wrong *stretch*; a single
+    # low token inside an otherwise sure span must not dominate the trace's score.
+    conf = np.array([10.0] * 20 + [1.0] * 4 + [10.0] * 20, dtype=np.float32)
+    stats = summarize({"deepconf_c": conf}, window=4)
+
+    assert stats["c_least"] == pytest.approx(1.0)
+    assert stats["mean_deepconf_c"] == pytest.approx(float(conf.mean()), abs=1e-4)
+    assert stats["n_tokens"] == 44
+
+
+def test_summarize_handles_a_trace_shorter_than_the_window():
+    stats = summarize({"deepconf_c": np.array([2.0, 4.0], dtype=np.float32)}, window=512)
+    assert stats["c_least"] == pytest.approx(3.0)  # one window over the whole trace
+
+
+def test_summarize_of_an_empty_trace_is_empty_not_an_exception():
+    assert summarize({"deepconf_c": np.array([], dtype=np.float32)}) == {}
+
+
+# ------------------------------------------------------------------------ round trip
+
+
+def test_trace_round_trips_through_disk_without_allow_pickle(tmp_path):
+    # np.load defaults to allow_pickle=False; these files outlive the code that wrote
+    # them, so reading one must never be a trust decision.
+    original = concat_passes(
+        pack([1, 2], _rows(_peaked(), _flat()), k=20, meta={"model": "qwen"}),
+        pack([3], _rows(_peaked()), k=20),
+        meta={"plan_char_end": 17},
+    )
+    path = str(tmp_path / "trace.npz")
+    write_trace(path, original)
+    restored = read_trace(path)
+
+    assert restored.token_ids.tolist() == original.token_ids.tolist()
+    assert restored.seg.tolist() == original.seg.tolist()
+    assert restored.meta == original.meta
+    np.testing.assert_allclose(
+        np.asarray(restored.topk_lp, dtype=np.float32),
+        np.asarray(original.topk_lp, dtype=np.float32),
+    )
