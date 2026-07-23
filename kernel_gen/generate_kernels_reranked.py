@@ -112,9 +112,16 @@ def load_model(model_id: str, load_in_4bit: bool):
     num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
     kwargs = dict(
         dtype="auto",
-        max_model_len=16384,
+        # See generate_kernels_samples.load_model: the longest one-shot prompt plus a
+        # full generation needs ~33k tokens; 40960 leaves headroom. KV cache is
+        # allocated on demand, so the raised cap does not inflate memory.
+        max_model_len=40960,
         gpu_memory_utilization=0.80,
         tensor_parallel_size=num_gpus,
+        # We only ever send text prompts. On a VL checkpoint (e.g. Qwen3.6) startup
+        # otherwise profiles the vision tower and dies at cublasCreate; zeroing every
+        # modality limit skips that. No-op on text-only models.
+        language_model_only=True,
     )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"

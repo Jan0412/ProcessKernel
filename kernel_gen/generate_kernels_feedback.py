@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     # The round-2 prompt carries the seed kernel and (for A4) the config table on top of the
     # round-1 prompt, so it needs materially more context than round 1's 16k default.
-    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--max-model-len", type=int, default=40960)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")

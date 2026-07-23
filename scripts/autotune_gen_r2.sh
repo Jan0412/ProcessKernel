@@ -71,7 +71,7 @@ uv run --no-sync python kernel_gen/generate_kernels_feedback.py \
     --temperature 0.3 \
     --think-temperature 1.0 \
     --max-new-tokens 16384 \
-    --max-model-len 32768 \
+    --max-model-len 40960 \
     --skip-existing \
     "${FAIRNESS[@]}"
 

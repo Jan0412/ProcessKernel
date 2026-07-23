@@ -84,8 +84,9 @@ def main():
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=16384,
-        help="vLLM max sequence length (default: 16384).",
+        default=40960,
+        help="vLLM max sequence length. Must fit the longest one-shot prompt (~16.4k "
+             "tokens) plus a full generation, or output is truncated (default: 40960).",
     )
     parser.add_argument(
         "--max-num-seqs",

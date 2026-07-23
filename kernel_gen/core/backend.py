@@ -46,7 +46,10 @@ class VLLMBackend(Backend):
         model_id: str,
         load_in_4bit: bool = False,
         gpu_memory_utilization: float = 0.92,
-        max_model_len: int = 16384,
+        # A one-shot prompt can reach ~16.4k tokens; 16384 left no room for output. 40960
+        # fits the longest prompt plus a full 16384-token generation. KV cache is on
+        # demand, so this does not inflate memory. See core/cli.py --max-model-len.
+        max_model_len: int = 40960,
         trust_remote_code: bool = False,
         max_num_seqs: int = 32,
     ):
@@ -100,17 +103,14 @@ class VLLMBackend(Backend):
             # nvcc since 23fa6e6 and its result is cached after the first run. Falls
             # back to triton on non-Hopper. Ignored by models with no GDN layers.
             gdn_prefill_backend="flashinfer",
-            # vLLM 0.24's cudagraph startup is broken for hybrid GDN models: the
-            # "Profiling CUDA graph memory" phase runs dummy decode batches against a
-            # minimal 64-block KV cache before the real one exists, and on Qwen3.6 a
-            # kernel reads past that minimal cache and kills the CUDA context --
-            # 'unspecified launch failure' one second into the phase, every run, with
-            # both GDN prefill backends. Pure-attention models (Qwen3-Coder) are
-            # unaffected. Same bug family as vllm-project/vllm#35743, where the conv
-            # state cache asserts num_cache_lines >= batch in that phase. NONE skips
-            # graph capture and with it the profiling phase; torch.compile stays on.
-            # Costs some decode speed; retire on a vLLM upgrade.
-            compilation_config={"cudagraph_mode": "NONE"},
+            # CUDA-graph capture is left at vLLM's default (FULL_AND_PIECEWISE). We used
+            # to force cudagraph_mode=NONE here to dodge a vLLM 0.24 startup crash: the
+            # "Profiling CUDA graph memory" phase ran dummy decode batches against a
+            # minimal 64-block KV cache and a Qwen3.6 GDN kernel read past it, killing
+            # the CUDA context ('unspecified launch failure', vllm-project/vllm#35743).
+            # That is fixed as of 0.25.1 -- graph capture now completes cleanly for
+            # Qwen3.6 -- so we take the decode speedup back. If a future vLLM regresses
+            # the profiling phase for hybrid GDN models, restore cudagraph_mode=NONE.
         )
         if load_in_4bit:
             kwargs["quantization"] = "bitsandbytes"

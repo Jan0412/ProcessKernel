@@ -62,10 +62,11 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=32768,
+        default=40960,
         help="vLLM context length. A repair prompt carries the base prompt AND the "
              "previous kernel AND the findings, so it needs materially more than a "
-             "round-0 prompt (default: 32768).",
+             "round-0 prompt; 40960 fits the longest one-shot prompt (~16.4k tokens) "
+             "plus a full generation (default: 40960).",
     )
     parser.add_argument(
         "--max-num-seqs",

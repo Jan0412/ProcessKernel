@@ -96,7 +96,13 @@ def load_model(
     model_id: str,
     load_in_4bit: bool,
     gpu_memory_utilization: float = 0.92,
-    max_model_len: int = 16384,
+    # A few KernelBench one-shot prompts (example kernel + reference arch) reach ~16.4k
+    # tokens, which left no room for output under a 16384 cap and aborted the level-2
+    # Qwen3.6 run at "prompt contains at least 16385 input tokens". 40960 fits the
+    # longest prompt plus a full 16384-token generation; every model we use has a
+    # >=40960 native context, and KV cache is allocated on demand so this does not
+    # inflate memory.
+    max_model_len: int = 40960,
     trust_remote_code: bool = False,
     max_num_seqs: int = 32,
 ):
