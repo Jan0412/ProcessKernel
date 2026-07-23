@@ -284,13 +284,20 @@ def _sliding_mean(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def write_trace(path: str, trace: TokenTrace) -> None:
-    """One compressed ``.npz`` per completion.
+    """One ``.npz`` per completion, uncompressed on purpose.
+
+    Measured on a realistic trace (5,300 tokens, K=20): ``savez_compressed`` produces
+    506 KiB in 161 ms, ``savez`` 680 KiB in 6.2 ms. Over the 330,000 attempts a full
+    KernelBook run implies that is 171 GB at 14.7 CPU-hours against 230 GB at 0.6 --
+    and the writing happens in the between-rounds checkpoint, with the GPU idle. Saving
+    59 GB out of 332 TB free is not worth 14 CPU-hours of a job the GPU is waiting on.
+    The bulk is ``topk_ids``, which is near-random and barely compresses anyway.
 
     ``meta`` goes in as a JSON string rather than as object-dtype arrays, so the file
     loads without ``allow_pickle`` -- these files outlive the code that wrote them and
     a pickle in the load path would make reading them a trust decision.
     """
-    np.savez_compressed(
+    np.savez(
         path,
         token_ids=trace.token_ids,
         topk_ids=trace.topk_ids,

@@ -19,6 +19,14 @@ and it resolves the level as ``pseudo_level or level``, *pseudo_level winning*. 
 that wrote both keys would report level 5 on a KernelBench run at level 1, and every
 downstream filename lookup would be built against files that do not exist. Hence
 :func:`write_config` emits exactly one of the two.
+
+**Traces obey contract 1 by living outside its reach.** Everything the trace writer
+produces goes under ``traces/``, never flat and never in ``rounds/``. That is not
+tidiness: ``scan.py``'s docstring records that a run folder already holds 140k-175k
+files and that its single non-recursive ``scandir`` pass is load-bearing, and this run
+is heading for four times that. A ``.npz`` sitting flat would be invisible to the
+globs (they are anchored on ``_kernel.py``) and would still be walked by every one of
+them.
 """
 
 from __future__ import annotations
@@ -34,6 +42,10 @@ from .model import Trajectory
 
 def round_dir(out_dir: str, round_index: int) -> str:
     return os.path.join(out_dir, "rounds", f"round_{round_index}")
+
+
+def trace_dir(out_dir: str, round_index: int) -> str:
+    return os.path.join(out_dir, "traces", f"round_{round_index}")
 
 
 def write_config(out_dir: str, config: dict, dataset: str) -> str:
@@ -102,6 +114,92 @@ def write_kernels(out_dir: str, trajectories: list[Trajectory]) -> int:
         with open(os.path.join(out_dir, name), "w") as fh:
             fh.write(final.code)
         written += 1
+    return written
+
+
+def write_trace_config(out_dir: str, config: dict) -> str:
+    """Run-level facts about the capture, written once to ``traces/trace_config.json``.
+
+    Model id, ``logprobs_mode``, top-K and vocabulary size are constant for a run, so
+    they live here rather than on every one of ~330,000 attempt records. ``vocab_size``
+    in particular is not decoration: self-certainty is a KL against the uniform
+    distribution over the vocabulary, so a reader that guesses it wrong gets a plausible
+    number that is off by a constant nobody can recover later.
+    """
+    target = os.path.join(out_dir, "traces")
+    os.makedirs(target, exist_ok=True)
+    path = os.path.join(target, "trace_config.json")
+    with open(path, "w") as fh:
+        json.dump(config, fh, indent=2)
+    return path
+
+
+def write_traces(
+    out_dir: str,
+    trajectories: list[Trajectory],
+    round_index: int,
+    *,
+    window: int = 512,
+    vocab_size: int | None = None,
+) -> int:
+    """One round's traces: a ``.npz`` of arrays plus a line of context per attempt.
+
+    The two halves answer different questions and are stored apart on purpose. The
+    ``.npz`` is bulk numeric data nobody reads without a reason; ``attempts.jsonl`` is
+    the index over it, small enough to load whole and rich enough to decide *which*
+    traces are worth opening -- which is the entire point of the DeepConf summary
+    statistics on each record.
+
+    The jsonl also carries the two things this pipeline has been discarding since it was
+    written: the **full raw completion**, including the ``## Plan`` prose that
+    ``write_attempts`` drops in favour of the extracted code, and the **full findings**
+    with their line numbers.
+
+    An attempt whose trace failed to assemble still gets a record, with ``trace: null``.
+    Its prose and findings are worth keeping regardless, and a silently missing line
+    would make the journal disagree with the kernels on disk.
+    """
+    from .trace import derive_scalars, summarize, write_trace
+
+    target = trace_dir(out_dir, round_index)
+    os.makedirs(target, exist_ok=True)
+
+    records, written = [], 0
+    for traj in trajectories:
+        attempt = next((a for a in traj.attempts if a.round == round_index), None)
+        if attempt is None:
+            continue
+        stem = staged_kernel_filename(
+            traj.problem.level, traj.problem.problem_id, traj.sample_id
+        )[: -len(".py")]
+
+        record = {
+            "stem": stem,
+            "level": traj.problem.level,
+            "problem_id": traj.problem.problem_id,
+            "sample_id": traj.sample_id,
+            "problem_name": traj.problem.name,
+            "round": round_index,
+            "raw": attempt.raw,
+            "n_chars_code": len(attempt.code),
+            "clean": bool(attempt.review and attempt.review.clean),
+            "findings": attempt.review.findings if attempt.review else [],
+            "trace": None,
+            "confidence": {},
+        }
+
+        if attempt.trace is not None:
+            scalars = derive_scalars(
+                attempt.trace.topk_lp, attempt.trace.sampled_lp, vocab_size=vocab_size
+            )
+            record["trace"] = {"file": f"{stem}.npz", **attempt.trace.meta}
+            record["confidence"] = summarize(scalars, window=window)
+            write_trace(os.path.join(target, f"{stem}.npz"), attempt.trace)
+            written += 1
+
+        records.append(record)
+
+    append_jsonl(os.path.join(target, "attempts.jsonl"), records)
     return written
 
 
