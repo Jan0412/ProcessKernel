@@ -254,40 +254,58 @@ class VLLMBackend(Backend):
             stop=stop,
             include_stop_str_in_output=False,
             logprobs=logprobs,
+            # Primitive parallel lists instead of one dict of Logprob dataclasses per
+            # position. A round-0 batch here is ~1000 prompts of ~4000 tokens, so at
+            # K=20 the default shape would allocate ~4M dicts and ~84M dataclasses and
+            # hold them all until generate() returns -- vLLM's own docstring calls out
+            # the GC cost, and this is the scale where it stops being theoretical.
+            # No-op when logprobs is None.
+            flat_logprobs=logprobs is not None,
         )
         outputs = self.llm.generate(prompts, params)
         return [_completion(out.outputs[0]) for out in outputs]
 
 
 def _completion(output) -> Completion:
-    """vLLM's ``CompletionOutput`` -> :class:`Completion`, flattening the logprob dicts.
+    """vLLM's ``CompletionOutput`` -> :class:`Completion`, flattening the logprobs.
 
-    Each position arrives as ``{token_id: Logprob(logprob, rank, decoded_token)}``. Only
-    the id and the logprob are carried across: ``rank`` is recoverable by sorting, and
-    ``decoded_token`` is a string per token per position -- at 20 alternatives over
-    thousands of tokens it is the largest thing in the object and the tokenizer can
-    reproduce all of it from the ids on demand.
+    Only the token id and the logprob are carried across. ``rank`` is recoverable by
+    sorting, and ``decoded_token`` is a string per alternative per position -- at 20
+    alternatives over thousands of tokens it is the largest thing in the object, and the
+    tokenizer reproduces all of it from the ids on demand.
 
-    A position is typed ``LogprobsOnePosition | None`` and becomes an empty row rather
-    than a crash: this runs once per completion inside a job holding hours of GPU time,
-    and losing one token's alternatives is not worth losing the run over.
+    Two container shapes, because vLLM has two. ``FlatLogprobs`` (what we ask for) keeps
+    parallel primitive lists and is read by slicing them; the legacy shape is one
+    ``{token_id: Logprob}`` dict per position. Iterating a ``FlatLogprobs`` would
+    materialize exactly the dicts asking for it was meant to avoid, so the flat path
+    indexes the lists directly and is duck-typed rather than isinstance-checked -- this
+    module keeps its vLLM import inside the functions that need a GPU.
     """
     return Completion(
         text=output.text,
         token_ids=list(output.token_ids),
-        topk=(
-            [
-                [(token_id, lp.logprob) for token_id, lp in position.items()]
-                if position
-                else []
-                for position in output.logprobs
-            ]
-            if output.logprobs is not None
-            else None
-        ),
+        topk=_topk(output.logprobs),
         finish_reason=output.finish_reason,
         stop_reason=output.stop_reason,
     )
+
+
+def _topk(logprobs) -> list[list[tuple[int, float]]] | None:
+    if logprobs is None:
+        return None
+    if (starts := getattr(logprobs, "start_indices", None)) is not None:
+        token_ids, values = logprobs.token_ids, logprobs.logprobs
+        return [
+            list(zip(token_ids[start:end], values[start:end]))
+            for start, end in zip(starts, logprobs.end_indices)
+        ]
+    # A position is typed ``LogprobsOnePosition | None``; an empty row rather than a
+    # crash, because this runs inside a job holding hours of GPU time and one token's
+    # missing alternatives are not worth losing it over.
+    return [
+        [(token_id, lp.logprob) for token_id, lp in position.items()] if position else []
+        for position in logprobs
+    ]
 
 
 #: The fake's stand-in tokenizer: a fixed number of characters per "token". Nothing

@@ -8,6 +8,8 @@ sorted -- because a fake that quietly gets either one right would hide a real bu
 
 from __future__ import annotations
 
+import pytest
+
 from kernel_gen.core.backend import Backend, Completion, FakeBackend
 from kernel_gen.core.trace import pack
 
@@ -121,3 +123,86 @@ def test_completion_defaults_leave_every_internal_absent():
         None,
         None,
     )
+
+
+# -- vLLM's two logprob container shapes -----------------------------------
+#
+# These use vLLM's real classes rather than stand-ins. They are the only tests in the
+# suite that import vllm, and they import it lazily and skip when it is absent, because
+# _topk's whole job is to read a data structure this repo does not own.
+
+
+def _vllm_logprobs(flat: bool):
+    """Build a real vLLM logprob container the way its engine does."""
+    logprobs = pytest.importorskip("vllm.logprobs")
+    container = logprobs.create_sample_logprobs(flat)
+    # Two positions. vLLM inserts the SAMPLED token first, then the top-K in rank order,
+    # so position 0's sampled token (id 3) ranked 2nd and position 1's (id 99) ranked
+    # outside the top-2 entirely -- the ragged case.
+    logprobs.append_logprobs_for_next_position(
+        container, [3, 7, 3], [-1.2, -0.2, -1.2], [None] * 3, 2, 2
+    )
+    logprobs.append_logprobs_for_next_position(
+        container, [99, 1, 2], [-9.0, -0.1, -2.0], [None] * 3, 5, 2
+    )
+    return container
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_both_vllm_logprob_containers_read_the_same(flat):
+    from kernel_gen.core.backend import _topk
+
+    rows = _topk(_vllm_logprobs(flat))
+
+    assert len(rows) == 2
+    # Position 0: the dict shape dedupes the repeated sampled token, so it is 2 wide.
+    assert dict(rows[0]) == {3: pytest.approx(-1.2), 7: pytest.approx(-0.2)}
+    # Position 1: the sampled token ranked outside the top-2, so the row is 3 wide.
+    assert dict(rows[1]) == {
+        99: pytest.approx(-9.0),
+        1: pytest.approx(-0.1),
+        2: pytest.approx(-2.0),
+    }
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_packing_a_real_vllm_container_recovers_the_sampled_logprobs(flat):
+    from kernel_gen.core.backend import _topk
+
+    trace = pack([3, 99], _topk(_vllm_logprobs(flat)), k=2)
+
+    assert trace.topk_ids[0].tolist() == [7, 3]  # sorted best-first, not as returned
+    assert trace.sampled_lp.tolist() == [pytest.approx(-1.2), pytest.approx(-9.0)]
+    assert trace.sampled_rank.tolist() == [2, 3]
+    assert 99 not in trace.topk_ids  # truncated away, its logprob kept
+
+
+def test_the_flat_container_is_not_iterated_into_dicts():
+    # Iterating a FlatLogprobs materializes exactly the per-position dicts that asking
+    # for it was meant to avoid. _topk must slice the parallel lists instead.
+    container = _vllm_logprobs(flat=True)
+
+    class Tripwire(type(container)):
+        def __iter__(self):
+            raise AssertionError("_topk iterated the flat container")
+
+        def __getitem__(self, index):
+            raise AssertionError("_topk indexed the flat container")
+
+    from kernel_gen.core.backend import _topk
+
+    tripwire = Tripwire(
+        start_indices=container.start_indices,
+        end_indices=container.end_indices,
+        token_ids=container.token_ids,
+        logprobs=container.logprobs,
+        ranks=container.ranks,
+        decoded_tokens=container.decoded_tokens,
+    )
+    assert len(_topk(tripwire)) == 2
+
+
+def test_no_logprobs_container_is_none_not_an_empty_list():
+    from kernel_gen.core.backend import _topk
+
+    assert _topk(None) is None
