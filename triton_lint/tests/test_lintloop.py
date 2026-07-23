@@ -201,12 +201,17 @@ CRASH_RULES = [("variant: ALPHA", HONEST), ("variant: BETA", CHEATING)]
 
 
 class CrashingBackend(FakeBackend):
-    """Dies the way EngineCore did in job 2339985: mid-generate, on round 1's batch."""
+    """Dies the way EngineCore did in job 2339985: mid-generate, on round 1's batch.
 
-    def complete(self, prompts, **kwargs):
+    Overrides ``complete_traced``, not ``complete``: that is the method the sampler
+    actually calls, and ``complete`` is now a wrapper over it. Hooking the wrapper would
+    make this fixture a no-op and quietly retire the two crash-survival tests below.
+    """
+
+    def complete_traced(self, prompts, **kwargs):
         if self.batches:
             raise RuntimeError("CUDA error: unspecified launch failure (simulated)")
-        return super().complete(prompts, **kwargs)
+        return super().complete_traced(prompts, **kwargs)
 
 
 def drive_main(monkeypatch, out_dir, backend, *, skip_existing):
