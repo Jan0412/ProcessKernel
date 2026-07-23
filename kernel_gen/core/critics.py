@@ -62,6 +62,13 @@ def lint_critic(
                 "n_warn": summary.get("n_warn", 0),
                 "check_ids": summary.get("check_ids", []),
             },
+            # The full findings, carried past the summary that used to be all the loop
+            # kept. Each one holds a `lineno` in its data, which is a verifier pointing
+            # at the exact line it objects to -- free, exact error localization that
+            # every later credit-assignment method would otherwise have to estimate.
+            # It goes on `findings`, not into `data`, so `lint_loop.jsonl` stays the
+            # size it was; see Review.to_dict.
+            findings=[f.to_dict() for f in report.findings],
         )
 
     return critic

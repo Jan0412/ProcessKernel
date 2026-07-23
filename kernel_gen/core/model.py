@@ -10,6 +10,10 @@ the file stem.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # numpy is not needed to define a Problem or run a dry run
+    from .trace import TokenTrace
 
 
 @dataclass(frozen=True)
@@ -36,11 +40,19 @@ class Review:
 
     ``text`` is prompt-ready feedback. ``clean`` is the early-stop signal: nothing
     actionable was found, so this slot is done and costs nothing further.
+
+    ``findings`` is the critic's full output -- every finding's check id, severity,
+    message and line number. It is separate from ``data`` and deliberately absent
+    from :meth:`to_dict`, because ``data`` is what lands in ``lint_loop.jsonl`` and that
+    file is read start-to-finish by ``--skip-existing`` before every resumed run. The
+    line numbers matter enormously later (they are free, verifier-supplied error
+    localization) and not at all to the loop, so they go to the trace sidecar instead.
     """
 
     text: str
     clean: bool
     data: dict = field(default_factory=dict)
+    findings: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"clean": self.clean, **self.data}
@@ -48,12 +60,18 @@ class Review:
 
 @dataclass
 class Attempt:
-    """One generation for one slot in one round."""
+    """One generation for one slot in one round.
+
+    ``trace`` is the token-level record when the run was started with ``--trace``, and
+    ``None`` otherwise. It is never journaled -- it is arrays, and it goes to its own
+    ``.npz``; see :meth:`to_dict`, which is unchanged by its presence.
+    """
 
     round: int
     raw: str
     code: str
     review: Review | None = None
+    trace: TokenTrace | None = None
 
     def to_dict(self) -> dict:
         out: dict = {"round": self.round, "n_chars": len(self.code)}
