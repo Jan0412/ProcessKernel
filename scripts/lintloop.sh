@@ -22,8 +22,14 @@
 # separate baseline; an independently-drawn one would confound "the feedback helped"
 # with "the sampler changed".
 #
+# TRACE=1 additionally records per-token model internals to $OUTPUT_DIR/traces/ -- token
+# ids, the top-20 alternatives at every step, the plan prose and the linter's line
+# numbers. That is PRM training data; it changes nothing about what is generated, and it
+# writes to its own output dir so a traced run is never confused with an untraced one.
+#
 # Usage:  sbatch scripts/lintloop.sh <level>                    # KernelBench, 3 rounds x 10 samples
 #         SMOKE=1 sbatch scripts/lintloop.sh 1                  # 5 problems x 2 samples x 2 rounds
+#         TRACE=1 sbatch scripts/lintloop.sh 1                  # the same, capturing traces
 #         DATASET=kernelbook sbatch scripts/lintloop.sh 5       # KernelBook at pseudo-level 5
 #
 # Then, and this is where the result actually lives:
@@ -42,11 +48,20 @@ DATASET="${DATASET:-kernelbench}"
 ROUNDS="${ROUNDS:-3}"
 POLICY="${POLICY:-severity}"
 SMOKE="${SMOKE:-0}"
+TRACE="${TRACE:-0}"
 
 MODEL_SLUG=$(basename "$MODEL")
 TAG=$([ "$DATASET" = "kernelbook" ] && echo "kb" || echo "level")
 # OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
 OUTPUT_DIR="/path/to/workdir/KernelBench/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
+
+TRACE_ARGS=()
+if [ "$TRACE" = "1" ]; then
+    # Its own dir: --skip-existing keys on lint_loop.jsonl, so pointing a traced run at
+    # an untraced run's dir would skip every slot already done and capture nothing.
+    OUTPUT_DIR="${OUTPUT_DIR}_traced"
+    TRACE_ARGS=(--trace --trace-topk "${TRACE_TOPK:-20}" --trace-window "${TRACE_WINDOW:-512}")
+fi
 
 if [ "$SMOKE" = "1" ]; then
     SCOPE=(--problems 0-4 --num-samples 2)
@@ -57,7 +72,7 @@ else
 fi
 
 echo "============================================================"
-echo "  lint-feedback loop (A5) | $DATASET level $LEVEL | smoke=$SMOKE"
+echo "  lint-feedback loop (A5) | $DATASET level $LEVEL | smoke=$SMOKE trace=$TRACE"
 echo "  model  : $MODEL"
 echo "  rounds : $ROUNDS (policy=$POLICY)"
 echo "  out    : $OUTPUT_DIR"
@@ -93,6 +108,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
         --max-new-tokens 16384 \
         --max-model-len 40960 \
         --output-dir "$OUTPUT_DIR" \
+        "${TRACE_ARGS[@]}" \
         --skip-existing; then
         echo "--- generation finished on attempt $attempt"
         break
@@ -108,6 +124,11 @@ done
 echo
 echo "Refined kernels : $(find "$OUTPUT_DIR" -maxdepth 1 -name '*_kernel.py' | wc -l)"
 echo "Baseline (r0)   : $(find "$OUTPUT_DIR/rounds/round_0" -maxdepth 1 -name '*_kernel.py' | wc -l)"
+if [ "$TRACE" = "1" ]; then
+    echo "Traces          : $(find "$OUTPUT_DIR/traces" -name '*.npz' | wc -l) npz, \
+$(du -sh "$OUTPUT_DIR/traces" 2>/dev/null | cut -f1)"
+    echo "  uv run python -m kernel_gen.inspect_trace --run-dir $OUTPUT_DIR"
+fi
 echo
 echo "Next -- eval BOTH, and compare those, not the linter's own numbers:"
 echo "  sbatch scripts/autotune_eval.sh $OUTPUT_DIR $LEVEL"
