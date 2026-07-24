@@ -34,6 +34,7 @@
 # Usage:  sbatch scripts/lintloop.sh <level>                    # KernelBench, 3 rounds x 10 samples
 #         SMOKE=1 sbatch scripts/lintloop.sh 1                  # 5 problems x 2 samples x 2 rounds
 #         TRACE=1 sbatch scripts/lintloop.sh 1                  # the same, capturing traces
+#         THINK_TEMP=0 sbatch scripts/lintloop.sh 1             # single-pass, no plan (own _nothink dir)
 #         DATASET=kernelbook sbatch scripts/lintloop.sh 5       # KernelBook at pseudo-level 5
 #
 # Then, and this is where the result actually lives:
@@ -53,16 +54,24 @@ ROUNDS="${ROUNDS:-3}"
 POLICY="${POLICY:-severity}"
 SMOKE="${SMOKE:-0}"
 TRACE="${TRACE:-0}"
+# The plan/code split's temperature. >0 enables the two-pass "think" path (plan at this
+# temperature, code at --temperature); THINK_TEMP=0 turns it off entirely -- single-pass
+# generation, no plan prose. The two are different experiments, so they get different
+# output dirs below (--skip-existing keys on lint_loop.jsonl, and pointing one at the
+# other's dir would skip every done slot and capture nothing).
+THINK_TEMP="${THINK_TEMP:-1.0}"
 
 MODEL_SLUG=$(basename "$MODEL")
 TAG=$([ "$DATASET" = "kernelbook" ] && echo "kb" || echo "level")
 # OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
 OUTPUT_DIR="/path/to/workdir/KernelBench/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
 
+if [ "$THINK_TEMP" = "0" ]; then
+    OUTPUT_DIR="${OUTPUT_DIR}_nothink"
+fi
+
 TRACE_ARGS=()
 if [ "$TRACE" = "1" ]; then
-    # Its own dir: --skip-existing keys on lint_loop.jsonl, so pointing a traced run at
-    # an untraced run's dir would skip every slot already done and capture nothing.
     OUTPUT_DIR="${OUTPUT_DIR}_traced"
     TRACE_ARGS=(--trace --trace-topk "${TRACE_TOPK:-20}" --trace-window "${TRACE_WINDOW:-512}")
 fi
@@ -76,7 +85,7 @@ else
 fi
 
 echo "============================================================"
-echo "  lint-feedback loop (A5) | $DATASET level $LEVEL | smoke=$SMOKE trace=$TRACE"
+echo "  lint-feedback loop (A5) | $DATASET level $LEVEL | smoke=$SMOKE trace=$TRACE think=$THINK_TEMP"
 echo "  model  : $MODEL"
 echo "  rounds : $ROUNDS (policy=$POLICY)"
 echo "  out    : $OUTPUT_DIR"
@@ -107,7 +116,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
         --backend triton \
         --option one_shot \
         --temperature 0.6 \
-        --think-temperature 1.0 \
+        --think-temperature "$THINK_TEMP" \
         --max-num-seqs "${MAX_NUM_SEQS:-10}" \
         --max-new-tokens 16384 \
         --max-model-len 40960 \
