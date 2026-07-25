@@ -1,11 +1,16 @@
-"""The two-pass trace seam -- the alignment nobody downstream would catch being wrong.
+"""The two-pass think/code sampler: the text reassembly AND the trace-array alignment.
 
-``test_sampling.py`` pins that the two halves of the *text* are stitched correctly.
-This file pins the same thing for the *arrays*, which is harder for one reason: the
-assembled string contains two spans that no token produced (the ``## Plan`` prefill and
-the ``` ```python ``` fence), while pass 1 returns tokens that no kept character
-accounts for (the ones that spelled the fence). Both facts are recorded rather than
-patched over, so both get a test that says so out loud.
+Two concerns, one module (``core/sampling.py``), so one test file.
+
+*Text* (bottom section): the prefill, the stop string, and the reassembly -- if the
+halves are stitched back wrong, ``extract_code_block`` silently returns prose and every
+kernel in the run is garbage.
+
+*Arrays* (top sections): the same seam is harder to get right for the token trace,
+because the assembled string contains two spans that no token produced (the ``## Plan``
+prefill and the ``` ```python ``` fence), while pass 1 returns tokens that no kept
+character accounts for (the ones that spelled the fence). Both facts are recorded rather
+than patched over, so both get a test that says so out loud.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from kernel_gen.core.sampling import (
     generate_batch,
     generate_batch_traced,
 )
+from kernel_gen.core.text import extract_code_block
 from kernel_gen.core.trace import SEG_CODE, SEG_PLAN, derive_scalars
 
 PLAN = "fuse the elementwise ops\n"
@@ -192,3 +198,74 @@ def test_empty_prompt_list_never_reaches_the_backend():
     backend = _model()
     assert generate_batch_traced(backend, [], SamplingSpec(trace_topk=TOPK)) == []
     assert backend.batches == []
+
+
+# ------------------------------------------------- text reassembly (the plain path)
+#
+# The original test_sampling.py: the two halves of the TEXT are stitched correctly, over
+# the plain generate_batch (no trace). If this breaks, extract_code_block returns prose.
+
+
+def test_single_pass_sends_one_prompt_per_slot():
+    backend = _model()
+    out = generate_batch(backend, ["a", "b", "c"], SamplingSpec(think_temperature=None))
+
+    assert len(out) == 3
+    assert len(backend.batches) == 1  # one call, not one per prompt
+    assert len(backend.batches[0]) == 3
+    assert extract_code_block(out[0]) == "import torch"
+
+
+def test_think_pass_prefills_the_plan_heading_and_stops_at_the_fence():
+    backend = _model()
+    generate_batch(backend, ["solve this"], SamplingSpec(think_temperature=1.0))
+
+    plan_batch, code_batch = backend.batches
+    # Instruct models ignore "plan first" and emit the fence immediately; the prefill
+    # is what forces them to start in prose.
+    assert plan_batch[0].endswith(PLAN_PREFIX)
+    # Pass 1 stopped at the fence, so pass 2 resumes from a prompt ending in it --
+    # which is why the model continues with code and not with more prose.
+    assert code_batch[0] == plan_batch[0] + PLAN + CODE_FENCE
+
+
+def test_think_reassembly_round_trips_through_extract_code_block():
+    backend = _model()
+    completion = generate_batch(backend, ["solve this"], SamplingSpec(think_temperature=1.0))[0]
+
+    assert completion == PLAN_PREFIX + PLAN + CODE_FENCE + CODE
+    # The whole point: the stitched halves still look like one normal fenced answer.
+    assert extract_code_block(completion) == "import torch"
+
+
+def test_think_path_batches_every_slot_in_one_call_per_pass():
+    backend = _model()
+    generate_batch(backend, [f"p{i}" for i in range(7)], SamplingSpec(think_temperature=1.0))
+
+    assert len(backend.batches) == 2  # exactly two passes, not two per prompt
+    assert [len(b) for b in backend.batches] == [7, 7]
+
+
+def test_the_system_prompt_is_rendered_into_every_prompt():
+    backend = _model()
+    generate_batch(backend, ["solve this"], SamplingSpec(system="BE TERSE"))
+
+    assert "BE TERSE" in backend.batches[0][0]
+
+
+def test_a_plan_truncated_before_the_fence_is_counted_out_loud(capsys):
+    # A plan that hits --max-new-tokens still gets a fence appended and a kernel written
+    # from it. That has always happened silently; the sampler now says how often.
+    class TruncatingBackend(FakeBackend):
+        def complete_traced(self, prompts, **kwargs):
+            out = super().complete_traced(prompts, **kwargs)
+            for completion in out:
+                completion.finish_reason = "length"
+            return out
+
+    generate_batch_traced(
+        TruncatingBackend(default=PLAN + CODE_FENCE + CODE),
+        ["a", "b"],
+        SamplingSpec(think_temperature=1.0, temperature=0.3),
+    )
+    assert "plans hit --max-new-tokens" in capsys.readouterr().out

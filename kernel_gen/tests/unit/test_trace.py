@@ -373,3 +373,18 @@ def test_calibration_of_an_empty_trace_is_nan_not_a_crash():
     trace = pack([], None, k=20)
     recorded, observed = rank1_calibration(trace.topk_lp, trace.sampled_rank)
     assert math.isnan(recorded) and math.isnan(observed)
+
+
+def test_more_logprob_rows_than_tokens_are_ignored():
+    # A backend that returns more rows than it sampled tokens must not overrun the
+    # arrays -- pack stops at the token count.
+    rows = _rows(_flat(4), _flat(4), _flat(4))
+    trace = pack([1, 2], rows, k=4)  # 3 rows, 2 tokens
+    assert len(trace) == 2
+
+
+def test_a_single_token_trace_summarizes_without_a_sliding_window():
+    # window degenerates to <= 1: the values are their own group.
+    stats = summarize({"deepconf_c": np.array([4.0], dtype=np.float32)}, window=512)
+    assert stats["c_least"] == pytest.approx(4.0)
+    assert stats["n_tokens"] == 1

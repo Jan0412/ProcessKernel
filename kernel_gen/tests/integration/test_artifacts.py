@@ -1,10 +1,16 @@
-"""What the trace writer puts on disk, and what it must not disturb.
+"""``core/artifacts.py``: the on-disk contracts, and what the trace writer adds.
 
-The run dir has three documented contracts (see ``artifacts.py``), all of them about
-non-recursive globs over a directory that already holds 140k-175k files. Tracing adds
-roughly one file per kernel, so most of this file is about staying out of their way --
-and the rest is about the two things this pipeline has been silently discarding since it
-was written: the plan prose, and the line numbers the linter already knows.
+Two concerns, one module, so one file.
+
+*The run-dir contracts* (bottom section): the ``generation_config.yaml`` coupling -- the
+writer is PyYAML, the reader a 12-line hand-rolled scanner, and the two agree only by
+convention, the level key being the part that bites -- and where kernel files are
+allowed to land (the eval glob is non-recursive).
+
+*The trace writer* (top sections): the run dir already holds 140k-175k files, so the
+traces must stay out of the non-recursive globs' way; and they finally persist the two
+things this pipeline discarded since it was written -- the plan prose and the linter's
+line numbers.
 """
 
 from __future__ import annotations
@@ -13,16 +19,41 @@ import json
 import os
 
 from kernel_gen.core import artifacts
+from kernel_gen.core.artifacts import round_dir, write_attempts, write_config, write_kernels
 from kernel_gen.core.backend import FakeBackend
 from kernel_gen.core.model import Attempt, Problem, Review, Trajectory
 from kernel_gen.core.sampling import CODE_FENCE, PLAN_PREFIX, SamplingSpec, generate_batch_traced
 from kernel_gen.core.trace import read_trace
 from triton_lint.model import parse_kernel_filename
+from triton_lint.runs import load_run
 
 PLAN = "fuse the elementwise ops\n"
 CODE = "\nimport torch\n```\n"
 PROBLEM = Problem(level=1, problem_id=7, name="7_Add.py", ref_arch_src="ref")
 STEM = "level_1_problem_7_sample_0_kernel"
+
+BENCH_CONFIG = {
+    "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "level": 1,
+    "num_samples": 10,
+    "backend": "triton",
+    "run_name": "test_run",
+    "lint_checks": "F1.2,F1.4",
+}
+
+
+def _cfg_traj(problem_id: int, sample_id: int, *attempts: Attempt) -> Trajectory:
+    problem = Problem(level=1, problem_id=problem_id, name="x.py", ref_arch_src="")
+    return Trajectory(problem=problem, sample_id=sample_id, attempts=list(attempts))
+
+
+def _cfg_attempt(round_: int, code: str, *, clean=False, n_fail=0) -> Attempt:
+    return Attempt(
+        round=round_,
+        raw=code,
+        code=code,
+        review=Review(text="", clean=clean, data={"n_fail": n_fail, "parse_status": "ok"}),
+    )
 
 
 def _slot(out_dir: str, *, trace: bool = True, findings: list | None = None) -> Trajectory:
@@ -200,3 +231,105 @@ def test_the_run_level_facts_are_written_once_not_per_record(tmp_path):
     assert os.path.basename(path) == "trace_config.json"
     artifacts.write_traces(out, [_slot(out)], 0)
     assert "model" not in _records(out)[0]
+
+
+# ================= the run-dir contracts (ex-test_artifacts.py) =================
+#
+# The generation_config.yaml coupling and where kernel files land. Independent of
+# tracing; the sharpest edges in the repo (the level key, the non-recursive eval glob).
+
+
+def test_kernelbench_config_round_trips_and_carries_no_pseudo_level(tmp_path):
+    write_config(str(tmp_path), BENCH_CONFIG, dataset="kernelbench")
+
+    info = load_run(str(tmp_path))
+    assert info.level == 1
+    assert info.model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    assert info.num_samples == 10
+
+    raw = (tmp_path / "generation_config.yaml").read_text()
+    assert "pseudo_level" not in raw
+
+
+def test_kernelbook_config_round_trips_as_pseudo_level_and_carries_no_level(tmp_path):
+    write_config(str(tmp_path), {**BENCH_CONFIG, "level": 5}, dataset="kernelbook")
+
+    assert load_run(str(tmp_path)).level == 5
+
+    raw = (tmp_path / "generation_config.yaml").read_text()
+    assert "pseudo_level: 5" in raw
+    # `runs.py` resolves `pseudo_level or level`. Emitting both would make a
+    # KernelBench run at level 1 report level 5 and break every filename lookup.
+    assert not any(line.startswith("level:") for line in raw.splitlines())
+
+
+def test_comma_separated_flags_survive_the_flat_yaml_reader(tmp_path):
+    # A nargs="+" flag would serialize as a block list, whose lines start with "-",
+    # and runs.py's scanner drops those. This is why --lint-checks is a string.
+    write_config(str(tmp_path), BENCH_CONFIG, dataset="kernelbench")
+    raw = (tmp_path / "generation_config.yaml").read_text()
+    assert "lint_checks: F1.2,F1.4" in raw
+
+
+def test_round_0_gets_its_own_config_so_it_is_a_run_dir_in_its_own_right(tmp_path):
+    write_config(str(tmp_path), BENCH_CONFIG, dataset="kernelbench")
+
+    # round_0 is the unrefined baseline; eval and load_run() get pointed straight at it.
+    assert load_run(round_dir(str(tmp_path), 0)).level == 1
+
+
+def test_final_kernels_go_flat_and_intermediates_stay_invisible(tmp_path):
+    trajs = [
+        _cfg_traj(19, 0, _cfg_attempt(0, "dirty", n_fail=2), _cfg_attempt(1, "clean", clean=True))
+    ]
+
+    write_attempts(str(tmp_path), trajs, round_index=0)
+    write_attempts(str(tmp_path), trajs, round_index=1)
+    write_kernels(str(tmp_path), trajs)
+
+    # eval_run.py globs the run dir non-recursively: it must see exactly one kernel.
+    flat = sorted(f for f in os.listdir(tmp_path) if f.endswith("_kernel.py"))
+    assert flat == ["level_1_problem_19_sample_0_kernel.py"]
+    assert (tmp_path / flat[0]).read_text() == "clean"
+
+    # …and each round dir is a valid run dir holding that round's version.
+    r0 = round_dir(str(tmp_path), 0)
+    assert open(os.path.join(r0, "level_1_problem_19_sample_0_kernel.py")).read() == "dirty"
+
+
+def test_a_slot_that_never_went_clean_is_still_written(tmp_path):
+    # "N samples per problem" is a contract; dropping the dirty slots would bias
+    # pass@k, the sweep and the reranker's lists toward the easy problems.
+    trajs = [
+        _cfg_traj(19, 0, _cfg_attempt(0, "best", n_fail=1), _cfg_attempt(1, "worse", n_fail=4)),
+        _cfg_traj(19, 1, _cfg_attempt(0, "ok", clean=True)),
+    ]
+    assert write_kernels(str(tmp_path), trajs) == 2
+    assert (tmp_path / "level_1_problem_19_sample_0_kernel.py").read_text() == "best"
+
+
+# -- the degradation paths -------------------------------------------------
+
+
+def test_a_slot_with_no_attempt_in_this_round_is_skipped(tmp_path):
+    # Round 2 only writes the slots that RAN in round 2; a slot that went clean in
+    # round 0 has no round-2 attempt and must not produce a stray file.
+    trajs = [_cfg_traj(19, 0, _cfg_attempt(0, "r0", clean=True))]
+    assert write_attempts(str(tmp_path), trajs, round_index=2) == 0
+    assert not os.path.exists(round_dir(str(tmp_path), 2)) or not os.listdir(
+        round_dir(str(tmp_path), 2)
+    )
+
+
+def test_a_slot_with_no_attempt_at_all_warns_and_writes_nothing(tmp_path, capsys):
+    # final() is None -- nothing to ship. It must say so rather than write an empty file
+    # that eval would score as a failure indistinguishable from a bad kernel.
+    trajs = [_cfg_traj(19, 0)]  # no attempts
+    assert write_kernels(str(tmp_path), trajs) == 0
+    assert "no attempt at all" in capsys.readouterr().out
+    assert not [f for f in os.listdir(tmp_path) if f.endswith("_kernel.py")]
+
+
+def test_read_jsonl_of_a_missing_file_is_empty_not_an_error(tmp_path):
+    # --skip-existing reads the journal before the first run ever wrote it.
+    assert artifacts.read_jsonl(str(tmp_path / "never_written.jsonl")) == []

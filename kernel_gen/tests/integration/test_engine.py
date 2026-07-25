@@ -11,6 +11,8 @@ one crashing critic must cost that slot, not the run.
 
 from __future__ import annotations
 
+import pytest
+
 from kernel_gen.core.backend import FakeBackend
 from kernel_gen.core.engine import run_rounds
 from kernel_gen.core.model import Problem, Review
@@ -238,3 +240,29 @@ def test_tracing_off_leaves_the_attempt_text_identical():
 
     assert [t.final().code for t in off] == [t.final().code for t in on]
     assert [t.final().raw for t in off] == [t.final().raw for t in on]
+
+
+def test_a_backend_that_drops_a_completion_is_a_hard_error():
+    # Silent misalignment between prompts and completions would attribute one slot's
+    # kernel to another. That is never recoverable, so it raises rather than degrades.
+    class DroppingBackend(FakeBackend):
+        def complete_traced(self, prompts, **kwargs):
+            out = super().complete_traced(prompts, **kwargs)
+            return out[:-1]  # drop one
+
+    with pytest.raises(RuntimeError, match="returned 3 completions for 4 prompts"):
+        run(DroppingBackend(default=GOOD), rounds=1, n_problems=2, num_samples=2)
+
+
+def test_an_extraction_that_raises_degrades_that_slot_only(monkeypatch):
+    # extract_code_block is defensive by design: a completion it cannot handle costs
+    # that attempt, not the run.
+    import kernel_gen.core.engine as engine_mod
+
+    def boom(_raw):
+        raise ValueError("unparseable")
+
+    monkeypatch.setattr(engine_mod, "extract_code_block", boom)
+    trajs = run(FakeBackend(default=GOOD), rounds=1, n_problems=1, num_samples=2)
+
+    assert all(t.attempts[0].code == "" for t in trajs)  # degraded, not crashed

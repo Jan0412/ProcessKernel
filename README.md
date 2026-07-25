@@ -80,8 +80,33 @@ Cluster jobs go through `scripts/*.sh` (SLURM) and `reranker/scripts/*.sh`.
 ## Tests
 
 ```bash
-uv run --group dev pytest triton_lint/tests/
+uv run --group dev pytest                    # both suites (triton_lint + kernel_gen)
+uv run --group dev pytest kernel_gen/tests   # just the generation pipeline
+uv run --group dev pytest kernel_gen/tests/unit          # pure functions
+uv run --group dev pytest kernel_gen/tests/integration   # cross-module seams
+uv run --group dev pytest kernel_gen/tests/properties     # metamorphic (gemtest) + property (Hypothesis)
 ```
+
+`kernel_gen/tests/` is split into `unit/` (one file per `core/` module), `integration/`
+(the seams) and `properties/` (metamorphic via **gemtest** + property-based via
+**Hypothesis**). Two quality gates back it, both kept out of the inner-loop `pytest` so
+it stays fast:
+
+```bash
+# coverage FLOOR -- catches untouched code (core/ is at 100%, gate fails under 95%)
+uv run --group dev pytest kernel_gen/tests --cov=kernel_gen/core
+
+# mutation testing -- catches untested BEHAVIOUR, the real anti-alibi bar
+uv run --group dev pytest kernel_gen/tests --gremlins --gremlin-targets=kernel_gen/core
+```
+
+Mutation testing is what proves the tests actually assert something: **pytest-gremlins**
+corrupts `core/` and reports how many mutants the suite kills ("zaps"). Line coverage
+says a line ran; only this says a test would have noticed it being wrong. Do **not** pass
+`--gremlin-parallel` — it collides with coverage.py's data file and errors out.
+
+Known-but-unfixed data-flow bugs are tracked as strict-xfail tests plus a row in
+`triton_lint/tests/KERNEL_GEN_BUGS.md`.
 
 ---
 

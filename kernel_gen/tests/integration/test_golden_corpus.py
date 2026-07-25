@@ -1,0 +1,81 @@
+"""Extraction against a frozen corpus of REAL Qwen3.6 completions.
+
+Synthetic fixtures encode what I imagined the model does. This corpus is what it
+actually did -- 20 completions pulled from the level 1+2 trace runs, each labelled by
+behaviour and carrying its oracle (the kernel a correct extractor should return,
+computed independently of ``extract_code_block``). It is the regression bedrock: a
+parser change that breaks on real output fails here, and the KGEN-2 cases are real proof
+the bug bites on real data, not just on a hand-built repro.
+
+Categories (see fixtures/completions/corpus.jsonl):
+  single_block / revision / revision_fragment_first  -> extraction is correct today
+  unterminated_recovered  -> an unterminated final block the fallback path DID recover
+  kgen2_broken            -> an unterminated final block; recovered since the KGEN-2 fix
+  kgen3_broken            -> a stray closing fence hid the real block; recovered since KGEN-3
+  model_failed            -> no valid ModelNew anywhere (the model failed, not a bug)
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import pathlib
+
+import pytest
+
+from kernel_gen.core.text import extract_code_block
+
+_CORPUS = pathlib.Path(__file__).parents[1] / "fixtures" / "completions" / "corpus.jsonl"
+CORPUS = [json.loads(line) for line in _CORPUS.read_text().splitlines()]
+_CORRECT = ("single_block", "revision", "revision_fragment_first", "unterminated_recovered")
+WELLFORMED = [c for c in CORPUS if c["category"] in _CORRECT]
+KGEN2 = [c for c in CORPUS if c["category"] == "kgen2_broken"]
+KGEN3 = [c for c in CORPUS if c["category"] == "kgen3_broken"]
+FAILED = [c for c in CORPUS if c["category"] == "model_failed"]
+
+
+def _id(cases):
+    return [c["id"] for c in cases]
+
+
+def test_the_corpus_covers_every_behaviour():
+    # If a category empties out (e.g. a rebuild that lost the KGEN-2 cases), the suite
+    # would silently stop testing it. Fail loudly instead.
+    cats = {c["category"] for c in CORPUS}
+    assert {"single_block", "revision", "kgen2_broken", "kgen3_broken", "model_failed"} <= cats
+
+
+@pytest.mark.parametrize("case", WELLFORMED, ids=_id(WELLFORMED))
+def test_extraction_matches_the_oracle_on_real_wellformed_completions(case):
+    out = extract_code_block(case["raw"])
+    assert out.strip() == case["oracle"].strip()
+    assert "class ModelNew" in out
+    ast.parse(out)  # a correct extraction is always valid Python
+
+
+@pytest.mark.parametrize("case", FAILED, ids=_id(FAILED))
+def test_a_genuinely_failed_completion_does_not_crash_extraction(case):
+    # The model produced no ModelNew; the extractor returns its best effort without
+    # raising, and we do not pretend a submission exists.
+    extract_code_block(case["raw"])  # must not raise
+    assert not case["oracle_has_modelnew"]
+
+
+@pytest.mark.parametrize("case", KGEN2, ids=_id(KGEN2))
+def test_kgen2_real_completions_recover_the_unterminated_final(case):
+    # KGEN-2, now fixed: each of these real completions has a complete earlier block that
+    # USED to win over the cut-off final ModelNew. Extraction now recovers the tail. See
+    # triton_lint/tests/KERNEL_GEN_BUGS.md.
+    assert extract_code_block(case["raw"]).strip() == case["oracle"].strip()
+
+
+@pytest.mark.parametrize("case", KGEN3, ids=_id(KGEN3))
+def test_kgen3_real_completions_survive_a_stray_closing_fence(case):
+    # KGEN-3, now fixed. These are model SUCCESSES: each raw contains a complete,
+    # parseable ModelNew (the oracle) that a stray closing fence used to hide -- the old
+    # regex paired that stray ``` with the real block's ```python opener and shipped the
+    # inter-block prose. _fenced_blocks now ignores a bare ``` outside a block, so the
+    # real block is recovered. See triton_lint/tests/KERNEL_GEN_BUGS.md.
+    out = extract_code_block(case["raw"])
+    assert "class ModelNew" in out
+    assert out.strip() == case["oracle"].strip()

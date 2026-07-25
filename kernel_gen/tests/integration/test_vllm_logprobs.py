@@ -23,7 +23,10 @@ import sys
 
 import pytest
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# this file → integration → tests → kernel_gen → repo root (four levels up)
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 # Two positions, built exactly as vLLM's engine builds them (see
 # LogprobsProcessor._update_sample_logprobs -> append_logprobs_for_next_position):
