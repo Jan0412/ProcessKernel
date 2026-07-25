@@ -141,6 +141,7 @@ def write_traces(
     *,
     window: int = 512,
     vocab_size: int | None = None,
+    system_prompt: str = "",
 ) -> int:
     """One round's traces: a ``.npz`` of arrays plus a line of context per attempt.
 
@@ -180,9 +181,22 @@ def write_traces(
             "sample_id": traj.sample_id,
             "problem_name": traj.problem.name,
             "round": round_index,
+            # The conversation this round, in order: the system message, the user turn the
+            # model actually saw (base prompt at round 0; base + previous kernel + feedback
+            # after), then the assistant completion. Stored so the trace reconstructs the
+            # whole exchange without replaying the prompt builders against a pinned dataset.
+            # `system_prompt` is constant across the run and repeated per record on purpose,
+            # so each line is a self-contained training example.
+            "system_prompt": system_prompt,
+            "prompt": attempt.prompt,
             "raw": attempt.raw,
             "n_chars_code": len(attempt.code),
             "clean": bool(attempt.review and attempt.review.clean),
+            # `feedback` is the rendered critic text -- the exact string folded into the
+            # NEXT round's prompt; `findings` is the same verdict structured, with a lineno
+            # per entry. Both kept: the text is what the model sees, the structure is what a
+            # reward model reads.
+            "feedback": attempt.review.text if attempt.review else "",
             "findings": attempt.review.findings if attempt.review else [],
             "trace": None,
             "confidence": {},

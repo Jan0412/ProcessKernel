@@ -96,8 +96,12 @@ def run_rounds(
             )
 
         n_clean = 0
-        for traj, completion in zip(active, completions):
+        for traj, completion, prompt in zip(active, completions, prompts):
             attempt = _review(traj, completion, round_index, critic)
+            # The exact user turn this slot saw this round, carried onto the attempt so a
+            # trace can reconstruct the conversation. `prompts` was built from `active` in
+            # the same order just above, so the zip is aligned.
+            attempt.prompt = prompt
             traj.attempts.append(attempt)
 
             clean = attempt.review is not None and attempt.review.clean

@@ -254,6 +254,20 @@ def test_a_backend_that_drops_a_completion_is_a_hard_error():
         run(DroppingBackend(default=GOOD), rounds=1, n_problems=2, num_samples=2)
 
 
+def test_each_attempt_captures_the_exact_prompt_it_was_given():
+    # The user turn the model saw is carried onto the attempt so a trace can reconstruct
+    # the conversation without replaying the prompt builders. Round 0 gets the base prompt;
+    # a repair round gets the repair prompt, which itself embeds the previous kernel and
+    # the feedback (the loop is Markov -- that one string is the model's whole context).
+    backend = FakeBackend(rules=[(REPAIR_MARKER, GOOD)], default=BAD)
+    trajs = run(backend, rounds=2, critic_fn=critic, n_problems=1, num_samples=1)
+
+    first, second = trajs[0].attempts
+    assert first.prompt == build_prompt(trajs[0].problem)
+    assert second.prompt == build_repair_prompt(trajs[0].problem, first)
+    assert REPAIR_MARKER in second.prompt and first.code in second.prompt
+
+
 def test_an_extraction_that_raises_degrades_that_slot_only(monkeypatch):
     # extract_code_block is defensive by design: a completion it cannot handle costs
     # that attempt, not the run.

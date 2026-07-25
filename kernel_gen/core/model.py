@@ -62,6 +62,13 @@ class Review:
 class Attempt:
     """One generation for one slot in one round.
 
+    ``prompt`` is the exact user turn the model saw this round -- the base prompt at
+    round 0, the repair prompt (base + previous kernel + feedback) after. It is captured
+    so the trace can reconstruct the whole conversation without replaying the prompt
+    builders against a pinned dataset; like ``trace`` it is deliberately absent from
+    :meth:`to_dict`, so ``lint_loop.jsonl`` stays byte-identical and ``--skip-existing``
+    is untouched.
+
     ``trace`` is the token-level record when the run was started with ``--trace``, and
     ``None`` otherwise. It is never journaled -- it is arrays, and it goes to its own
     ``.npz``; see :meth:`to_dict`, which is unchanged by its presence.
@@ -72,6 +79,7 @@ class Attempt:
     code: str
     review: Review | None = None
     trace: TokenTrace | None = None
+    prompt: str = ""
 
     def to_dict(self) -> dict:
         out: dict = {"round": self.round, "n_chars": len(self.code)}

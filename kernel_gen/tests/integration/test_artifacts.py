@@ -139,6 +139,40 @@ def test_findings_are_persisted_with_their_line_numbers(tmp_path):
     assert record["clean"] is False
 
 
+def test_the_record_carries_the_system_prompt_user_prompt_and_feedback(tmp_path):
+    # The three fields that make a line a self-contained training example: the constant
+    # system message, the exact user turn the model saw, and the rendered critic text
+    # (== Review.text -- the string folded into the NEXT round's prompt). Without them the
+    # conversation is only reconstructable by replaying the prompt builders on a pinned set.
+    out = str(tmp_path)
+    finding = {"check_id": "F1.2", "severity": "fail", "message": "never launched",
+               "data": {"lineno": 8}}
+    traj = _slot(out, findings=[finding])
+    traj.attempts[0].prompt = "solve problem 7\n## Your previous solution\n```python\n...\n```"
+    artifacts.write_traces(out, [traj], 0, system_prompt="You write custom kernels ...")
+
+    record = _records(out)[0]
+    assert record["system_prompt"] == "You write custom kernels ..."
+    assert record["prompt"] == "solve problem 7\n## Your previous solution\n```python\n...\n```"
+    assert record["feedback"] == "F1.2: never launched"  # == the Review.text, verbatim
+
+
+def test_prompt_persists_and_feedback_is_empty_when_no_critic_ran(tmp_path):
+    # review is None (the critic crashed or was absent): feedback degrades to "" rather
+    # than raising, and the prompt / system_prompt are still captured. A record with no
+    # verdict is still a usable training turn.
+    out = str(tmp_path)
+    traj = _slot(out)
+    traj.attempts[0].review = None
+    traj.attempts[0].prompt = "solve"
+    artifacts.write_traces(out, [traj], 0, system_prompt="sys")
+
+    record = _records(out)[0]
+    assert record["feedback"] == ""
+    assert record["prompt"] == "solve"
+    assert record["system_prompt"] == "sys"
+
+
 def test_the_record_carries_the_seam_offsets_and_finish_reasons(tmp_path):
     out = str(tmp_path)
     artifacts.write_traces(out, [_slot(out)], 0)

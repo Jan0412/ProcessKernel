@@ -306,6 +306,7 @@ def main() -> None:
                 round_index,
                 window=args.trace_window,
                 vocab_size=getattr(backend, "vocab_size", None),
+                system_prompt=SYSTEM_PROMPT,
             )
 
     trajectories = run_rounds(

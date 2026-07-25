@@ -85,3 +85,17 @@ def test_final_is_none_when_a_slot_never_produced_an_attempt():
     # A slot skipped entirely (e.g. it was filtered before generation) has nothing to
     # ship; artifacts must be able to tell that apart from "produced empty code".
     assert Trajectory(problem=PROBLEM, sample_id=0).final() is None
+
+
+# -- prompt capture: for the trace, not for the journal --------------------
+
+
+def test_attempt_captures_the_prompt_but_keeps_it_out_of_the_journal():
+    # The exact user turn the model saw is captured so a trace can reconstruct the whole
+    # conversation. But to_dict feeds lint_loop.jsonl, which --skip-existing reads
+    # start-to-finish before every resumed run, so prompt must NOT appear there -- exactly
+    # like trace. Default "" keeps every existing Attempt(...) call working unchanged.
+    assert Attempt(round=0, raw="r", code="c").prompt == ""
+    attempt = Attempt(round=0, raw="r", code="c", prompt="solve problem 19")
+    assert attempt.prompt == "solve problem 19"
+    assert "prompt" not in attempt.to_dict()
