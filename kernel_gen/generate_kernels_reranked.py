@@ -77,10 +77,23 @@ def extract_code_block(text: str) -> str:
         except (SyntaxError, ValueError):
             return False
 
-    blocks = [
-        textwrap.dedent(m.group(1)).strip()
-        for m in re.finditer(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", text, re.DOTALL)
-    ]
+    # Pair fences open->close in document order (mirror of kernel_gen/core/text.py, the
+    # tested copy). An info-tagged ```python OPENS; a bare ``` CLOSES; a bare ``` seen
+    # outside a block is a stray closer and is skipped (KGEN-3); a block left open at
+    # end-of-text is the max_tokens tail (KGEN-2). A regex cannot tell an opening fence
+    # from a closing one, which is why this walk replaced one.
+    blocks = []
+    start = None
+    for m in re.finditer(r"```([A-Za-z0-9_+#-]*)[ \t]*(?:\r?\n|$)", text):
+        opener = bool(m.group(1))
+        if start is not None:
+            blocks.append(text[start : m.start()])
+            start = m.end() if opener else None
+        elif opener:
+            start = m.end()
+    if start is not None:
+        blocks.append(text[start:])
+    blocks = [textwrap.dedent(b).strip() for b in blocks]
     if blocks:
         parseable = [b for b in blocks if _parses(b)]
         submissions = [b for b in parseable if "class ModelNew" in b]
