@@ -14,8 +14,8 @@ canonical filenames, which makes that directory a run dir in its own right. So t
 comparison is one generation job and two evals:
 
     uv run python -m kernel_gen.arms.lintloop --level 1 --all --rounds 3 --num-samples 10
-    uv run python -m autotune.eval_run --run-dir runs/<run>                --level 1  # refined
-    uv run python -m autotune.eval_run --run-dir runs/<run>/rounds/round_0 --level 1  # baseline
+    sbatch --export=ALL,RUN_NAME=<run>,LEVEL=1 slum_scripts/eval_from_generations.sh
+    sbatch --export=ALL,RUN_NAME=<run>/rounds/round_0,LEVEL=1 slum_scripts/eval_from_generations.sh
 
 That is not merely cheaper than generating a separate baseline: it is *paired*. Every
 slot has its own round-0 ancestor, so the questions that decide whether the loop is

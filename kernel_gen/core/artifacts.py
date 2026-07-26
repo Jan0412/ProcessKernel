@@ -1,8 +1,8 @@
-"""Everything the loop puts on disk, and the three contracts that constrain it.
+"""Everything the loop puts on disk, and the four contracts that constrain it.
 
-**1. The final kernel goes flat, under the canonical name.** ``autotune/eval_run.py``
-globs the run dir and ``triton_lint/scan.py`` scandirs it, both NON-recursively, and
-the file stem is the primary key joining generation to eval to the sweep. So the
+**1. The final kernel goes flat, under the canonical name.** KernelBench's eval resolves
+each sample by exact path and ``triton_lint/scan.py`` scandirs the run dir
+non-recursively; the file stem is the primary key joining generation to eval. So the
 per-round intermediates live in ``rounds/round_{r}/`` where those globs cannot see
 them, and only :meth:`Trajectory.final` is written flat. A dirty round-0 kernel
 landing in the run dir would be scored as if it were the answer.

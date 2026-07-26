@@ -1,8 +1,7 @@
 """Findings -> prompt text. Pure: no GPU, no model, no filesystem.
 
-This lives in ``triton_lint`` rather than in ``kernel_gen`` for the same reason
-``autotune/feedback.py`` lives next to the sweep that produces its numbers: the thing
-that knows what a finding *means* is the package that raised it. A generation arm
+This lives in ``triton_lint`` rather than in ``kernel_gen`` because the thing that knows
+what a finding *means* is the package that raised it. A generation arm
 should be able to hand a kernel to a renderer and get back text, without knowing that
 F1.4 outranks F2.1.
 
