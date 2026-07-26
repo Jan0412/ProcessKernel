@@ -12,6 +12,9 @@ Categories (see fixtures/completions/corpus.jsonl):
   unterminated_recovered  -> an unterminated final block the fallback path DID recover
   kgen2_broken            -> an unterminated final block; recovered since the KGEN-2 fix
   kgen3_broken            -> a stray closing fence hid the real block; recovered since KGEN-3
+  kgen9_broken            -> unfenced answer + the sampler's trailing ```python; recovered
+                             since KGEN-9. Both were catalogued as model_failed until the
+                             fix showed they contain a complete ModelNew.
   model_failed            -> no valid ModelNew anywhere (the model failed, not a bug)
 """
 
@@ -31,6 +34,7 @@ _CORRECT = ("single_block", "revision", "revision_fragment_first", "unterminated
 WELLFORMED = [c for c in CORPUS if c["category"] in _CORRECT]
 KGEN2 = [c for c in CORPUS if c["category"] == "kgen2_broken"]
 KGEN3 = [c for c in CORPUS if c["category"] == "kgen3_broken"]
+KGEN9 = [c for c in CORPUS if c["category"] == "kgen9_broken"]
 FAILED = [c for c in CORPUS if c["category"] == "model_failed"]
 
 
@@ -42,7 +46,8 @@ def test_the_corpus_covers_every_behaviour():
     # If a category empties out (e.g. a rebuild that lost the KGEN-2 cases), the suite
     # would silently stop testing it. Fail loudly instead.
     cats = {c["category"] for c in CORPUS}
-    assert {"single_block", "revision", "kgen2_broken", "kgen3_broken", "model_failed"} <= cats
+    assert {"single_block", "revision", "kgen2_broken", "kgen3_broken", "kgen9_broken",
+            "model_failed"} <= cats
 
 
 @pytest.mark.parametrize("case", WELLFORMED, ids=_id(WELLFORMED))
@@ -57,8 +62,28 @@ def test_extraction_matches_the_oracle_on_real_wellformed_completions(case):
 def test_a_genuinely_failed_completion_does_not_crash_extraction(case):
     # The model produced no ModelNew; the extractor returns its best effort without
     # raising, and we do not pretend a submission exists.
-    extract_code_block(case["raw"])  # must not raise
+    out = extract_code_block(case["raw"])  # must not raise
     assert not case["oracle_has_modelnew"]
+    # …and the raw really has no submission, so this stays a statement about the model.
+    # Two cases sat in this category until KGEN-9 showed they contained a complete
+    # ModelNew and the extractor was returning "" for them.
+    assert "class ModelNew" not in case["raw"]
+    assert "class ModelNew" not in out
+
+
+@pytest.mark.parametrize("case", KGEN9, ids=_id(KGEN9))
+def test_kgen9_real_completions_recover_an_unfenced_answer(case):
+    # KGEN-9, now fixed. The model wrote its whole answer as unfenced prose-with-code and
+    # the two-pass sampler then appended its ```python with nothing after it. That empty
+    # block parsed (ast.parse("") succeeds), so it won the ranking and "" was shipped --
+    # for round 0 that meant an EMPTY baseline kernel for a generation that succeeded.
+    out = extract_code_block(case["raw"])
+    assert out.strip() == case["oracle"].strip()
+    assert "class ModelNew" in out
+    tree = ast.parse(out)
+    model_new = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelNew")
+    # Instantiable AND callable -- a salvage that lost forward() would still score zero.
+    assert "forward" in [m.name for m in model_new.body if isinstance(m, ast.FunctionDef)]
 
 
 @pytest.mark.parametrize("case", KGEN2, ids=_id(KGEN2))

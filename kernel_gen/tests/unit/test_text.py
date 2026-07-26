@@ -1,10 +1,11 @@
 """``kernel_gen.core.text``: pull the kernel out of a completion, parse specs and ids.
 
 Extraction is the single highest-stakes pure function in the pipeline: it decides which
-bytes of a free-form completion become the kernel that eval scores. Three real bugs have
-lived here — KGEN-1 (first vs last block), KGEN-2 (unterminated final block) and KGEN-3
-(a stray closing fence swallowing the real block), all fixed, all "wrong element chosen
-out of a completion" — so this file carries the regression corpus for that whole class.
+bytes of a free-form completion become the kernel that eval scores. Four real bugs have
+lived here — KGEN-1 (first vs last block), KGEN-2 (unterminated final block), KGEN-3 (a
+stray closing fence swallowing the real block) and KGEN-9 (an empty block outranking an
+unfenced answer), all fixed, all "wrong element chosen out of a completion" — so this
+file carries the regression corpus for that whole class.
 """
 
 from __future__ import annotations
@@ -13,7 +14,12 @@ import ast
 
 import pytest
 
-from kernel_gen.core.text import extract_code_block, parse_int_spec, problem_id_from_name
+from kernel_gen.core.text import (
+    _largest_parseable_prefix,
+    extract_code_block,
+    parse_int_spec,
+    problem_id_from_name,
+)
 
 
 def test_extract_code_block_takes_the_fenced_block():
@@ -261,3 +267,154 @@ def test_a_stray_fence_before_an_unterminated_tail_still_recovers_it():
     out = extract_code_block(raw)
     assert "class ModelNew" in out
     assert out.startswith("import torch")
+
+
+# -- KGEN-9 (fixed, audit) -------------------------------------------------
+#
+# The two-pass sampler builds `PLAN_PREFIX + plan + CODE_FENCE + code`. When pass 2
+# returns nothing, that injected ```python trails the text with no content after it --
+# an EMPTY block. `ast.parse("")` succeeds, so it ranked as a valid candidate and won,
+# and "" was shipped for a generation that contained a complete kernel. Round 0 is the
+# paired baseline, so those empty files were scored as model failures.
+
+
+def test_an_empty_trailing_block_is_not_a_candidate():
+    # The bare mechanism: the model answered without fencing, the sampler appended its
+    # fence, and nothing followed it.
+    raw = (
+        "## Plan\nUse a Triton kernel.\n\n"
+        "import torch\n\n\nclass ModelNew:\n    def forward(self, x):\n        return x\n"
+        "```python"
+    )
+    out = extract_code_block(raw)
+
+    assert out != ""
+    assert "class ModelNew" in out
+    ast.parse(out)
+
+
+def test_the_injected_fence_does_not_eat_the_line_it_is_glued_to():
+    # vLLM re-inserts CODE_FENCE with no separator, so it lands on the model's last line:
+    # "        return triton_relu(x)```python". Deleting the marker outright would splice
+    # that line onto the next; trimming the line would lose the return statement.
+    raw = (
+        "## Plan\nplan prose\n\n"
+        "import torch\n\n\nclass ModelNew:\n"
+        "    def forward(self, x):\n        return triton_relu(x)```python"
+    )
+    out = extract_code_block(raw)
+
+    assert "return triton_relu(x)" in out
+    tree = ast.parse(out)
+    model_new = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelNew")
+    assert "forward" in [m.name for m in model_new.body if isinstance(m, ast.FunctionDef)]
+
+
+def test_trailing_commentary_after_the_kernel_is_trimmed_off():
+    # An unfenced answer is code followed by prose. The largest parseable prefix stops at
+    # the prose, which is what makes the salvage return a file rather than a blob.
+    raw = (
+        "## Plan\nprose\n\n"
+        "import torch\n\n\nclass ModelNew:\n    def forward(self, x):\n        return x\n\n"
+        "This kernel fuses the two ops, and should be about 2x faster than eager.\n"
+        "```python"
+    )
+    out = extract_code_block(raw)
+
+    ast.parse(out)
+    assert "class ModelNew" in out
+    assert "should be about 2x faster" not in out
+
+
+def test_a_salvage_without_the_entry_class_is_discarded():
+    # The salvage is gated on ENTRY_CLASS: prose that happens to start with an import must
+    # not be promoted into a "kernel". Degrades to the historical best-effort string.
+    raw = "## Plan\n\nimport torch\n\nThen we would tile the loop, but I am out of budget.\n"
+    out = extract_code_block(raw)
+
+    assert "class ModelNew" not in out
+
+
+def test_an_empty_block_does_not_displace_a_real_one():
+    # The empty block is dropped as a candidate, not treated as the answer, even when it
+    # comes last -- which is exactly the position the ranking prefers.
+    raw = (
+        "```python\nimport torch\n\n\nclass ModelNew:\n    def forward(self, x):\n"
+        "        return x\n```\n\n```python"
+    )
+    out = extract_code_block(raw)
+
+    assert "class ModelNew" in out
+    ast.parse(out)
+
+
+# -- the salvage helper's own edges ----------------------------------------
+
+
+def test_the_salvage_gives_up_when_nothing_leading_parses():
+    # Trimming reaches line 0 without ever parsing. Must return "" rather than loop or
+    # raise -- the caller then falls through to the historical best-effort string.
+    assert _largest_parseable_prefix("def f(:\n    ???\n") == ""
+
+
+def test_the_salvage_rejects_a_source_python_cannot_even_encode():
+    # A lone surrogate makes ast.parse raise UnicodeEncodeError -- a ValueError, not a
+    # SyntaxError, so it carries no lineno to trim at. Detokenized model output really can
+    # contain one, and it must come back as "" rather than escape as an exception.
+    assert _largest_parseable_prefix("import torch\n\udcff\n") == ""
+
+
+def test_the_salvage_gives_up_at_line_zero_rather_than_looping():
+    blob = "\n".join(f"line {i} is prose, not python: <{i}>" for i in range(200))
+    assert _largest_parseable_prefix(blob, max_trims=3) == ""
+
+
+def test_the_salvage_is_bounded_by_its_trim_budget():
+    # Each trim only steps back to the reported error line, so a file whose errors walk
+    # backwards slowly would cost one ast.parse per line. The budget caps that; running
+    # out returns "" and the caller degrades to its historical best effort.
+    src = "x = 1\nx = 2\nx = 3\nx = 4\ndef f(:\n"  # first error is on the last line
+    assert _largest_parseable_prefix(src, max_trims=1) == ""
+    assert _largest_parseable_prefix(src, max_trims=2) == "x = 1\nx = 2\nx = 3\nx = 4"
+
+
+def test_the_trim_jumps_to_the_error_line_rather_than_stepping_one_at_a_time():
+    # The error is on line 3 of 6, so ONE trim must land on line 2 -- not walk back a line
+    # per iteration. Pinned through the budget: a rule that stepped by one, or that
+    # overshot past the error, would need more trims than this allows and return "".
+    src = "x = 1\nx = 2\ndef f(:\nx = 4\nx = 5\nx = 6\n"
+
+    assert _largest_parseable_prefix(src, max_trims=2) == "x = 1\nx = 2"
+    assert _largest_parseable_prefix(src, max_trims=1) == ""
+
+
+def test_the_salvage_can_come_down_to_a_single_line():
+    # Everything after line 1 is prose. The give-up guard must not fire while one good
+    # line is still on the table.
+    src = "import torch\n$$$ not python $$$\n"
+    assert _largest_parseable_prefix(src) == "import torch"
+
+
+def test_the_salvage_keeps_the_code_and_drops_the_prose_that_follows():
+    src = "import torch\n\n\nclass ModelNew:\n    pass\n\nThen we tile the loop.\n"
+    assert _largest_parseable_prefix(src) == "import torch\n\n\nclass ModelNew:\n    pass\n"
+
+
+def test_a_completion_with_no_python_statement_at_all_is_returned_as_is():
+    # No fence, nothing that parses, and no import/def/class to resume at -- the model
+    # answered in pure prose. Best effort is the text itself; the salvage never runs.
+    raw = "I cannot write this kernel: the reduction axis is not known at compile time.\n"
+    assert extract_code_block(raw) == raw.strip()
+
+
+def test_a_fence_glued_mid_line_becomes_a_break_not_a_splice():
+    # Why the no-fence path substitutes a newline rather than deleting the marker. Both
+    # fences here yield no block (a stray closer, then a trailing opener with nothing
+    # after it), so the whole text goes down the fallback. Deleting the markers would
+    # splice "x = 1" onto "y = 2" and the result would not parse.
+    raw = "import torch\nx = 1```\ny = 2```python"
+    out = extract_code_block(raw)
+
+    ast.parse(out)
+    assert "x = 1" in out and "y = 2" in out
+    assert "x = 1y = 2" not in out

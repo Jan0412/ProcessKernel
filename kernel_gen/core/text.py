@@ -57,7 +57,11 @@ def _fenced_blocks(text: str) -> list[str]:
         # a bare ``` outside a block is a stray closer -- ignore it
     if start is not None:  # unterminated final block: the model hit max_tokens mid-answer
         blocks.append(text[start:])
-    return [textwrap.dedent(b).strip() for b in blocks]
+    # Empty blocks are dropped: an empty string is never the model's answer, and one is
+    # manufactured by the two-pass sampler whenever pass 2 returns nothing -- the injected
+    # CODE_FENCE then trails the text with no content after it. `ast.parse("")` succeeds,
+    # so an empty block used to rank as a valid candidate and win (KGEN-9).
+    return [b for b in (textwrap.dedent(b).strip() for b in blocks) if b]
 
 
 def extract_code_block(text: str) -> str:
@@ -77,7 +81,9 @@ def extract_code_block(text: str) -> str:
     3. failing that, the first block -- the historical behaviour, kept so a completion
        where nothing parses degrades exactly as it always did rather than newly
        returning something different;
-    4. and with no fence at all, the text from its first Python statement.
+    4. and with no fence at all, the text from its first Python statement -- falling back
+       to its largest parseable prefix when even that does not parse, but only when the
+       salvage contains :data:`ENTRY_CLASS` (KGEN-9).
 
     Block boundaries come from :func:`_fenced_blocks`, which pairs fences by an open/close
     walk rather than a regex, so three failure modes are handled at the source: a
@@ -106,14 +112,58 @@ def extract_code_block(text: str) -> str:
         submissions = [b for b in parseable if ENTRY_CLASS in b]
         return (submissions or parseable or blocks[:1])[-1]
 
-    stripped = textwrap.dedent(re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip()))
+    # Every fence marker here is noise: no block had any content, so none of them
+    # delimited code. They are replaced by a newline rather than deleted -- the two-pass
+    # seam's injected ```python lands glued to the model's last line ("return f(x)```python"),
+    # and deleting it outright would splice that line onto the next one.
+    stripped = textwrap.dedent(_FENCE_TOKEN.sub("\n", text.strip()))
     if not _parses(stripped):
         head = re.search(r"^[ \t]*(?:import\s|from\s|@|def\s|class\s)", stripped, re.MULTILINE)
         if head:
             candidate = textwrap.dedent(stripped[head.start():]).strip()
             if _parses(candidate):
                 return candidate
+            salvage = _largest_parseable_prefix(candidate)
+            if ENTRY_CLASS in salvage:
+                return salvage
     return stripped.strip()
+
+
+def _largest_parseable_prefix(src: str, max_trims: int = 60) -> str:
+    """The longest leading run of ``src`` that parses, found by trimming at each error.
+
+    Only ever reached when the whole unfenced text fails to parse, i.e. where the caller
+    would otherwise return something it already knows is not Python. A model that writes
+    its kernel as unfenced prose-with-code leaves a complete ``ModelNew`` followed by
+    commentary; ``SyntaxError.lineno`` points at the first line that is not code, so
+    trimming there and retrying converges on the code. The caller keeps the result only
+    when it contains :data:`ENTRY_CLASS`, so a salvage that finds no submission is
+    discarded rather than shipped.
+
+    **Deliberately not applied to fenced blocks.** Ranking a salvaged submission above a
+    complete non-submission block looks like the KGEN-1 principle, and on the 10,510-trace
+    corpus it "recovers" 5 more. Four of those five are worse than what they replace: a
+    block truncated mid-``ModelNew`` salvages to a class with ``__init__`` but no
+    ``forward`` (instantiable, not callable), and one to a 299-char stub with no imports at
+    all. Eval scores those zero either way, but they read as submissions. A truncated block
+    is a model failure; only the *unfenced* case is ours.
+    """
+    lines = src.splitlines()
+    hi = len(lines)
+    for _ in range(max_trims):
+        if hi <= 0:  # guards the slice below: a negative hi would trim from the FRONT
+            return ""
+        candidate = "\n".join(lines[:hi])
+        try:
+            ast.parse(candidate)
+            return candidate
+        except SyntaxError as exc:
+            # Jump to just before the offending line, and never fewer than one line, so
+            # `hi` strictly decreases whatever the parser reports.
+            hi = min(exc.lineno or hi, hi) - 1
+        except ValueError:
+            return ""  # e.g. a lone surrogate: UnicodeEncodeError, and no lineno to use
+    return ""
 
 
 def parse_int_spec(spec: str) -> list[int]:
