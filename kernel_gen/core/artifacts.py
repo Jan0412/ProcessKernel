@@ -196,6 +196,12 @@ def write_traces(
             # NEXT round's prompt; `findings` is the same verdict structured, with a lineno
             # per entry. Both kept: the text is what the model sees, the structure is what a
             # reward model reads.
+            #
+            # Each lineno is 1-based into `extract_code_block(raw)` -- the string the critic
+            # was handed -- NOT into `raw`, and NOT into raw sliced at `code_char_start`.
+            # That slice keeps the newline after the fence, the closing fence and any
+            # trailing prose, so it is off by at least one line and for a single-pass run
+            # is the whole completion. Resolve a lineno by re-extracting.
             "feedback": attempt.review.text if attempt.review else "",
             "findings": attempt.review.findings if attempt.review else [],
             "trace": None,

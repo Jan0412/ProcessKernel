@@ -40,6 +40,7 @@ sys.path.insert(0, REPO_ROOT)
 import numpy as np  # noqa: E402
 
 from kernel_gen.core import artifacts  # noqa: E402
+from kernel_gen.core.text import extract_code_block  # noqa: E402
 from kernel_gen.core.trace import (  # noqa: E402
     SEG_CODE,
     SEG_PLAN,
@@ -166,9 +167,13 @@ def inspect(run_dir: str, record: dict, round_index: int, n_tokens: int) -> None
         print("  (a gap here is prose vs code, not temperature -- see the calibration check)")
 
     # -- the join that credit assignment needs -------------------------------
+    # linenos are 1-based into extract_code_block(raw) -- the string the linter was handed
+    # -- NOT into raw sliced at code_char_start. That slice keeps the leading newline after
+    # the fence, the closing fence and any trailing prose, and for a single pass it is the
+    # whole completion including the plan. Measured on real traces, it put 479 of 480
+    # findings on the wrong line, several onto reasoning prose rather than code.
     print(f"\nfindings ({len(record['findings'])}):")
-    code = record["raw"][meta.get("code_char_start", 0) :]
-    code_lines = code.splitlines()
+    code_lines = extract_code_block(record["raw"]).splitlines()
     for finding in record["findings"]:
         lineno = finding.get("data", {}).get("lineno")
         source = code_lines[lineno - 1].strip() if lineno and lineno <= len(code_lines) else ""

@@ -17,6 +17,7 @@ from kernel_gen.core import artifacts
 from kernel_gen.core.backend import FakeBackend
 from kernel_gen.core.model import Attempt, Problem, Review, Trajectory
 from kernel_gen.core.sampling import CODE_FENCE, SamplingSpec, generate_batch_traced
+from kernel_gen.core.text import extract_code_block
 
 PLAN = "launch the kernel, do not fall back to torch\n"
 CODE = "\nimport torch\n\n\nclass ModelNew:\n    pass\n```\n"
@@ -88,6 +89,27 @@ def test_inspecting_an_attempt_prints_the_seam_the_findings_and_the_frame(run_di
     assert "plan finished on 'stop'" in out
     assert "F1.2" in out and "line 5" in out  # the finding, joined by its line number
     assert "deepconf" in out and "tail" in out
+
+
+def test_a_finding_resolves_to_the_source_line_the_linter_actually_meant(run_dir, capsys):
+    # The join this whole module exists to demonstrate, and the half the assertion above
+    # cannot see: it pins that the finding is PRINTED with its number, not that the source
+    # shown next to it is the right line.
+    #
+    # linenos are 1-based into extract_code_block(raw). Slicing raw at code_char_start
+    # instead keeps the newline after the fence, the closing fence and any trailing prose,
+    # so every line comes out shifted -- on real traces, 479 of 480 findings landed on the
+    # wrong line and several onto reasoning prose rather than code.
+    record = inspect_trace.load_records(run_dir, 0)[0]
+    code_lines = extract_code_block(record["raw"]).splitlines()
+    expected = code_lines[FINDING["data"]["lineno"] - 1].strip()
+    assert expected == "pass"  # the fixture's line 5, stated so the test is readable
+
+    inspect_trace.inspect(run_dir, record, 0, n_tokens=5)
+    finding_line = next(
+        line for line in capsys.readouterr().out.splitlines() if "F1.2" in line and "line 5" in line
+    )
+    assert finding_line.rstrip().endswith(f"| {expected}")
 
 
 def test_the_summary_reports_how_many_plans_were_cut_off(run_dir, capsys):
