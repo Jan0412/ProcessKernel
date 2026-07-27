@@ -415,7 +415,11 @@ def _fake_tokens(
     rows = []
     for chunk, sampled_id in zip(chunks, token_ids):
         seed = zlib.crc32(chunk.encode())
-        alternatives = [((seed + 7919 * j) % FAKE_VOCAB, -0.1 - 0.7 * j) for j in range(k)]
+        # j + 1, not j: at j == 0 alternatives[0] WAS the sampled id at the top logprob, so
+        # every token came back at rank 1 and the ragged case below never actually fired.
+        alternatives = [
+            ((seed + 7919 * (j + 1)) % FAKE_VOCAB, -0.1 - 0.7 * j) for j in range(k)
+        ]
         # seed % (k + 1) == k is the "sampled token fell outside the top-K" case, which
         # is the one that makes rows ragged and the sampled logprob unrecoverable from
         # the truncated array -- so the fake produces it about one token in K+1.

@@ -97,6 +97,45 @@ def test_a_ragged_row_still_packs_rectangularly_with_its_sample_recorded():
     assert (trace.sampled_lp < 0).all()
 
 
+def test_the_sampled_token_does_not_always_come_back_as_the_argmax():
+    # The fixture's reason to exist. Its alternatives used to be generated as
+    # (seed + 7919*j) with j starting at 0, so alternatives[0] WAS the sampled id at the
+    # highest logprob -- the sampled token sat at rank 1 of every row, and the ranks below
+    # could never be produced. Every assertion about sampled_rank, and about surprisal
+    # differing from -top1_lp, then passed through that duplicate rather than through the
+    # code it names.
+    k = 4
+    out = _model().complete_traced(["x"], temperature=1.0, max_tokens=64, logprobs=k)[0]
+    trace = pack(out.token_ids, out.topk, k=k)
+
+    ranks = set(trace.sampled_rank.tolist())
+    assert len(ranks) > 1, f"every token came back at the same rank: {ranks}"
+    assert any(rank > k for rank in ranks), (
+        f"no token ranked outside the top-{k}, so truncation never dropped a sampled "
+        f"entry and the ragged path is untested: {sorted(ranks)}"
+    )
+    # A row holds K distinct alternatives -- never the sampled id twice at two logprobs,
+    # which is not a distribution any model could produce.
+    for row in out.topk:
+        ids = [token_id for token_id, _ in row]
+        assert len(ids) == len(set(ids)), f"duplicate id in a logprob row: {row}"
+
+
+def test_a_sample_outside_the_top_k_keeps_its_logprob_past_truncation():
+    # The information-preservation claim pack() makes about ragged rows: the sampled
+    # logprob and rank are read off BEFORE the row is cut to K, so the entry truncation
+    # drops costs nothing. Only reachable now that the fixture can rank a sample outside K.
+    k = 4
+    out = _model().complete_traced(["x"], temperature=1.0, max_tokens=64, logprobs=k)[0]
+    trace = pack(out.token_ids, out.topk, k=k)
+
+    outside = [t for t, rank in enumerate(trace.sampled_rank.tolist()) if rank > k]
+    assert outside, "the fixture produced no sample outside the top-K"
+    for t in outside:
+        assert trace.sampled_lp[t] < 0  # recorded
+        assert trace.token_ids[t] not in trace.topk_ids[t].tolist()  # yet truncated away
+
+
 def test_the_fake_is_deterministic_so_fixtures_do_not_drift():
     first = _model().complete_traced(["x"], temperature=1.0, max_tokens=64, logprobs=4)[0]
     second = _model().complete_traced(["x"], temperature=1.0, max_tokens=64, logprobs=4)[0]
