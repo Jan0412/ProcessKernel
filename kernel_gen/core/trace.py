@@ -256,14 +256,22 @@ def summarize(scalars: dict[str, np.ndarray], window: int = 512) -> dict[str, fl
 
     ``window`` defaults well below DeepConf's 2048, which was tuned on math traces: a
     plan here is 300-800 tokens, and a 2048-wide window would average it away entirely.
+
+    Taken over the finite entries only: ``top1_lp`` is ``-inf`` for a token whose row held
+    no alternatives, and one such token would drag the whole record's mean to ``-inf``. A
+    name with nothing finite is dropped rather than faked to 0.0 (which reads as p=1).
     """
     out: dict[str, float] = {}
     for name, values in scalars.items():
-        if values.size:
-            out[f"mean_{name}"] = float(values.mean())
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            out[f"mean_{name}"] = float(finite.mean())
 
     conf = scalars.get("deepconf_c")
-    if conf is None or conf.size == 0:
+    if conf is None:
+        return out
+    conf = conf[np.isfinite(conf)]  # also collapses an already-empty array
+    if conf.size == 0:
         return out
 
     groups = _sliding_mean(conf, window)

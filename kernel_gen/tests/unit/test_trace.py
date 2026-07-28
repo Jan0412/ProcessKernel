@@ -8,6 +8,7 @@ values, and the first symptom would be a PRM that trains and does not work.
 
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
@@ -303,6 +304,50 @@ def test_summarize_handles_a_trace_shorter_than_the_window():
 
 def test_summarize_of_an_empty_trace_is_empty_not_an_exception():
     assert summarize({"deepconf_c": np.array([], dtype=np.float32)}) == {}
+
+
+def test_one_token_with_no_alternatives_does_not_poison_the_whole_summary():
+    # top1_lp is -inf for a row that held no logprobs at all (_topk yields an empty row
+    # for a position vLLM returned as None). The per-token array says so honestly, but a
+    # plain mean does not: one such token in a 100-token trace used to drag mean_top1_lp
+    # to -inf, destroying the record's summary and writing -Infinity into attempts.jsonl.
+    rows = [[(i * 3 + j, -0.1 - 0.5 * j) for j in range(5)] for i in range(100)]
+    rows[42] = []
+    ids = [row[0][0] if row else 999 for row in rows]
+
+    scalars = derive_scalars(pack(ids, rows, k=5).topk_lp, vocab_size=VOCAB)
+    stats = summarize(scalars, window=32)
+
+    assert not np.isfinite(scalars["top1_lp"]).all()  # the array stays honest
+    for name, value in stats.items():
+        assert math.isfinite(value), f"{name} is {value}"
+    # …and the record it lands in is plain JSON, with no -Infinity/NaN token in it.
+    assert json.loads(json.dumps(stats)) == stats
+    assert "Infinity" not in json.dumps(stats) and "NaN" not in json.dumps(stats)
+
+
+def test_summarize_without_deepconf_still_reports_the_means_it_has():
+    # The window statistics are all derived from deepconf_c; the per-name means are not.
+    stats = summarize({"entropy": np.array([1.0, 3.0], dtype=np.float32)})
+    assert stats == {"mean_entropy": 2.0}
+
+
+def test_a_confidence_array_with_nothing_finite_yields_no_window_statistics():
+    # derive_scalars cannot produce this -- deepconf_c is finite by construction -- but
+    # summarize is public and takes the dict it is given. The window statistics are means
+    # and a min over `conf`; with nothing finite left there is no honest number to report,
+    # and _sliding_mean over an empty array would raise on groups.min().
+    assert summarize({"deepconf_c": np.array([np.inf, -np.inf], dtype=np.float32)}) == {}
+
+
+def test_a_scalar_that_is_never_finite_is_omitted_rather_than_faked():
+    # No alternatives anywhere -- an untraced backend. A zero would read as "logprob 0",
+    # i.e. probability 1, which is the most confident claim there is.
+    scalars = derive_scalars(pack([1, 2, 3], None, k=20).topk_lp, vocab_size=VOCAB)
+    stats = summarize(scalars)
+
+    assert "mean_top1_lp" not in stats
+    assert all(math.isfinite(v) for v in stats.values())
 
 
 # ------------------------------------------------------------------------ round trip
