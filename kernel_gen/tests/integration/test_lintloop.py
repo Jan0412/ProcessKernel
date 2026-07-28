@@ -271,6 +271,84 @@ def test_a_resumed_run_dir_holds_every_slot_not_just_the_ones_it_ran(tmp_path, m
     assert len(flat_kernels(out)) == 4
 
 
+# -- --ref-dir: the staged bytes are the ones the model is asked about ------
+#
+# Everything else here monkeypatches load_problems away, so deleting `ref_dir=args.ref_dir`
+# from main() left the whole suite green. These drive the real loader against a staged dir.
+
+
+def _stage_level_dir(tmp_path, marker: str, problem_id: int = 19) -> str:
+    level = tmp_path / "level6"
+    level.mkdir()
+    (level / f"{problem_id}_ReLU.py").write_text(
+        MARKED_REF.format(marker=marker), encoding="utf-8"
+    )
+    return str(level)
+
+
+def test_ref_dir_puts_the_staged_bytes_in_the_prompt(tmp_path, monkeypatch):
+    # The property, not the call signature: what the model is asked about must be the file
+    # on disk. The KernelBench prompt constructor embeds ref_arch_src verbatim, so a marker
+    # in the staged source is observable in the prompt the backend received.
+    from kernel_gen.arms import lintloop
+    from kernel_gen.core import backend as backend_module
+
+    ref_dir = _stage_level_dir(tmp_path, "STAGED-AND-SCALED")
+    out = str(tmp_path / "runs" / "kb6_run")
+    backend = FakeBackend(default=HONEST)
+
+    monkeypatch.setattr(backend_module, "VLLMBackend", lambda *a, **k: backend)
+    monkeypatch.setattr(sys, "argv", [
+        "lintloop", "--model", "fake", "--dataset", "kernelbook", "--level", "6",
+        "--ref-dir", ref_dir, "--problems", "19", "--num-samples", "1",
+        "--rounds", "1", "--think-temperature", "0", "--output-dir", out,
+    ])
+    lintloop.main()
+
+    assert backend.batches, "no prompt was ever built"
+    assert "STAGED-AND-SCALED" in backend.batches[0][0], (
+        "the prompt does not carry the staged reference -- --ref-dir was ignored and the "
+        "row was re-converted in-process"
+    )
+
+
+def test_ref_dir_selects_by_the_staged_id_and_is_recorded_in_the_config(tmp_path, monkeypatch):
+    # What this pins: the run dir is keyed on the staged filename's prefix, and the config
+    # records ref_dir (a reader cannot otherwise tell which reference a run was prompted
+    # from) while --dataset still drives the level -> pseudo_level rename.
+    #
+    # What it deliberately does NOT claim: that it detects a lost --ref-dir. For KernelBook
+    # the staged id IS the dataset row index -- that is the whole reason --problems shards
+    # the same way with or without the flag -- so no filename can tell the two loaders
+    # apart. Only the reference's *content* can, which is what the test above checks.
+    from kernel_gen.arms import lintloop
+    from kernel_gen.core import backend as backend_module
+
+    ref_dir = _stage_level_dir(tmp_path, "ONLY-THIS-ROW", problem_id=10001)
+    out = str(tmp_path / "runs" / "kb6_run")
+    backend = FakeBackend(default=HONEST)
+
+    monkeypatch.setattr(backend_module, "VLLMBackend", lambda *a, **k: backend)
+    monkeypatch.setattr(sys, "argv", [
+        "lintloop", "--model", "fake", "--dataset", "kernelbook", "--level", "6",
+        "--ref-dir", ref_dir, "--problems", "10001", "--num-samples", "1",
+        "--rounds", "1", "--think-temperature", "0", "--output-dir", out,
+    ])
+    lintloop.main()
+
+    config = _read_config(os.path.join(out, "generation_config.yaml"))
+    assert config["ref_dir"] == ref_dir
+    assert config["pseudo_level"] == 6  # --dataset still drives the rename
+    assert flat_kernels(out) == ["level_6_problem_10001_sample_0_kernel.py"]
+
+
+def _read_config(path: str) -> dict:
+    import yaml
+
+    with open(path) as fh:
+        return yaml.safe_load(fh)
+
+
 def test_round_dirs_stay_invisible_to_the_non_recursive_eval_glob(tmp_path):
     backend = FakeBackend(rules=[(REPAIR_MARKER, HONEST)], default=CHEATING)
     trajs = run(backend, str(tmp_path), num_samples=2)

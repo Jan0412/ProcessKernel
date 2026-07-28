@@ -87,3 +87,38 @@ def test_sampling_defaults_match_the_documented_values():
 def test_level_is_required():
     with pytest.raises(SystemExit):
         _full_parser().parse_args(["--model", "m"])
+
+
+def test_ref_dir_defaults_to_none_and_stays_a_scalar_path():
+    # A path is one string, so it honours the flat-scalar contract above. Default None
+    # keeps the HF loaders as the unchanged default for runs that do not stage a dir.
+    assert _parse(["--model", "m", "--level", "1"]).ref_dir is None
+    args = _parse(["--model", "m", "--level", "6", "--ref-dir", "KernelBench/level6"])
+    assert args.ref_dir == "KernelBench/level6"
+    assert isinstance(args.ref_dir, str)
+
+
+def test_the_problems_help_says_the_unit_changes_under_ref_dir():
+    # --problems means dataset INDICES for the HF loaders and problem IDS under --ref-dir
+    # (load_local_problems keys `index.get(problem_id)`). For KernelBench level 1 those
+    # differ: index 1 is problem 10. The help used to assert "NOT problem ids" flatly,
+    # which is exactly wrong for the --ref-dir path. The string IS the artifact here.
+    # argparse hard-wraps, so compare against the collapsed text a reader sees.
+    help_text = " ".join(_full_parser().format_help().split())
+
+    assert "UNDER --ref-dir these are problem ids" in help_text
+    assert "WITHOUT it they are dataset indices" in help_text
+    assert "NOT problem ids" not in help_text  # the flat claim that was wrong
+
+
+def test_ref_dir_does_not_become_a_third_dataset_choice():
+    # --dataset also decides level vs pseudo_level in the written config, which a staged
+    # dir cannot answer (level6 is a pseudo-level, level1 is not). Keeping them separate
+    # flags is the point; a "local" dataset value must stay rejected.
+    with pytest.raises(SystemExit):
+        _full_parser().parse_args(["--model", "m", "--level", "6", "--dataset", "local"])
+
+    args = _parse(["--model", "m", "--level", "6", "--dataset", "kernelbook",
+                   "--ref-dir", "KernelBench/level6"])
+    assert args.dataset == "kernelbook"  # still drives the pseudo_level rename
+    assert args.ref_dir == "KernelBench/level6"

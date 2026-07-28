@@ -42,16 +42,31 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
         "--problems",
         "--rows",  # KernelBook is addressed by row index; same dest, same meaning
         default=None,
-        help="Dataset indices: '23', '1-49' or '1,5,10'. NOT problem ids -- the "
-             "KernelBench split is ordered lexicographically, so index 1 is problem 10. "
-             "Omit for --all.",
+        help="Which problems to run: '23', '1-49' or '1,5,10'. UNDER --ref-dir these are "
+             "problem ids (the staged filename's prefix). WITHOUT it they are dataset "
+             "indices -- the KernelBench split is ordered lexicographically, so index 1 "
+             "is problem 10. Omit for --all.",
     )
     parser.add_argument("--all", action="store_true", help="Every problem/row in the split")
+    # NOT a third --dataset choice. --dataset also decides whether the config records
+    # `level` or `pseudo_level` (artifacts.write_config), and a staged dir cannot answer
+    # that -- KernelBench/level6 is a pseudo-level, KernelBench/level1 is not. So the
+    # reference source is its own flag and --dataset keeps meaning what it means.
+    parser.add_argument(
+        "--ref-dir",
+        default=None,
+        help="Read references from a staged level dir (e.g. KernelBench/level6) instead "
+             "of converting dataset rows in-process. This is what eval scores, so it "
+             "makes the prompt, the linter's shapes and the eval reference the same "
+             "bytes; converting again here reproduces the row UNSCALED and silently "
+             "disagrees with a dir staged by convert_kernelbook.py --scale.",
+    )
     parser.add_argument(
         "--max-src-chars",
         type=int,
         default=24000,
-        help="KernelBook only: skip rows whose python_code is longer than this",
+        help="Skip references longer than this. Applied to KernelBook's raw python_code "
+             "before conversion, or to the staged file itself under --ref-dir",
     )
 
 

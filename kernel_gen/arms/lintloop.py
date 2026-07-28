@@ -46,9 +46,13 @@ Examples:
     uv run python -m kernel_gen.arms.lintloop --model Qwen/Qwen3.6-27B \\
         --level 1 --all --rounds 3 --num-samples 10 --trace
 
-    # KernelBook, same loop, pseudo-level 5
+    # KernelBook, same loop, pseudo-level 6. --ref-dir is not optional in practice: it
+    # points the prompt at the same staged files eval scores. Without it the row is
+    # re-converted here UNSCALED, and the model is asked about a 4x4 problem it will be
+    # graded on at 2048x2048. See core/sources.py.
     uv run python -m kernel_gen.arms.lintloop --model Qwen/Qwen3-Coder-30B-A3B-Instruct \\
-        --dataset kernelbook --level 5 --rows 0-499 --rounds 3
+        --dataset kernelbook --level 6 --ref-dir KernelBench/level6 \\
+        --rows 0-499 --rounds 3
 
     # No GPU: render round 0's prompt and exit
     uv run python -m kernel_gen.arms.lintloop --model x --level 1 --problems 0 --dry-run
@@ -172,6 +176,7 @@ def main() -> None:
 
     problems = load_problems(
         args.dataset,
+        ref_dir=args.ref_dir,
         dataset_name=args.dataset_name,
         level=args.level,
         spec=args.problems,
@@ -202,10 +207,10 @@ def main() -> None:
     )
     print_generation_summary(
         config,
-        keys=["model", "arm", "dataset", "dataset_name", "level", "num_problems",
-              "num_slots", "num_samples", "rounds", "feedback_policy", "lint_checks",
-              "temperature", "think_temperature", "max_new_tokens", "max_model_len",
-              "trace", "trace_topk", "output_dir"],
+        keys=["model", "arm", "dataset", "dataset_name", "ref_dir", "level",
+              "num_problems", "num_slots", "num_samples", "rounds", "feedback_policy",
+              "lint_checks", "temperature", "think_temperature", "max_new_tokens",
+              "max_model_len", "trace", "trace_topk", "output_dir"],
         title="Lint-feedback loop (A5)",
     )
 
