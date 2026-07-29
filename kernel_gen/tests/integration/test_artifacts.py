@@ -225,6 +225,49 @@ def test_a_second_round_appends_rather_than_truncating(tmp_path):
     assert len(_records(out)) == 2
 
 
+# ------------------------------------------------------------ the name eval resolves
+
+
+def test_eval_run_name_is_the_path_below_runs_not_the_basename():
+    # eval takes RUN_NAME relative to runs/ and resolves runs/$RUN_NAME. A sharded array
+    # run lives one level deeper, so basename would name a directory that does not exist
+    # -- for every task of the array.
+    assert artifacts.eval_run_name("/x/KernelBench/runs/model_kb6_lintloop") == "model_kb6_lintloop"
+    assert (
+        artifacts.eval_run_name("/x/KernelBench/runs/model_kb6_lintloop/shard_07")
+        == "model_kb6_lintloop/shard_07"
+    )
+    assert (
+        artifacts.eval_run_name("/x/runs/model_kb6_lintloop/rounds/round_0")
+        == "model_kb6_lintloop/rounds/round_0"
+    )
+
+
+def test_eval_run_name_normalises_trailing_slashes_and_dot_segments():
+    assert artifacts.eval_run_name("/x/runs/a_run/") == "a_run"
+    assert artifacts.eval_run_name("/x/runs/a_run/shard_00/") == "a_run/shard_00"
+    assert artifacts.eval_run_name("/x/runs/a_run/./shard_00") == "a_run/shard_00"
+
+
+def test_eval_run_name_takes_the_last_runs_component():
+    # The repo nests one (KernelBench/runs/…), and a checkout could itself sit under a
+    # directory called runs. The innermost one is the one eval is relative to.
+    assert artifacts.eval_run_name("/runs/checkout/runs/a_run/shard_01") == "a_run/shard_01"
+
+
+def test_eval_run_name_falls_back_to_the_basename_without_a_runs_component():
+    # An ad-hoc --output-dir must still print something usable rather than raising.
+    assert artifacts.eval_run_name("/tmp/scratch/my_run") == "my_run"
+    assert artifacts.eval_run_name("/tmp/scratch/runs") == "runs"
+
+
+# ------------------------------------------------------- contract 4: prune on resume
+#
+# write_traces appends and write_trace overwrites (the two tests above pin exactly that),
+# so "one record per (round, stem), describing its own arrays" is not a property of the
+# writers. prune_traces is what makes it hold across a resume.
+
+
 def test_prune_traces_drops_the_records_and_arrays_of_slots_being_regenerated(tmp_path):
     out = str(tmp_path)
     artifacts.write_traces(out, [_slot(out)], 0)

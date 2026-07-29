@@ -34,6 +34,7 @@ import os
 import statistics
 from collections import Counter
 
+from kernel_gen.core.artifacts import eval_run_name
 from triton_lint.runs import iter_samples, speedup
 
 
@@ -245,13 +246,18 @@ def main() -> None:
 
     baseline_dir = args.baseline_dir or os.path.join(args.run_dir, "rounds", "round_0")
 
+    # RUN_NAME is relative to runs/, so a sharded run needs <run>/shard_NN, not shard_NN.
+    run_name = eval_run_name(args.run_dir)
     for path in (args.run_dir, baseline_dir):
         if not os.path.exists(os.path.join(path, "eval_results.json")):
             raise SystemExit(
                 f"No eval_results.json in {path}.\n"
                 f"Evaluate both halves first -- this script reads, it does not measure:\n"
-                f"  uv run python -m autotune.eval_run --run-dir {args.run_dir}\n"
-                f"  uv run python -m autotune.eval_run --run-dir {baseline_dir}"
+                f"  cd /path/to/workdir/KernelBench && sbatch --export=ALL,"
+                f"RUN_NAME={run_name} slum_scripts/eval_from_generations.sh\n"
+                f"  cd /path/to/workdir/KernelBench && sbatch --export=ALL,"
+                f"RUN_NAME={run_name}/rounds/round_0 "
+                f"slum_scripts/eval_from_generations.sh"
             )
 
     refined = load_slots(args.run_dir)

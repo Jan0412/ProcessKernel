@@ -49,6 +49,18 @@ def round_dir(out_dir: str, round_index: int) -> str:
     return os.path.join(out_dir, "rounds", f"round_{round_index}")
 
 
+def eval_run_name(out_dir: str) -> str:
+    """The name eval resolves as ``runs/<name>``. NOT basename: a sharded run is
+    ``runs/<run>/shard_07``, two levels deep. Last ``runs`` wins; falls back to basename.
+    """
+    parts = os.path.normpath(os.path.abspath(out_dir)).split(os.sep)
+    if "runs" in parts:
+        tail = parts[len(parts) - 1 - parts[::-1].index("runs") + 1 :]
+        if tail:
+            return "/".join(tail)
+    return os.path.basename(os.path.normpath(out_dir))
+
+
 def trace_dir(out_dir: str, round_index: int) -> str:
     return os.path.join(out_dir, "traces", f"round_{round_index}")
 

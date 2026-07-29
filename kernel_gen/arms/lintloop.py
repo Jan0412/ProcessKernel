@@ -200,7 +200,9 @@ def main() -> None:
 
     config = dict(vars(args))
     config.update(
-        run_name=os.path.basename(os.path.normpath(out_dir)),
+        # Shard-qualified: runs.py stamps this onto every SampleRef, and four shards all
+        # called "shard_0N" would be indistinguishable once pooled.
+        run_name=artifacts.eval_run_name(out_dir),
         num_problems=len(problems),
         num_slots=len(slots),
         arm="lintloop",
@@ -339,11 +341,11 @@ def main() -> None:
     )
 
     n_written = artifacts.write_kernels(out_dir, trajectories)
-    report(trajectories, n_written, args.rounds, out_dir)
+    report(trajectories, n_written, args.rounds, out_dir, args.level)
 
 
 def report(
-    trajectories: list[Trajectory], n_written: int, rounds: int, out_dir: str
+    trajectories: list[Trajectory], n_written: int, rounds: int, out_dir: str, level: int
 ) -> None:
     print("\n" + "=" * 60)
     print(f"  Wrote {n_written} kernels to {out_dir}")
@@ -358,8 +360,12 @@ def report(
 
     print("-" * 60)
     print("  Next, and this is where the actual result lives:")
-    print(f"    uv run python -m autotune.eval_run --run-dir {out_dir}")
-    print(f"    uv run python -m autotune.eval_run --run-dir {out_dir}/rounds/round_0")
+    run_name = artifacts.eval_run_name(out_dir)
+    print(f"    cd /path/to/workdir/KernelBench")
+    print(f"    sbatch --export=ALL,RUN_NAME={run_name},LEVEL={level} "
+          f"slum_scripts/eval_from_generations.sh")
+    print(f"    sbatch --export=ALL,RUN_NAME={run_name}/rounds/round_0,LEVEL={level} "
+          f"slum_scripts/eval_from_generations.sh")
     print("=" * 60)
 
 
