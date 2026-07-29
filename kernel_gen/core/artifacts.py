@@ -20,6 +20,11 @@ that wrote both keys would report level 5 on a KernelBench run at level 1, and e
 downstream filename lookup would be built against files that do not exist. Hence
 :func:`write_config` emits exactly one of the two.
 
+**4. One trace record per ``(round, stem)``, describing its own arrays.**
+:func:`write_traces` appends while :func:`~.trace.write_trace` overwrites, so a slot
+generated twice leaves the first record pointing at the second's tokens.
+:func:`prune_traces` drops the stale half before the round runs.
+
 **Traces obey contract 1 by living outside its reach.** Everything the trace writer
 produces goes under ``traces/``, never flat and never in ``rounds/``. That is not
 tidiness: ``scan.py``'s docstring records that a run folder already holds 140k-175k
@@ -221,6 +226,49 @@ def write_traces(
 
     append_jsonl(os.path.join(target, "attempts.jsonl"), records)
     return written
+
+
+def prune_traces(out_dir: str, stems: set[str]) -> int:
+    """Drop every record and ``.npz`` for ``stems``, enforcing contract 4 before a rerun.
+
+    Keyed on the slots about to run, not on ``--skip-existing``: re-running a traced run
+    without that flag regenerates everything. Returns the number of records dropped.
+    """
+    traces_root = os.path.join(out_dir, "traces")
+    if not stems or not os.path.isdir(traces_root):
+        return 0
+
+    dropped = 0
+    for entry in sorted(os.scandir(traces_root), key=lambda e: e.name):
+        if not entry.is_dir() or not entry.name.startswith("round_"):
+            continue
+        journal = os.path.join(entry.path, "attempts.jsonl")
+        stale_files = {f"{stem}.npz" for stem in stems}
+
+        if os.path.exists(journal):
+            kept = []
+            for record in read_jsonl(journal):
+                if record.get("stem") not in stems:
+                    kept.append(record)
+                    continue
+                dropped += 1
+                if record.get("trace"):  # the name that record claims, not the default
+                    stale_files.add(record["trace"]["file"])
+            # Via a temp file: a crash mid-prune must not truncate the journal.
+            tmp = journal + ".tmp"
+            with open(tmp, "w") as fh:
+                for record in kept:
+                    fh.write(json.dumps(record) + "\n")
+            os.replace(tmp, journal)
+
+        # Unconditional, not only for dropped records: write_traces writes each .npz in its
+        # loop and appends the journal at the end, so a crash between leaves orphans.
+        for name in stale_files:
+            path = os.path.join(entry.path, name)
+            if os.path.exists(path):
+                os.unlink(path)
+
+    return dropped
 
 
 def append_jsonl(path: str, records: list[dict]) -> None:

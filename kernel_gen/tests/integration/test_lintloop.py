@@ -11,10 +11,11 @@ from __future__ import annotations
 import os
 import sys
 
+import numpy as np
 import pytest
 
 from kernel_gen.core import artifacts
-from kernel_gen.core.backend import FakeBackend
+from kernel_gen.core.backend import FakeBackend, _fake_tokens
 from kernel_gen.core.critics import lint_critic
 from kernel_gen.core.engine import run_rounds
 from kernel_gen.core.model import Problem
@@ -463,6 +464,38 @@ def test_traces_are_journaled_per_round_so_a_crash_keeps_what_finished(tmp_path,
     # The process died in round 1, but round 0's four traces survived it.
     assert len(_npz(out, 0)) == 4
     assert not os.path.exists(artifacts.trace_dir(out, 1))
+
+
+def test_a_resumed_slot_does_not_leave_a_stale_record_pointing_at_the_new_arrays(
+    tmp_path, monkeypatch
+):
+    # The two halves exist separately above -- one resumes without --trace, the other
+    # traces without resuming -- and the bug lives exactly where they cross.
+    out = str(tmp_path)
+    with pytest.raises(RuntimeError, match="unspecified launch failure"):
+        drive_main(monkeypatch, out, CrashingBackend(rules=CRASH_RULES),
+                   skip_existing=False, extra=["--trace", "--trace-topk", "4"])
+
+    drive_main(monkeypatch, out, FakeBackend(rules=[(REPAIR_MARKER, HONEST)] + CRASH_RULES),
+               skip_existing=True, extra=["--trace", "--trace-topk", "4"])
+
+    for round_index in (0, 1, 2):
+        directory = artifacts.trace_dir(out, round_index)
+        if not os.path.exists(directory):
+            continue
+        records = artifacts.read_jsonl(os.path.join(directory, "attempts.jsonl"))
+        stems = [r["stem"] for r in records]
+        assert len(stems) == len(set(stems)), f"round {round_index} journalled a stem twice"
+
+        # …and every record describes the arrays it names: the fake tokenizer is
+        # deterministic, so the record's own completion must reproduce the npz.
+        for record in records:
+            expected, _ = _fake_tokens(record["raw"], 4)
+            with np.load(os.path.join(directory, record["trace"]["file"])) as data:
+                assert data["token_ids"].tolist() == expected, (
+                    f"round {round_index} {record['stem']}: the record's completion is not "
+                    f"the one these arrays came from"
+                )
 
 
 def test_a_dirty_attempt_is_traced_even_though_it_is_never_journaled(tmp_path, monkeypatch):

@@ -225,6 +225,102 @@ def test_a_second_round_appends_rather_than_truncating(tmp_path):
     assert len(_records(out)) == 2
 
 
+def test_prune_traces_drops_the_records_and_arrays_of_slots_being_regenerated(tmp_path):
+    out = str(tmp_path)
+    artifacts.write_traces(out, [_slot(out)], 0)
+    assert os.path.exists(os.path.join(artifacts.trace_dir(out, 0), f"{STEM}.npz"))
+
+    assert artifacts.prune_traces(out, {STEM}) == 1
+
+    assert _records(out) == []
+    assert not os.path.exists(os.path.join(artifacts.trace_dir(out, 0), f"{STEM}.npz"))
+
+
+def test_prune_traces_leaves_every_other_slot_untouched(tmp_path):
+    out = str(tmp_path)
+    artifacts.write_traces(out, [_slot(out)], 0)
+
+    assert artifacts.prune_traces(out, {"level_1_problem_999_sample_0_kernel"}) == 0
+
+    record = _records(out)[0]
+    assert record["stem"] == STEM
+    assert os.path.exists(os.path.join(artifacts.trace_dir(out, 0), record["trace"]["file"]))
+
+
+def test_prune_traces_reaches_every_round_not_only_round_0(tmp_path):
+    # A resumed slot re-runs from round 0 and may reach round 2 again, so a stale record
+    # in ANY round dir would be re-paired with new arrays.
+    out = str(tmp_path)
+    for round_index in (0, 1, 2):
+        traj = _slot(out)
+        traj.attempts[0].round = round_index  # write_traces selects the attempt by round
+        artifacts.write_traces(out, [traj], round_index)
+
+    assert artifacts.prune_traces(out, {STEM}) == 3
+
+    for round_index in (0, 1, 2):
+        assert _records(out, round_index) == []
+
+
+def test_prune_traces_removes_arrays_no_record_ever_mentioned(tmp_path):
+    # write_traces writes each .npz inside its loop and appends the journal once at the
+    # end, so a crash between the two leaves orphan arrays. They belong to a slot that is
+    # about to be regenerated, so they must not survive under the name the new record
+    # will claim.
+    out = str(tmp_path)
+    artifacts.write_traces(out, [_slot(out)], 0)
+    os.unlink(os.path.join(artifacts.trace_dir(out, 0), "attempts.jsonl"))
+
+    artifacts.prune_traces(out, {STEM})
+
+    assert not os.path.exists(os.path.join(artifacts.trace_dir(out, 0), f"{STEM}.npz"))
+
+
+def test_prune_traces_drops_a_record_that_never_had_a_trace(tmp_path):
+    # An attempt whose trace would not assemble still gets a record (with trace: null) so
+    # the journal does not disagree with the kernels. That record is just as stale after a
+    # regeneration as a traced one, and there is no array name on it to follow.
+    out = str(tmp_path)
+    traj = _slot(out)
+    traj.attempts[0].trace = None  # as above: a trace that would not assemble
+    artifacts.write_traces(out, [traj], 0)
+    assert _records(out)[0]["trace"] is None
+
+    assert artifacts.prune_traces(out, {STEM}) == 1
+    assert _records(out) == []
+
+
+def test_prune_traces_ignores_everything_in_traces_that_is_not_a_round(tmp_path):
+    # traces/ also holds trace_config.json, and could hold anything a reader dropped there.
+    out = str(tmp_path)
+    artifacts.write_traces(out, [_slot(out)], 0)
+    artifacts.write_trace_config(out, {"model": "m"})
+    os.mkdir(os.path.join(out, "traces", "notes"))
+
+    assert artifacts.prune_traces(out, {STEM}) == 1
+
+    assert os.path.exists(os.path.join(out, "traces", "trace_config.json"))
+    assert os.path.isdir(os.path.join(out, "traces", "notes"))
+
+
+def test_prune_traces_is_a_no_op_on_a_fresh_run(tmp_path):
+    # The common case: no traces/ at all. Must not raise and must not create anything.
+    out = str(tmp_path)
+    assert artifacts.prune_traces(out, {STEM}) == 0
+    assert artifacts.prune_traces(out, set()) == 0
+    assert not os.path.exists(os.path.join(out, "traces"))
+
+
+def test_prune_traces_leaves_no_temp_file_behind(tmp_path):
+    # The journal is rewritten through a temp file so a crash cannot truncate it; the
+    # temp must not survive into a directory something else scandirs.
+    out = str(tmp_path)
+    artifacts.write_traces(out, [_slot(out)], 0)
+    artifacts.prune_traces(out, {STEM})
+
+    assert [f for f in os.listdir(artifacts.trace_dir(out, 0)) if f.endswith(".tmp")] == []
+
+
 # ---------------------------------------------------------------------- degradation
 
 

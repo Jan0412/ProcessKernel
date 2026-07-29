@@ -73,6 +73,7 @@ from kernel_gen.core.prompts import SYSTEM_PROMPT, build_base_prompt, build_repa
 from kernel_gen.core.sampling import SamplingSpec
 from kernel_gen.core.sources import load_problems
 from kernel_gen.gen_config import print_generation_summary
+from triton_lint.model import staged_kernel_filename
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -265,6 +266,18 @@ def main() -> None:
         trace_topk=args.trace_topk if args.trace else None,
     )
     if args.trace:
+        # A slot in flight when a run died is never journaled, so it is never skipped and
+        # re-runs here; its old trace record would else point at the new arrays (contract 4).
+        n_pruned = artifacts.prune_traces(
+            out_dir,
+            {
+                staged_kernel_filename(p.level, p.problem_id, s)[: -len(".py")]
+                for p, s in slots
+            },
+        )
+        if n_pruned:
+            print(f"Pruned {n_pruned} trace records for slots this session regenerates")
+
         # The run-level facts a reader needs and cannot recover from the arrays. Written
         # before the first round, so a crashed run's partial traces are still readable.
         cfg = artifacts.write_trace_config(
