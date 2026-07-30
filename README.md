@@ -8,8 +8,9 @@ repository studies how to *detect* that gap and *close* it, without a human in t
 Three ideas are developed and evaluated against
 [KernelBench](https://github.com/ScalingIntelligence/KernelBench):
 
-1. **A deterministic, GPU-free static linter** (`checker/`) that reads a generated
-   kernel and reports, in bytes and microseconds, whether it cheated or is provably slow.
+1. **A deterministic, GPU-free static analyzer** (`checker/`) that reads a generated
+   kernel and reports, in bytes and microseconds, whether it cheated or is provably slow —
+   and, separately, whether the evaluator can load it at all.
 2. **A self-refinement loop** (`kernel_gen/`) that feeds those findings — and execution
    feedback — back to the model and asks it to repair its own kernel.
 3. **A learned reranker** (`reranker/`) that picks the best of *N* samples so the loop
@@ -21,7 +22,10 @@ Three ideas are developed and evaluated against
 
 | Path | What it is |
 |---|---|
-| [`checker/`](checker/README.md) | The static analyzer. Pure-stdlib `ast`, ~1 ms/file, no GPU. **Start here — it has its own detailed README.** |
+| [`checker/`](checker/README.md) | The static analyzers. Pure-stdlib `ast`, no GPU. **Start here — it has its own detailed README.** |
+| &nbsp;&nbsp;`checker/core/` | What both analyzers are built from: the AST front end, the `Finding` vocabulary, and the `Check` / `Analyzer` / `Renderer` base classes. |
+| &nbsp;&nbsp;`checker/lint/` | *"Is this good Triton?"* — families F1 (is the kernel real) and F2 (what it wastes). |
+| &nbsp;&nbsp;`checker/submission/` | *"Can the evaluator load this?"* — S1.0–S1.3. `compile()`, an entry class, a reachable `forward`, bound module aliases. Answers loadability only, never correctness. |
 | [`kernel_gen/`](kernel_gen/) | Kernel generation with vLLM: baseline sampling, execution-feedback rounds, the lint-repair loop, and reranked selection. |
 | [`reranker/`](reranker/) | Pointwise / pairwise / listwise reranker that scores candidates and keeps the best. |
 | — | Evaluation is **not** in this repo. Runs are scored by the KernelBench checkout at `/path/to/workdir/KernelBench` via `scripts/eval_from_generations.py`. |
@@ -96,12 +100,17 @@ uv run --group dev pytest kernel_gen/tests/properties     # metamorphic (gemtest
 it stays fast:
 
 ```bash
-# coverage FLOOR -- catches untouched code (core/ is at 100%, gate fails under 95%)
-uv run --group dev pytest kernel_gen/tests --cov=kernel_gen/core
+# coverage FLOOR -- catches untouched code. kernel_gen/core, checker/core and
+# checker/submission are all at 100% line and branch; the gate fails under 95%.
+uv run --group dev pytest --cov --cov-branch
 
 # mutation testing -- catches untested BEHAVIOUR, the real anti-alibi bar
 uv run --group dev pytest kernel_gen/tests --gremlins --gremlin-targets=kernel_gen/core
+uv run --group dev pytest checker/tests --gremlins --gremlin-targets=checker/core,checker/submission
 ```
+
+The coverage sources in `pyproject.toml` are **dotted module names**, not paths: a path is
+silently reported as "module was never imported" and measures nothing.
 
 Mutation testing is what proves the tests actually assert something: **pytest-gremlins**
 corrupts `core/` and reports how many mutants the suite kills ("zaps"). Line coverage
@@ -110,6 +119,16 @@ says a line ran; only this says a test would have noticed it being wrong. Do **n
 
 Known-but-unfixed data-flow bugs are tracked as strict-xfail tests plus a row in
 `checker/tests/KERNEL_GEN_BUGS.md`.
+
+Three whole-corpus sweeps in `scripts/` back claims that a unit test cannot:
+`verify_report_parity.py` proves a refactor left `analyze_source` byte-identical over every
+shipped kernel, `verify_extraction_parity.py` hashes what the extractor picks from each
+captured completion, and `verify_submission_gate.py` re-measures how many lint-clean
+kernels the evaluator still cannot load.
+
+> **Run dirs predate KGEN-14.** Kernels already on disk were written when `clean` meant only
+> "the linter had nothing to say", so roughly 3.7% of the ones marked clean cannot be
+> loaded at all. They are not retro-fixed; new runs stop mislabelling them.
 
 ---
 

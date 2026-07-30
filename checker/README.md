@@ -2,13 +2,38 @@
 
 Deterministic, GPU-free static analysis for LLM-generated Triton kernels.
 
-The linter answers two questions about a generated solution, one per check family:
+Two analyzers, built from a shared `core/`, answering two different questions. Both
+produce the same `FileReport`, so the loop, the batch scanner and the eval-outcome join
+treat them identically.
+
+**`lint/` — is this good Triton?**
 
 - **Family 1 — Did it cheat?** Does the file actually do the work in Triton, or does
   it hand the computation back to PyTorch (or never run its kernel at all)?
 - **Family 2 — Is it provably slow?** Which memory transactions does the code pay
   for that a well-written kernel would not — expressed in **bytes and microseconds**,
   not vague counts.
+
+**`submission/` — can the evaluator load this at all?** A separate question, and the
+linter never asked it: a file that raises `SyntaxError` at import, or defines no
+`ModelNew`, scores zero however clean it lints. S1.0 hands the source to CPython's
+`compile()` rather than enumerating error types; S1.1–S1.3 check for an entry class, a
+reachable `forward`, and bound module aliases. It answers loadability **only** — a kernel
+that loads, runs, and computes entirely the wrong thing passes every check here, and
+conflating that with correctness would make the gate unfalsifiable.
+
+### Layout
+
+```
+core/        model, parsing, naming, summary + the Check / Analyzer / Renderer base classes
+lint/        the F1/F2 checks and the kernel-body, host-flow and shape stages
+submission/  the S1 checks and the blocking renderer
+runs.py scan.py report.py cli.py   drivers and consumers, generic over an Analyzer
+```
+
+`core/` is what an analyzer is *built from*; the top-level modules are what *runs* one.
+Nothing in `core/` may import `torch`, `triton` or `numpy` — that is what keeps a
+whole-run scan a login-node operation.
 
 Every finding carries a human-readable, *actionable* `message` naming the exact op,
 line, tensor, and fix. That is deliberate: the findings are designed to be fed back
@@ -17,7 +42,8 @@ into an LLM prompt so the model can repair its own kernel (self-refinement loop)
 for 33.6 MB; fuse `exp_kernel` into `scale_kernel`" is.
 
 The analysis is pure stdlib `ast`. No GPU, no `torch` import, no compilation — it
-runs on a login node at roughly 1 ms per file, and a full 175k-file run folder scans
+runs on a login node at a few milliseconds per file (measured over the pinned corpus:
+5.6 ms for the linter, 3.9 for the submission gate), and a full 175k-file run folder scans
 in a few minutes.
 
 ---
