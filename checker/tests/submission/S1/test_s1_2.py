@@ -16,9 +16,20 @@ from checker.submission import SubmissionAnalyzer
 PRELUDE = "import torch\nimport torch.nn as nn\nimport triton\nimport triton.language as tl\n"
 
 
+def findings_for(source: str, check_id: str):
+    """Findings for one check, and proof the check did not simply crash.
+
+    Registry.run catches a raising check into model.notes and moves on, so a broken
+    predicate returns the same empty list a satisfied one does. Asserting on the notes is
+    what tells those two apart."""
+    report = SubmissionAnalyzer().analyze(source, "<test>")
+    crashed = [n for n in report.summary.get("notes", []) if " raised " in n]
+    assert not crashed, crashed
+    return [f for f in report.findings if f.check_id == check_id]
+
+
 def s1_2(source: str):
-    findings = SubmissionAnalyzer().analyze(source, "<test>").findings
-    return [f for f in findings if f.check_id == "S1.2"]
+    return findings_for(source, "S1.2")
 
 
 # -- fires ------------------------------------------------------------------
@@ -132,4 +143,78 @@ def test_a_file_with_no_ModelNew_is_left_to_s1_1():
 
 def test_a_file_that_does_not_compile_is_not_also_accused_of_this():
     source = PRELUDE + "def k(x, W, W):\n    return x\n"
+    assert s1_2(source) == []
+
+
+def test_an_unrelated_module_level_assignment_is_skipped():
+    """The alias scan walks every top-level statement; a file full of constants must not
+    confuse it for one."""
+    source = PRELUDE + '''
+
+BLOCK = 128
+SCALE = 2.0
+
+
+class MyKernel(nn.Module):
+    def forward(self, x):
+        return x
+
+
+ModelNew = MyKernel
+'''
+
+    assert s1_2(source) == []
+
+
+def test_an_alias_to_something_that_is_not_a_class_is_left_alone():
+    # `ModelNew = make_model()` binds the name, so S1.1 is satisfied, and there is no
+    # class definition to inspect for a forward. Silence is the only honest answer.
+    source = PRELUDE + '''
+
+def make_model():
+    return None
+
+
+ModelNew = make_model()
+'''
+
+    assert s1_2(source) == []
+
+
+def test_an_alias_to_a_class_without_forward_is_rejected_through_the_alias():
+    """The alias hop has to be followed in both directions. Resolving it only when the
+    answer is "accepted" would let `ModelNew = Empty` through, and that scores zero."""
+    source = PRELUDE + '''
+
+class Empty(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+
+ModelNew = Empty
+'''
+
+    findings = s1_2(source)
+
+    assert [f.check_id for f in findings] == ["S1.2"]
+    assert findings[0].data["cls"] == "Empty"
+
+
+def test_the_alias_must_match_the_entry_name():
+    """`Other = Empty` is not the evaluator's entry point, so it says nothing about
+    whether ModelNew has a forward."""
+    source = PRELUDE + '''
+
+class Empty(nn.Module):
+    pass
+
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        return x
+
+
+Other = Empty
+'''
+
     assert s1_2(source) == []

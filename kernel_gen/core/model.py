@@ -91,19 +91,26 @@ class Attempt:
 def _rank(attempt: Attempt) -> tuple:
     """Sort key for "which attempt do we keep", lower is better.
 
-    ``(does not parse, n_fail, n_warn, round)``. A non-parsing attempt can never beat
-    a parsing one no matter how many findings the parsing one has -- a file that does
-    not compile scores zero at eval. Ties break toward the earliest round, so a round
-    that changed nothing measurable does not get credit for the previous round's work.
+    ``(does not parse, cannot be loaded, n_fail, n_warn, round)``. A non-parsing attempt
+    can never beat a parsing one no matter how many findings the parsing one has -- a file
+    that does not compile scores zero at eval. The loadability term (KGEN-14) is the same
+    argument one step further in: a file that parses but raises at import, or defines no
+    ``ModelNew``, also scores zero, so it loses to any attempt the evaluator can actually
+    run. Ties break toward the earliest round, so a round that changed nothing measurable
+    does not get credit for the previous round's work.
     """
     review = attempt.review
     if review is None:
         # No critic ran (or it crashed): all we can say is whether there is any code.
-        return (not attempt.code.strip(), 0, 0, attempt.round)
+        return (not attempt.code.strip(), False, 0, 0, attempt.round)
     data = review.data
     parses = data.get("parse_status") in (None, "ok", "partial")
+    # Absent in journals written before the submission gate existed. Defaulting to True
+    # keeps those attempts ranked exactly as they were rather than demoting all of them.
+    loadable = data.get("submission_ok", True)
     return (
         not parses,
+        not loadable,
         int(data.get("n_fail", 0)),
         int(data.get("n_warn", 0)),
         attempt.round,

@@ -9,6 +9,14 @@ nothing on its own -- the honest control is the identical loop with the lint con
 stripped out of the feedback text, which would isolate "the advice helped" from "being
 asked to try again helped". That control is not built here, and passing a different
 ``render`` is all it will take.
+
+**Two analyzers, staged (KGEN-14).** ``clean`` ends the slot, so it has to mean the whole
+answer is acceptable -- and the linter only ever answered "is this good Triton?". A file
+that raises ``SyntaxError`` at import, or defines no ``ModelNew``, scores zero however
+clean it lints. So the submission gate runs first and, when it has something to say, its
+message *replaces* the lint feedback rather than joining it. That is the argument
+``checker.core.feedback`` already makes about fails outranking warns, one level up:
+advice about fusing memory traffic is worse than useless on a file Python cannot load.
 """
 
 from __future__ import annotations
@@ -18,6 +26,8 @@ from typing import Callable
 from checker import analyze_source
 from checker.core.feedback import Policy
 from checker.core.feedback import render as render_findings
+from checker.submission import SubmissionAnalyzer
+from checker.submission.feedback import BlockingRenderer
 
 from .model import Problem, Review
 
@@ -38,6 +48,8 @@ def lint_critic(
     reference is already in hand, so use it.
     """
     shape_cache: dict[tuple[int, int], list] = {}
+    submission = SubmissionAnalyzer()
+    blocking = BlockingRenderer()
 
     def critic(problem: Problem, code: str, previous_check_ids: set) -> Review:
         report = analyze_source(
@@ -46,7 +58,10 @@ def lint_critic(
             only=only,
             fallback_shapes=_shapes(problem, shape_cache),
         )
-        text = render(
+        submission_report = submission.analyze(code, path="<generated>")
+        blocked = blocking.render(submission_report, previous_check_ids)
+
+        text = blocked if blocked is not None else render(
             report,
             previous_check_ids=previous_check_ids,
             max_findings=max_findings,
@@ -55,12 +70,18 @@ def lint_critic(
         summary = report.summary
         return Review(
             text=text or "",
+            # Unchanged expression, stricter input: `clean` still means "nothing to say",
+            # it is now asked of both analyzers.
             clean=text is None,
             data={
                 "parse_status": report.parse_status,
+                # The linter's counters stay the linter's. A submission defect must not
+                # inflate n_fail, or every comparison against a historical run shifts
+                # meaning; `submission_ok` is the one key that was added.
                 "n_fail": summary.get("n_fail", 0),
                 "n_warn": summary.get("n_warn", 0),
                 "check_ids": summary.get("check_ids", []),
+                "submission_ok": blocked is None,
             },
             # The full findings, carried past the summary that used to be all the loop
             # kept. Each one holds a `lineno` in its data, which is a verifier pointing
@@ -68,7 +89,12 @@ def lint_critic(
             # every later credit-assignment method would otherwise have to estimate.
             # It goes on `findings`, not into `data`, so `lint_loop.jsonl` stays the
             # size it was; see Review.to_dict.
-            findings=[f.to_dict() for f in report.findings],
+            #
+            # S1.* share the array with F1/F2 -- one schema for the PRM, told apart by id
+            # prefix. Suppressed from the *prompt* while the file is unloadable, never
+            # dropped from the record: what the linter saw is still what it saw.
+            findings=[f.to_dict() for f in submission_report.findings]
+            + [f.to_dict() for f in report.findings],
         )
 
     return critic

@@ -50,7 +50,16 @@ def test_findings_stay_out_of_the_serialized_review(problem, dead_kernel_file):
 
     assert review.findings  # captured ...
     assert "findings" not in record  # ... and not journaled
-    assert set(record) == {"clean", "parse_status", "n_fail", "n_warn", "check_ids"}
+    # submission_ok (KGEN-14) is the one key added since: a bool per round, against a
+    # journal that is read end-to-end on every resumed run.
+    assert set(record) == {
+        "clean",
+        "parse_status",
+        "n_fail",
+        "n_warn",
+        "check_ids",
+        "submission_ok",
+    }
 
 
 def test_the_journal_record_for_a_whole_slot_is_unchanged_in_shape(problem, dead_kernel_file):
@@ -67,6 +76,7 @@ def test_the_journal_record_for_a_whole_slot_is_unchanged_in_shape(problem, dead
         "n_fail",
         "n_warn",
         "check_ids",
+        "submission_ok",
     }
 
 

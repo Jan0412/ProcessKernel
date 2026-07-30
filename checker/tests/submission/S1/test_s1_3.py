@@ -33,9 +33,20 @@ class ModelNew(nn.Module):
 '''
 
 
+def findings_for(source: str, check_id: str):
+    """Findings for one check, and proof the check did not simply crash.
+
+    Registry.run catches a raising check into model.notes and moves on, so a broken
+    predicate returns the same empty list a satisfied one does. Asserting on the notes is
+    what tells those two apart."""
+    report = SubmissionAnalyzer().analyze(source, "<test>")
+    crashed = [n for n in report.summary.get("notes", []) if " raised " in n]
+    assert not crashed, crashed
+    return [f for f in report.findings if f.check_id == check_id]
+
+
 def s1_3(source: str):
-    findings = SubmissionAnalyzer().analyze(source, "<test>").findings
-    return [f for f in findings if f.check_id == "S1.3"]
+    return findings_for(source, "S1.3")
 
 
 # -- fires ------------------------------------------------------------------
@@ -194,3 +205,67 @@ class ModelNew(nn.Module):
 
 def test_a_file_that_does_not_compile_is_not_also_accused_of_this():
     assert s1_3("import torch\ndef k(x, W, W):\n    return x\n") == []
+
+
+# -- the remaining binding constructs `_bound_anywhere` must not miss --------
+# Each of these is a way to bind a name that a scope-blind walker could overlook, and
+# every miss is a false positive on working code.
+
+
+def test_an_except_handler_name_binds_it():
+    source = (
+        "import os\ntry:\n    pass\nexcept Exception as math:\n    pass\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return math.pi\n"
+    )
+    assert s1_3(source) == []
+
+
+def test_a_global_declaration_binds_it():
+    source = (
+        "import os\n\n\ndef setup():\n    global np\n    np = None\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return np.abs(x)\n"
+    )
+    assert s1_3(source) == []
+
+
+def test_a_nonlocal_declaration_binds_it():
+    source = (
+        "import os\n\n\ndef outer():\n    tl = None\n\n    def inner():\n"
+        "        nonlocal tl\n        return tl.arange(0, 4)\n    return inner\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return x\n"
+    )
+    assert s1_3(source) == []
+
+
+def test_a_vararg_binds_it():
+    source = (
+        "import os\n\n\ndef f(*math):\n    return math\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return math.pi\n"
+    )
+    assert s1_3(source) == []
+
+
+def test_a_kwarg_binds_it():
+    source = (
+        "import os\n\n\ndef f(**torch):\n    return torch\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return torch.abs(x)\n"
+    )
+    assert s1_3(source) == []
+
+
+def test_a_keyword_only_argument_binds_it():
+    source = (
+        "import os\n\n\ndef f(*, nn):\n    return nn\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return nn.Linear(1, 1)\n"
+    )
+    assert s1_3(source) == []
+
+
+def test_a_deleted_name_counts_as_bound():
+    source = (
+        "import os\nimport numpy as np\ndel np\n"
+        "\n\nclass ModelNew:\n    def forward(self, x):\n        return np.abs(x)\n"
+    )
+    # Scope-blind and deliberately over-generous: `del` proves the name existed, and
+    # erring towards silence is the whole design of this predicate.
+    assert s1_3(source) == []

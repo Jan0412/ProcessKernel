@@ -176,3 +176,10 @@ def test_the_renderer_carries_its_policy_and_cap():
 def test_a_clean_report_renders_nothing():
     # The early stop, stated on the object: None is what makes a clean sample free.
     assert StagedRenderer().render(_report()) is None
+
+
+def test_an_unknown_policy_is_refused():
+    """The policy selects what the model is shown, so a typo must not silently degrade to
+    "show nothing" and quietly end every slot."""
+    with pytest.raises(ValueError, match="unknown feedback policy"):
+        actionable(_report(), policy="whatever")

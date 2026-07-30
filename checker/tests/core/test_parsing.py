@@ -5,6 +5,7 @@ from __future__ import annotations
 from conftest import ELEMENTWISE_KERNEL, src
 
 from checker.core.naming import parse_kernel_filename, staged_kernel_filename
+from checker.core.parsing import build_skeleton
 
 
 class TestKernelDetection:
@@ -350,3 +351,26 @@ class ModelNew(nn.Module):
         )
         out = m.buffers[m.canonical("ModelNew.forward::out")]
         assert out.nbytes == 2 * 2 * 4
+
+
+class TestDuplicateKernelNames:
+    def test_a_redefined_kernel_is_noted_and_the_last_one_wins(self):
+        """Two @triton.jit functions with one name: Python keeps the second, so the model
+        must too, and the collision is recorded rather than silently resolved."""
+        source = (
+            "import triton\nimport triton.language as tl\n\n"
+            "@triton.jit\ndef k(x):\n    pass\n\n"
+            "@triton.jit\ndef k(x, y):\n    pass\n"
+        )
+
+        model = build_skeleton(source, "<test>")
+
+        assert list(model.kernels) == ["k"]
+        assert any("duplicate @triton.jit name `k`" in n for n in model.notes)
+
+    def test_a_decorator_that_is_not_a_dotted_name_is_ignored(self):
+        source = "import triton\n\n@(lambda f: f)\ndef k(x):\n    pass\n"
+
+        model = build_skeleton(source, "<test>")
+
+        assert model.kernels == {}

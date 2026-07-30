@@ -36,10 +36,13 @@ filterwarnings = [
 
 # Coverage is a FLOOR, not the quality bar -- pytest-gremlins (mutation testing) is that.
 # --cov is deliberately NOT in addopts so the inner-loop `pytest` stays fast:
-#     uv run --group dev pytest kernel_gen/tests --cov=kernel_gen/core
-# core/ currently sits at 100%; the floor is 95 so a real regression fails CI.
+#     uv run --group dev pytest --cov --cov-branch
+# All three sources sit at 100% line and branch; the floor is 95 so a real regression
+# fails CI. NB: coverage wants dotted module names here, not paths -- a path silently
+# reports "module was never imported" and measures nothing.
 [tool.coverage.run]
-source = ["kernel_gen/core"]
+source = ["kernel_gen.core", "checker.core", "checker.submission"]
+branch = true
 
 [tool.coverage.report]
 fail_under = 95

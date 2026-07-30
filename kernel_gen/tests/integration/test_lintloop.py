@@ -164,7 +164,11 @@ def test_a_generation_that_does_not_parse_is_told_so(tmp_path):
 
     repair = backend.batches[1][0]
     assert "not valid Python" in repair
-    assert "from scratch" in repair
+    # S1.0 now owns this message and quotes CPython's own diagnosis, including the line,
+    # so the model is told what is wrong rather than just that something is.
+    assert "S1.0" in repair
+    assert "invalid syntax" in repair and "line 1" in repair
+    assert "COMPLETE corrected file" in repair
 
     # Outside a loop this file is written to disk and silently scores zero at eval.
     # Here it gets rewritten, and the rewrite is what ships.
