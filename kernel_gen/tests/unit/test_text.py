@@ -418,3 +418,80 @@ def test_a_fence_glued_mid_line_becomes_a_break_not_a_splice():
     ast.parse(out)
     assert "x = 1" in out and "y = 2" in out
     assert "x = 1y = 2" not in out
+
+
+# -- ranking blocks by what Python can actually load (KGEN-14) ---------------
+
+
+def test_a_block_that_parses_but_does_not_compile_loses_to_one_that_does():
+    """`ast.parse` accepts a duplicated parameter name and CPython does not, so a draft
+    with that defect used to outrank the corrected block that followed it. Measured over
+    10,510 real completions, this picked the wrong block 13 times."""
+    # The block that wins is normally the LAST submission block, so the failure needs the
+    # broken revision to come second -- which is exactly the shape a reasoning model
+    # produces when it "improves" a working kernel into a broken one.
+    text = (
+        "Here it is:\n\n"
+        "```python\n"
+        "import triton\n\n\n"
+        "@triton.jit\n"
+        "def k(x_ptr, W, H):\n"
+        "    pass\n\n\n"
+        "class ModelNew:\n"
+        "    def forward(self, x):\n"
+        "        return x\n"
+        "```\n\n"
+        "Actually, let me widen the signature:\n\n"
+        "```python\n"
+        "import triton\n\n\n"
+        "@triton.jit\n"
+        "def k(x_ptr, W, W):\n"
+        "    pass\n\n\n"
+        "class ModelNew:\n"
+        "    def forward(self, x):\n"
+        "        return x\n"
+        "```\n"
+    )
+
+    code = extract_code_block(text)
+
+    compile(code, "<test>", "exec")  # the whole point: the chosen block is loadable
+    assert "def k(x_ptr, W, H)" in code
+
+
+def test_a_non_compilable_block_still_wins_over_nothing():
+    """Strictly stricter ranking must not become "return empty": if every candidate is
+    broken, the model's actual answer is still the best thing to hand back."""
+    text = "```python\nimport triton\n\n\ndef k(x, W, W):\n    pass\n```\n"
+
+    code = extract_code_block(text)
+
+    assert "def k(x, W, W)" in code
+
+
+def test_a_compilable_block_without_the_entry_class_still_loses_to_a_submission():
+    """Loadability is a tiebreak among candidates, not a replacement for looking for
+    ModelNew -- a helper snippet that compiles is not the answer."""
+    text = (
+        "```python\nimport torch\n```\n\n"
+        "```python\nimport triton\n\n\nclass ModelNew:\n    def forward(self, x):\n"
+        "        return x\n```\n"
+    )
+
+    assert "ModelNew" in extract_code_block(text)
+
+
+def test_a_non_compilable_submission_still_beats_a_compilable_fragment():
+    """Ranking purely by loadability is worse than the bug it fixes. Measured over 10,510
+    real completions, it moved 111 attempts off a ModelNew block that merely failed to
+    compile and onto a compilable snippet with no entry class -- trading a one-line defect
+    the repair round is now told about for a file that scores zero with certainty."""
+    text = (
+        "```python\nimport torch\nimport triton\n```\n\n"
+        "```python\nimport triton\n\n\n@triton.jit\ndef k(x, W, W):\n    pass\n\n\n"
+        "class ModelNew:\n    def forward(self, x):\n        return x\n```\n"
+    )
+
+    code = extract_code_block(text)
+
+    assert "ModelNew" in code

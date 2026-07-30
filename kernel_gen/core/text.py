@@ -106,11 +106,36 @@ def extract_code_block(text: str) -> str:
         except (SyntaxError, ValueError):
             return False
 
+    def _loads(src: str) -> bool:
+        """What the evaluator actually needs: ``exec(compile(...))``, not just a parse.
+
+        ``compile`` runs the symbol-table and codegen passes on top of the parser, so it
+        rejects source ``ast.parse`` accepts -- a duplicated kernel parameter being by far
+        the most common in practice. Raises wider than ``SyntaxError`` (``ValueError`` on
+        a null byte, ``IndentationError``, ``MemoryError`` on pathological nesting), hence
+        the broad except.
+        """
+        try:
+            compile(src, "<block>", "exec")
+            return True
+        except Exception:  # noqa: BLE001 - the family is wider than SyntaxError
+            return False
+
     blocks = _fenced_blocks(text)
     if blocks:
+        # Containing ModelNew stays the dominant criterion and loadability only breaks
+        # ties within it. Ranking purely by loadability looks stricter and is worse:
+        # measured over 10,510 real completions it moved 111 attempts off a ModelNew block
+        # that merely failed to compile and onto a compilable *fragment* with no entry
+        # class -- trading a one-line fix the repair round is now told about for a file
+        # that scores zero with certainty.
         parseable = [b for b in blocks if _parses(b)]
+        loadable = [b for b in parseable if _loads(b)]
         submissions = [b for b in parseable if ENTRY_CLASS in b]
-        return (submissions or parseable or blocks[:1])[-1]
+        loadable_submissions = [b for b in loadable if ENTRY_CLASS in b]
+        return (
+            loadable_submissions or submissions or loadable or parseable or blocks[:1]
+        )[-1]
 
     # Every fence marker here is noise: no block had any content, so none of them
     # delimited code. They are replaced by a newline rather than deleted -- the two-pass
