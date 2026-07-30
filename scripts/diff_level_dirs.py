@@ -29,7 +29,7 @@ from kernel_gen.core.sources import index_level_dir
 
 
 def _shapes(src: str):
-    from checker.shapes import shapes_from_source
+    from checker.lint.shapes import shapes_from_source
 
     try:
         return tuple(tuple(s) for s, _ in shapes_from_source(src))

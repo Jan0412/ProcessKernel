@@ -25,7 +25,7 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from .model import staged_kernel_filename
+from .core.naming import staged_kernel_filename
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNELBENCH_DIR = os.path.join(REPO_ROOT, "KernelBench")

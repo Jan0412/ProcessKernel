@@ -15,7 +15,7 @@ _LEADING_ID = re.compile(r"(\d+)")
 
 
 #: The class KernelBench instantiates. A fenced block without it is not a submission --
-#: see ``checker.parsing.ENTRY_CLASSES``.
+#: see ``checker.core.parsing.ENTRY_CLASSES``.
 ENTRY_CLASS = "class ModelNew"
 
 #: A fenced-code delimiter: ``` then an optional info string (the language) then the end

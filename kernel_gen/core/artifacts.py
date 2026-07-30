@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import os
 
-from checker.model import staged_kernel_filename
+from checker.core.naming import staged_kernel_filename
 
 from ..gen_config import write_generation_config
 from .model import Trajectory

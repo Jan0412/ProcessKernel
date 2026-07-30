@@ -14,7 +14,8 @@ import sys
 from collections.abc import Iterator
 
 from . import analyze_file
-from .model import FileReport, parse_kernel_filename
+from .core.model import FileReport
+from .core.naming import parse_kernel_filename
 from .runs import load_run
 
 

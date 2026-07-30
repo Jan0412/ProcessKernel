@@ -16,7 +16,7 @@ test that pins the fix.
 from __future__ import annotations
 
 from checker import analyze_source
-from checker.model import Finding, FileReport
+from checker.core.model import Finding, FileReport
 
 #: A minimal, real kernel (elementwise x*2) plus the imports every synthetic
 #: test body needs. Kernels under test are appended after it.

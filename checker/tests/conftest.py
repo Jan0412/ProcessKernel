@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for `
 import pytest  # noqa: E402
 
 from checker import analyze_source, build_model  # noqa: E402
-from checker.model import staged_kernel_filename  # noqa: E402
+from checker.core.naming import staged_kernel_filename  # noqa: E402
 
 
 @pytest.fixture

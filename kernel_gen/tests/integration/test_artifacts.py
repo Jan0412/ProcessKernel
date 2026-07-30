@@ -24,7 +24,7 @@ from kernel_gen.core.backend import FakeBackend
 from kernel_gen.core.model import Attempt, Problem, Review, Trajectory
 from kernel_gen.core.sampling import CODE_FENCE, PLAN_PREFIX, SamplingSpec, generate_batch_traced
 from kernel_gen.core.trace import read_trace
-from checker.model import parse_kernel_filename
+from checker.core.naming import parse_kernel_filename
 from checker.runs import load_run
 
 PLAN = "fuse the elementwise ops\n"

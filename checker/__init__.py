@@ -14,19 +14,18 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from .checks import CHECKS, run_checks
-from .hostflow import analyze_host
-from .kernelbody import analyze_kernels
-from .model import (
+from .lint.checks import CHECKS, run_checks
+from .lint.hostflow import analyze_host
+from .lint.kernelbody import analyze_kernels
+from .core.model import (
     Finding,
     FileReport,
     ModuleModel,
-    build_summary,
-    parse_kernel_filename,
-    staged_kernel_filename,
 )
-from .parsing import build_skeleton
-from .shapes import infer as infer_shapes
+from .core.naming import parse_kernel_filename, staged_kernel_filename
+from .core.parsing import build_skeleton
+from .lint.shapes import infer as infer_shapes
+from .lint.summary import lint_summary
 
 __all__ = [
     "analyze_source",
@@ -77,7 +76,7 @@ def analyze_source(
     model = build_model(source, path, fallback_shapes)
     findings = run_checks(model, only=only) if model.tree is not None else []
 
-    summary = build_summary(model, findings)
+    summary = lint_summary(model, findings)
     if model.notes:
         summary["notes"] = model.notes
 
@@ -111,7 +110,7 @@ def analyze_file(path: str, only: set[str] | None = None) -> FileReport:
     # evaluated against always has it, so fall back to that for tensor shapes.
     fallback = None
     if meta:
-        from .shapes import reference_input_shapes
+        from .lint.shapes import reference_input_shapes
 
         try:
             fallback = _reference_shapes(meta[0], meta[1])
@@ -123,6 +122,6 @@ def analyze_file(path: str, only: set[str] | None = None) -> FileReport:
 
 @lru_cache(maxsize=4096)
 def _reference_shapes(level: int, problem_id: int) -> tuple:
-    from .shapes import reference_input_shapes
+    from .lint.shapes import reference_input_shapes
 
     return tuple(reference_input_shapes(level, problem_id))
