@@ -23,84 +23,86 @@ Liger-Kernel (arXiv:2410.10989) -- a wasted full-tensor pass -- applied to alloc
 from __future__ import annotations
 
 from ...hostflow import _base_name, scoped
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
-from .. import register
+from .. import LINT_REGISTRY
 from ._common import fmt_bytes, fmt_time, transfer_time
 
 ZERO_ALLOCS = {"zeros", "zeros_like"}
 
 
-@register("F2.4", "zeroed_overwritten_buffer", "warn")
-def check(model: ModuleModel) -> list[Finding]:
-    launches = {ls.index: ls for ls in model.reachable_launches}
-    findings: list[Finding] = []
+@LINT_REGISTRY.add
+class ZeroedOverwrittenBuffer(Check):
+    check_id = "F2.4"
+    name = "zeroed_overwritten_buffer"
+    severity = "warn"
 
-    for buf in model.buffers.values():
-        if buf.alloc_fn not in ZERO_ALLOCS or not buf.stored_by:
-            continue
+    def run(self, model: ModuleModel) -> list[Finding]:
+        launches = {ls.index: ls for ls in model.reachable_launches}
+        findings: list[Finding] = []
 
-        # Is the buffer ever read back -- by a kernel, or by host code?
-        if buf.loaded_by or buf.read_by_host:
-            continue
-
-        # Examine only the parameter *this* buffer is bound to, not every stored param
-        # of the kernel: a sibling atomic output (`hist`) must not suppress the finding
-        # for an independent, genuinely-wasted buffer (`out`). Skip when that param
-        # accumulates (atomic/reads it back -- zero-init required) or writes it only
-        # partially (a diagonal/strided store leaves elements at their zero value, so
-        # "use empty_like" would be a correctness bug).
-        accumulating = False
-        partial = False
-        writers: list[str] = []
-        for index in buf.stored_by:
-            launch = launches.get(index)
-            if launch is None:
+        for buf in model.buffers.values():
+            if buf.alloc_fn not in ZERO_ALLOCS or not buf.stored_by:
                 continue
-            kernel = model.kernels.get(launch.kernel_name)
-            if kernel is None:
+
+            # Is the buffer ever read back -- by a kernel, or by host code?
+            if buf.loaded_by or buf.read_by_host:
                 continue
-            writers.append(kernel.name)
-            for param, expr in launch.arg_map.items():
-                role = kernel.params.get(param)
-                if role is None or not role.stored:
+
+            # Examine only the parameter *this* buffer is bound to, not every stored param
+            # of the kernel: a sibling atomic output (`hist`) must not suppress the finding
+            # for an independent, genuinely-wasted buffer (`out`). Skip when that param
+            # accumulates (atomic/reads it back -- zero-init required) or writes it only
+            # partially (a diagonal/strided store leaves elements at their zero value, so
+            # "use empty_like" would be a correctness bug).
+            accumulating = False
+            partial = False
+            writers: list[str] = []
+            for index in buf.stored_by:
+                launch = launches.get(index)
+                if launch is None:
                     continue
-                var = _base_name(expr)
-                if var is None or model.canonical(scoped(launch.enclosing, var)) != buf.canonical:
-                    continue  # a sibling output of the same kernel, not this buffer
-                if role.atomic or role.loaded:
-                    accumulating = True
-                if role.partial_store:
-                    partial = True
+                kernel = model.kernels.get(launch.kernel_name)
+                if kernel is None:
+                    continue
+                writers.append(kernel.name)
+                for param, expr in launch.arg_map.items():
+                    role = kernel.params.get(param)
+                    if role is None or not role.stored:
+                        continue
+                    var = _base_name(expr)
+                    if var is None or model.canonical(scoped(launch.enclosing, var)) != buf.canonical:
+                        continue  # a sibling output of the same kernel, not this buffer
+                    if role.atomic or role.loaded:
+                        accumulating = True
+                    if role.partial_store:
+                        partial = True
 
-        if accumulating or partial or not writers:
-            continue
+            if accumulating or partial or not writers:
+                continue
 
-        name = buf.canonical.split("::")[-1]
-        cost = ""
-        if buf.nbytes:
-            cost = (
-                f" That memset moves {fmt_bytes(buf.nbytes)} "
-                f"(~{fmt_time(transfer_time(buf.nbytes))})."
-            )
+            name = buf.canonical.split("::")[-1]
+            cost = ""
+            if buf.nbytes:
+                cost = (
+                    f" That memset moves {fmt_bytes(buf.nbytes)} "
+                    f"(~{fmt_time(transfer_time(buf.nbytes))})."
+                )
 
-        findings.append(
-            Finding(
-                check_id="F2.4",
-                severity="warn",
-                message=(
+            findings.append(
+                self.finding(
                     f"`{name}` is allocated with `torch.{buf.alloc_fn}` (line "
                     f"{buf.alloc_lineno}) but every element is then written by "
                     f"`{writers[0]}`, which performs no accumulation. The zero-fill is a "
-                    f"wasted full write pass -- use `torch.empty_like` instead.{cost}"
-                ),
-                data={
-                    "buffer": name,
-                    "alloc_fn": buf.alloc_fn,
-                    "writers": writers,
-                    "bytes": buf.nbytes,
-                    "lineno": buf.alloc_lineno or 0,
-                },
+                    f"wasted full write pass -- use `torch.empty_like` instead.{cost}",
+                    buffer=name,
+                    alloc_fn=buf.alloc_fn,
+                    writers=writers,
+                    bytes=buf.nbytes,
+                    lineno=buf.alloc_lineno or 0,
+                )
             )
-        )
 
-    return findings
+        return findings
+
+

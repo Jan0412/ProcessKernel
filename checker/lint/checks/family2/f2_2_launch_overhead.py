@@ -25,91 +25,89 @@ conv, squeeze), each incurring a full tensor pass, and the fused Triton solution
 
 from __future__ import annotations
 
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
-from .. import register
+from .. import LINT_REGISTRY
 from ._common import LAUNCH_OVERHEAD, fmt_bytes, fmt_time, transfer_time
 
 #: Below this, a launch-count finding is noise.
 LAUNCH_WARN_THRESHOLD = 3
 
 
-@register("F2.2", "launch_overhead", "warn")
-def check(model: ModuleModel) -> list[Finding]:
-    # Timed path only: a launch inside autograd backward() costs the forward nothing.
-    launches = model.timed_launches
-    if not launches:
-        return []
+@LINT_REGISTRY.add
+class LaunchOverhead(Check):
+    check_id = "F2.2"
+    name = "launch_overhead"
+    severity = "warn"
 
-    findings: list[Finding] = []
+    def run(self, model: ModuleModel) -> list[Finding]:
+        # Timed path only: a launch inside autograd backward() costs the forward nothing.
+        launches = model.timed_launches
+        if not launches:
+            return []
 
-    for launch in launches:
-        if launch.loop_depth > 0:
-            loop = " / ".join(launch.loop_vars) or "a loop"
-            preamble = (
-                f"`{launch.kernel_name}` is launched inside a Python loop over "
-                f"{loop} (line {launch.lineno}). Every iteration is a separate, "
-                f"serialised kernel launch (~{fmt_time(LAUNCH_OVERHEAD)} of pure "
-                f"overhead each)."
-            )
-            if launch.recurrence:
-                # A sequential recurrence carries state across iterations; gridding the
-                # loop would run every step from the same initial state (a correctness
-                # bug). The fix is to move the loop *into* the kernel, not into the grid.
-                fix = (
-                    " That loop carries a data dependency across iterations, so it "
-                    "cannot be parallelised -- move the loop inside a single kernel (one "
-                    "launch, an internal sequential loop) instead."
+        findings: list[Finding] = []
+
+        for launch in launches:
+            if launch.loop_depth > 0:
+                loop = " / ".join(launch.loop_vars) or "a loop"
+                preamble = (
+                    f"`{launch.kernel_name}` is launched inside a Python loop over "
+                    f"{loop} (line {launch.lineno}). Every iteration is a separate, "
+                    f"serialised kernel launch (~{fmt_time(LAUNCH_OVERHEAD)} of pure "
+                    f"overhead each)."
                 )
-            else:
-                fix = " Move that dimension into the launch grid and launch the kernel once."
+                if launch.recurrence:
+                    # A sequential recurrence carries state across iterations; gridding the
+                    # loop would run every step from the same initial state (a correctness
+                    # bug). The fix is to move the loop *into* the kernel, not into the grid.
+                    fix = (
+                        " That loop carries a data dependency across iterations, so it "
+                        "cannot be parallelised -- move the loop inside a single kernel (one "
+                        "launch, an internal sequential loop) instead."
+                    )
+                else:
+                    fix = " Move that dimension into the launch grid and launch the kernel once."
+                findings.append(
+                    self.finding(
+                        preamble + fix,
+                        severity="fail",
+                        kernel=launch.kernel_name,
+                        loop_vars=launch.loop_vars,
+                        loop_depth=launch.loop_depth,
+                        lineno=launch.lineno,
+                        kind="launch_in_loop",
+                        recurrence=launch.recurrence,
+                    )
+                )
+
+        n = len(launches)
+        if n >= LAUNCH_WARN_THRESHOLD:
+            overhead = n * LAUNCH_OVERHEAD
+            regime = ""
+            essential = _essential_bytes(model)
+            if essential:
+                mem_time = transfer_time(essential)
+                if overhead > mem_time:
+                    regime = (
+                        f" At this problem size ({fmt_bytes(essential)} of essential I/O) the "
+                        f"launch overhead exceeds the memory-transfer time "
+                        f"(~{fmt_time(mem_time)}), so kernel count dominates the runtime."
+                    )
             findings.append(
-                Finding(
-                    check_id="F2.2",
-                    severity="fail",
-                    message=preamble + fix,
-                    data={
-                        "kernel": launch.kernel_name,
-                        "loop_vars": launch.loop_vars,
-                        "loop_depth": launch.loop_depth,
-                        "lineno": launch.lineno,
-                        "kind": "launch_in_loop",
-                        "recurrence": launch.recurrence,
-                    },
-                )
-            )
-
-    n = len(launches)
-    if n >= LAUNCH_WARN_THRESHOLD:
-        overhead = n * LAUNCH_OVERHEAD
-        regime = ""
-        essential = _essential_bytes(model)
-        if essential:
-            mem_time = transfer_time(essential)
-            if overhead > mem_time:
-                regime = (
-                    f" At this problem size ({fmt_bytes(essential)} of essential I/O) the "
-                    f"launch overhead exceeds the memory-transfer time "
-                    f"(~{fmt_time(mem_time)}), so kernel count dominates the runtime."
-                )
-        findings.append(
-            Finding(
-                check_id="F2.2",
-                severity="warn" if regime else "info",
-                message=(
+                self.finding(
                     f"forward() launches {n} Triton kernels "
-                    f"(~{fmt_time(overhead)} of launch overhead).{regime}"
-                ),
-                data={
-                    "n_launches": n,
-                    "overhead_s": overhead,
-                    "kernels": [ls.kernel_name for ls in launches],
-                    "kind": "launch_count",
-                    "lineno": min(ls.lineno for ls in launches),
-                },
+                    f"(~{fmt_time(overhead)} of launch overhead).{regime}",
+                    severity="warn" if regime else "info",
+                    n_launches=n,
+                    overhead_s=overhead,
+                    kernels=[ls.kernel_name for ls in launches],
+                    kind="launch_count",
+                    lineno=min(ls.lineno for ls in launches),
+                )
             )
-        )
 
-    return findings
+        return findings
 
 
 def _essential_bytes(model: ModuleModel) -> int | None:

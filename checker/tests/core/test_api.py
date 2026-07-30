@@ -65,7 +65,7 @@ class TestDegradation:
         def boom(model):
             raise RuntimeError("check exploded")
 
-        monkeypatch.setattr(checks.CHECKS[0], "fn", boom)
+        monkeypatch.setattr(checks.CHECKS[0], "run", boom)
 
         report = analyze_source(GOOD_KERNEL_FILE, "<test>")
 

@@ -19,70 +19,72 @@ buffer for the launch, so an unresolvable argument yields silence, not a false a
 
 from __future__ import annotations
 
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
 from ...hostflow import _base_name, scoped
-from .. import register
+from .. import LINT_REGISTRY
 
 
-@register("F1.3", "discarded_output", "fail")
-def check(model: ModuleModel) -> list[Finding]:
-    findings: list[Finding] = []
+@LINT_REGISTRY.add
+class DiscardedOutput(Check):
+    check_id = "F1.3"
+    name = "discarded_output"
+    severity = "fail"
 
-    for launch in model.reachable_launches:
-        kernel = model.kernels.get(launch.kernel_name)
-        if kernel is None:
-            continue
+    def run(self, model: ModuleModel) -> list[Finding]:
+        findings: list[Finding] = []
 
-        outputs = kernel.outputs()
-        if not outputs:
-            continue  # nothing is written; not this check's business
-
-        resolved = []
-        for param in outputs:
-            expr = launch.arg_map.get(param)
-            if expr is None:
+        for launch in model.reachable_launches:
+            kernel = model.kernels.get(launch.kernel_name)
+            if kernel is None:
                 continue
-            var = _base_name(expr)
-            if var is None:
+
+            outputs = kernel.outputs()
+            if not outputs:
+                continue  # nothing is written; not this check's business
+
+            resolved = []
+            for param in outputs:
+                expr = launch.arg_map.get(param)
+                if expr is None:
+                    continue
+                var = _base_name(expr)
+                if var is None:
+                    continue
+                buf = model.buffers.get(model.canonical(scoped(launch.enclosing, var)))
+                if buf is not None:
+                    resolved.append((var, buf))
+
+            if not resolved:
+                continue  # could not resolve the output tensors -- stay quiet
+
+            # A buffer consumed by a *different* launch (the next kernel in a pipeline) is
+            # used, not discarded. Loading by this same launch does not count -- an atomic
+            # accumulator is stored and loaded by its own launch, and discarding it is still
+            # a real F1.3 hit.
+            def used(buf) -> bool:
+                return (
+                    buf.returned
+                    or buf.read_by_host
+                    or buf.is_forward_input
+                    or any(idx != launch.index for idx in buf.loaded_by)
+                )
+
+            if any(used(b) for _, b in resolved):
                 continue
-            buf = model.buffers.get(model.canonical(scoped(launch.enclosing, var)))
-            if buf is not None:
-                resolved.append((var, buf))
 
-        if not resolved:
-            continue  # could not resolve the output tensors -- stay quiet
-
-        # A buffer consumed by a *different* launch (the next kernel in a pipeline) is
-        # used, not discarded. Loading by this same launch does not count -- an atomic
-        # accumulator is stored and loaded by its own launch, and discarding it is still
-        # a real F1.3 hit.
-        def used(buf) -> bool:
-            return (
-                buf.returned
-                or buf.read_by_host
-                or buf.is_forward_input
-                or any(idx != launch.index for idx in buf.loaded_by)
-            )
-
-        if any(used(b) for _, b in resolved):
-            continue
-
-        names = ", ".join(f"`{v}`" for v, _ in resolved)
-        findings.append(
-            Finding(
-                check_id="F1.3",
-                severity="fail",
-                message=(
+            names = ", ".join(f"`{v}`" for v, _ in resolved)
+            findings.append(
+                self.finding(
                     f"`{launch.kernel_name}` (line {launch.lineno}) writes its result to "
                     f"{names}, but that tensor is never returned or used afterwards. The "
-                    f"kernel runs and its output is discarded -- return the kernel's result."
-                ),
-                data={
-                    "kernel": launch.kernel_name,
-                    "outputs": [v for v, _ in resolved],
-                    "lineno": launch.lineno,
-                },
+                    f"kernel runs and its output is discarded -- return the kernel's result.",
+                    kernel=launch.kernel_name,
+                    outputs=[v for v, _ in resolved],
+                    lineno=launch.lineno,
+                )
             )
-        )
 
-    return findings
+        return findings
+
+

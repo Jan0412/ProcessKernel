@@ -18,29 +18,33 @@ meaningful code, and "lazy optimization" (Fast@1 improves while Fast@1.2 stalls)
 
 from __future__ import annotations
 
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
-from .. import register
+from .. import LINT_REGISTRY
 
 
-@register("F1.6", "passthrough_kernel", "fail")
-def check(model: ModuleModel) -> list[Finding]:
-    launched = {ls.kernel_name for ls in model.reachable_launches}
-    findings = []
+@LINT_REGISTRY.add
+class PassthroughKernel(Check):
+    check_id = "F1.6"
+    name = "passthrough_kernel"
+    severity = "fail"
 
-    for name in sorted(launched):
-        kernel = model.kernels.get(name)
-        if kernel is None or kernel.kind != "copy":
-            continue
-        findings.append(
-            Finding(
-                check_id="F1.6",
-                severity="fail",
-                message=(
+    def run(self, model: ModuleModel) -> list[Finding]:
+        launched = {ls.kernel_name for ls in model.reachable_launches}
+        findings = []
+
+        for name in sorted(launched):
+            kernel = model.kernels.get(name)
+            if kernel is None or kernel.kind != "copy":
+                continue
+            findings.append(
+                self.finding(
                     f"Kernel `{name}` only copies memory: every value it stores comes "
                     f"straight from a tl.load with no arithmetic applied. It performs "
-                    f"none of the task's computation."
-                ),
-                data={"kernel": name, "lineno": kernel.lineno, "kind": kernel.kind},
+                    f"none of the task's computation.",
+                    kernel=name, lineno=kernel.lineno, kind=kernel.kind,
+                )
             )
-        )
-    return findings
+        return findings
+
+

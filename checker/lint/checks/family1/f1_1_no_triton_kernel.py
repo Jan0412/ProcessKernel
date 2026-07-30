@@ -7,24 +7,26 @@ decorator.
 
 from __future__ import annotations
 
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
-from .. import register
+from .. import LINT_REGISTRY
 
 
-@register("F1.1", "no_triton_kernel", "fail")
-def check(model: ModuleModel) -> list[Finding]:
-    if model.parse_status not in ("ok", "partial"):
-        return []
-    if model.kernels:
-        return []
-    return [
-        Finding(
-            check_id="F1.1",
-            severity="fail",
-            message=(
+@LINT_REGISTRY.add
+class NoTritonKernel(Check):
+    check_id = "F1.1"
+    name = "no_triton_kernel"
+    severity = "fail"
+
+    def run(self, model: ModuleModel) -> list[Finding]:
+        if model.parse_status not in ("ok", "partial"):
+            return []
+        if model.kernels:
+            return []
+        return [
+            self.finding(
                 "The solution contains no @triton.jit kernel. The computation must be "
-                "implemented as a Triton kernel, not with PyTorch operators."
-            ),
-            data={"n_kernels": 0},
-        )
-    ]
+                "implemented as a Triton kernel, not with PyTorch operators.",
+                n_kernels=0,
+            )
+        ]

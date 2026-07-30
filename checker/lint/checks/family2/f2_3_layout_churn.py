@@ -28,9 +28,10 @@ from __future__ import annotations
 import ast
 
 from ...hostflow import LAYOUT_METHODS, _base_name, scoped
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
 from ....core.parsing import _dotted
-from .. import register
+from .. import LINT_REGISTRY
 from ._common import fmt_bytes, fmt_time, transfer_time
 from ..family1.f1_4_torch_fallback import _host_scopes
 
@@ -84,69 +85,68 @@ def _receiver_is_noncontiguous(model: ModuleModel, scope: str, node: ast.expr) -
     return False
 
 
-@register("F2.3", "layout_churn", "warn")
-def check(model: ModuleModel) -> list[Finding]:
-    scopes = _host_scopes(model)
-    findings: list[Finding] = []
+@LINT_REGISTRY.add
+class LayoutChurn(Check):
+    check_id = "F2.3"
+    name = "layout_churn"
+    severity = "warn"
 
-    for call in model.host_calls:
-        if call.enclosing not in scopes or call.node is None:
-            continue
-        op = call.qualname.rsplit(".", 1)[-1]
-        if op not in COPY_OPS:
-            continue
+    def run(self, model: ModuleModel) -> list[Finding]:
+        scopes = _host_scopes(model)
+        findings: list[Finding] = []
 
-        node = call.node
-        receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+        for call in model.host_calls:
+            if call.enclosing not in scopes or call.node is None:
+                continue
+            op = call.qualname.rsplit(".", 1)[-1]
+            if op not in COPY_OPS:
+                continue
 
-        if op == "contiguous":
-            if receiver is None or not _receiver_is_noncontiguous(model, call.enclosing, receiver):
-                continue  # .contiguous() on an already-contiguous tensor is a no-op
-            message_fix = (
-                "Triton kernels take stride arguments -- pass the tensor's strides and "
-                "index the permuted layout directly inside the kernel instead of "
-                "materialising a transposed copy."
-            )
-        elif op == "to":
-            if not _is_dtype_cast(node):
-                continue  # a device move, not a cast
-            message_fix = (
-                "Do the cast inside the kernel on load (`tl.load(...).to(tl.float32)`) "
-                "rather than casting the whole tensor in host code."
-            )
-        else:
-            message_fix = (
-                "This launches a kernel and moves the whole tensor; fold it into your "
-                "Triton kernel's indexing if possible."
-            )
+            node = call.node
+            receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
 
-        nbytes = _receiver_bytes(model, call.enclosing, receiver) if receiver else None
-        cost = ""
-        if nbytes:
-            traffic = 2 * nbytes  # read + write
-            cost = (
-                f" It moves {fmt_bytes(traffic)} of HBM traffic "
-                f"(~{fmt_time(transfer_time(traffic))})."
-            )
+            if op == "contiguous":
+                if receiver is None or not _receiver_is_noncontiguous(model, call.enclosing, receiver):
+                    continue  # .contiguous() on an already-contiguous tensor is a no-op
+                message_fix = (
+                    "Triton kernels take stride arguments -- pass the tensor's strides and "
+                    "index the permuted layout directly inside the kernel instead of "
+                    "materialising a transposed copy."
+                )
+            elif op == "to":
+                if not _is_dtype_cast(node):
+                    continue  # a device move, not a cast
+                message_fix = (
+                    "Do the cast inside the kernel on load (`tl.load(...).to(tl.float32)`) "
+                    "rather than casting the whole tensor in host code."
+                )
+            else:
+                message_fix = (
+                    "This launches a kernel and moves the whole tensor; fold it into your "
+                    "Triton kernel's indexing if possible."
+                )
 
-        findings.append(
-            Finding(
-                check_id="F2.3",
-                severity="warn",
-                message=(
+            nbytes = _receiver_bytes(model, call.enclosing, receiver) if receiver else None
+            cost = ""
+            if nbytes:
+                traffic = 2 * nbytes  # read + write
+                cost = (
+                    f" It moves {fmt_bytes(traffic)} of HBM traffic "
+                    f"(~{fmt_time(transfer_time(traffic))})."
+                )
+
+            findings.append(
+                self.finding(
                     f"`{call.qualname}()` (line {call.lineno}) launches a hidden PyTorch "
-                    f"kernel that copies the whole tensor.{cost} {message_fix}"
-                ),
-                data={
-                    "op": op,
-                    "qualname": call.qualname,
-                    "bytes": 2 * nbytes if nbytes else None,
-                    "lineno": call.lineno,
-                },
+                    f"kernel that copies the whole tensor.{cost} {message_fix}",
+                    op=op,
+                    qualname=call.qualname,
+                    bytes=2 * nbytes if nbytes else None,
+                    lineno=call.lineno,
+                )
             )
-        )
 
-    return findings
+        return findings
 
 
 def _receiver_bytes(model: ModuleModel, scope: str, node: ast.expr) -> int | None:

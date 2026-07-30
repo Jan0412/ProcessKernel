@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import ast
 
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
 from ...hostflow import _base_name, scoped
-from .. import register
+from .. import LINT_REGISTRY
 
 #: Ops that dominate a task's FLOPs. Falling back on one of these means the model
 #: did not implement the problem.
@@ -233,116 +234,117 @@ def _host_scopes(model: ModuleModel) -> set[str]:
     return {s for s in scopes if not s.endswith(".__init__")}
 
 
-@register("F1.4", "torch_fallback", "fail")
-def check(model: ModuleModel) -> list[Finding]:
-    if model.tree is None:
-        return []
+@LINT_REGISTRY.add
+class TorchFallback(Check):
+    check_id = "F1.4"
+    name = "torch_fallback"
+    severity = "fail"
 
-    scopes = _host_scopes(model)
-    heavy: list[tuple[str, int]] = []
-    light: list[tuple[str, int]] = []
-    unknown: list[str] = []
+    def run(self, model: ModuleModel) -> list[Finding]:
+        if model.tree is None:
+            return []
 
-    for call in model.host_calls:
-        if call.enclosing not in scopes:
-            continue
-        if _is_local_call(model, call):
-            continue  # model-authored code, not a torch fallback (F1.5 handles nn modules)
-        if call.qualname.split(".", 1)[0] in ("tl", "triton"):
-            continue  # BUG-26: a Triton builtin (tl.sum/tl.dot/...) in host scope is not torch
-        op = _op_of(call.qualname)
-        if _is_bare_scalar_builtin(model, call, op):
-            continue  # BUG-31: bare round/abs/pow/sum on non-tensors is Python scalar math
-        functional = _is_functional(call.qualname)
-        if op in PLUMBING_OPS and not functional:
-            continue
-        if op in HEAVY_OPS or (functional and op in HEAVY_FUNCTIONAL_ONLY):
-            heavy.append((call.qualname, call.lineno))
-        elif op in LIGHT_OPS:
-            light.append((call.qualname, call.lineno))
-        elif functional:
-            # unclassified compute: flagged, but spelling cannot make it heavy
-            light.append((call.qualname, call.lineno))
-            unknown.append(call.qualname)
+        scopes = _host_scopes(model)
+        heavy: list[tuple[str, int]] = []
+        light: list[tuple[str, int]] = []
+        unknown: list[str] = []
 
-    findings: list[Finding] = []
-
-    if heavy or light:
-        ops = [q for q, _ in heavy] + [q for q, _ in light]
-        lines = sorted({ln for _, ln in heavy + light})
-        severity = "fail" if heavy else "warn"
-        if heavy:
-            listed = ", ".join(f"`{q}` (line {ln})" for q, ln in heavy)
-            msg = (
-                f"forward() computes with PyTorch instead of Triton: {listed}. "
-                f"This is the dominant cost of the task -- it must be implemented as a "
-                f"Triton kernel, not handed back to PyTorch."
-            )
-        else:
-            listed = ", ".join(f"`{q}` (line {ln})" for q, ln in light)
-            msg = (
-                f"forward() still uses PyTorch operators: {listed}. Fold these into the "
-                f"Triton kernel so no work is left to PyTorch."
-            )
-        data = {
-            "ops": sorted(set(ops)),
-            "heavy_ops": sorted({q for q, _ in heavy}),
-            "linenos": lines,
-            "lineno": lines[0] if lines else 0,
-        }
-        if unknown:
-            data["unknown_ops"] = sorted(set(unknown))
-        findings.append(
-            Finding(check_id="F1.4", severity=severity, message=msg, data=data)
-        )
-
-    findings.extend(_tensor_binops(model, scopes))
-    return findings
-
-
-def _tensor_binops(model: ModuleModel, scopes: set[str]) -> list[Finding]:
-    """Elementwise arithmetic written as an operator (``a + b``) rather than a call.
-
-    Lower confidence than the call scan: we only fire when an operand traces back to
-    a forward input or to a tensor a kernel wrote, which is as close to type inference
-    as we get without running anything.
-    """
-    hits: list[tuple[str, int]] = []
-
-    for qual in sorted(scopes):
-        node = model.functions.get(qual)
-        if node is None:
-            continue
-        for sub in ast.walk(node):
-            if not isinstance(sub, ast.BinOp):
+        for call in model.host_calls:
+            if call.enclosing not in scopes:
                 continue
-            symbol = BINOP_NAMES.get(type(sub.op))
-            if symbol is None:
+            if _is_local_call(model, call):
+                continue  # model-authored code, not a torch fallback (F1.5 handles nn modules)
+            if call.qualname.split(".", 1)[0] in ("tl", "triton"):
+                continue  # BUG-26: a Triton builtin (tl.sum/tl.dot/...) in host scope is not torch
+            op = _op_of(call.qualname)
+            if _is_bare_scalar_builtin(model, call, op):
+                continue  # BUG-31: bare round/abs/pow/sum on non-tensors is Python scalar math
+            functional = _is_functional(call.qualname)
+            if op in PLUMBING_OPS and not functional:
                 continue
-            for operand in (sub.left, sub.right):
-                if _is_scalar_expr(operand):
-                    continue  # x.numel() // 4 is scalar grid math, not tensor arithmetic
-                if _operand_is_tensor(model, qual, operand):
-                    hits.append((symbol, sub.lineno))
-                    break
+            if op in HEAVY_OPS or (functional and op in HEAVY_FUNCTIONAL_ONLY):
+                heavy.append((call.qualname, call.lineno))
+            elif op in LIGHT_OPS:
+                light.append((call.qualname, call.lineno))
+            elif functional:
+                # unclassified compute: flagged, but spelling cannot make it heavy
+                light.append((call.qualname, call.lineno))
+                unknown.append(call.qualname)
 
-    if not hits:
-        return []
+        findings: list[Finding] = []
 
-    lines = sorted({ln for _, ln in hits})
-    symbols = sorted({s for s, _ in hits})
-    severity = "fail" if "@" in symbols else "warn"
-    return [
-        Finding(
-            check_id="F1.4",
-            severity=severity,
-            message=(
+        if heavy or light:
+            ops = [q for q, _ in heavy] + [q for q, _ in light]
+            lines = sorted({ln for _, ln in heavy + light})
+            severity = "fail" if heavy else "warn"
+            if heavy:
+                listed = ", ".join(f"`{q}` (line {ln})" for q, ln in heavy)
+                msg = (
+                    f"forward() computes with PyTorch instead of Triton: {listed}. "
+                    f"This is the dominant cost of the task -- it must be implemented as a "
+                    f"Triton kernel, not handed back to PyTorch."
+                )
+            else:
+                listed = ", ".join(f"`{q}` (line {ln})" for q, ln in light)
+                msg = (
+                    f"forward() still uses PyTorch operators: {listed}. Fold these into the "
+                    f"Triton kernel so no work is left to PyTorch."
+                )
+            data = {
+                "ops": sorted(set(ops)),
+                "heavy_ops": sorted({q for q, _ in heavy}),
+                "linenos": lines,
+                "lineno": lines[0] if lines else 0,
+            }
+            if unknown:
+                data["unknown_ops"] = sorted(set(unknown))
+            findings.append(
+                self.finding(msg, severity=severity, **data)
+            )
+
+        findings.extend(self._tensor_binops(model, scopes))
+        return findings
+
+    def _tensor_binops(self, model: ModuleModel, scopes: set[str]) -> list[Finding]:
+        """Elementwise arithmetic written as an operator (``a + b``) rather than a call.
+
+        Lower confidence than the call scan: we only fire when an operand traces back to
+        a forward input or to a tensor a kernel wrote, which is as close to type inference
+        as we get without running anything.
+        """
+        hits: list[tuple[str, int]] = []
+
+        for qual in sorted(scopes):
+            node = model.functions.get(qual)
+            if node is None:
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.BinOp):
+                    continue
+                symbol = BINOP_NAMES.get(type(sub.op))
+                if symbol is None:
+                    continue
+                for operand in (sub.left, sub.right):
+                    if _is_scalar_expr(operand):
+                        continue  # x.numel() // 4 is scalar grid math, not tensor arithmetic
+                    if _operand_is_tensor(model, qual, operand):
+                        hits.append((symbol, sub.lineno))
+                        break
+
+        if not hits:
+            return []
+
+        lines = sorted({ln for _, ln in hits})
+        symbols = sorted({s for s, _ in hits})
+        severity = "fail" if "@" in symbols else "warn"
+        return [
+            self.finding(
                 f"forward() performs tensor arithmetic in PyTorch using the "
                 f"{', '.join('`' + s + '`' for s in symbols)} operator "
                 f"(line{'s' if len(lines) > 1 else ''} {', '.join(map(str, lines))}). "
                 f"Each of these launches a PyTorch kernel -- do the arithmetic inside "
-                f"the Triton kernel instead."
-            ),
-            data={"ops": symbols, "linenos": lines, "lineno": lines[0], "kind": "binop"},
-        )
-    ]
+                f"the Triton kernel instead.",
+                severity=severity,
+                ops=symbols, linenos=lines, lineno=lines[0], kind="binop",
+            )
+        ]

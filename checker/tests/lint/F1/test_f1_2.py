@@ -354,4 +354,4 @@ class ModelNew(nn.Module):
     model.kernels["add_kernel"].calls.add("ghost_dev")
     # The ghost edge is followed off the launched kernel, found missing, and skipped;
     # the one live kernel stays live, so nothing is reported and nothing raises.
-    assert f1_2_dead_kernel.check(model) == []
+    assert f1_2_dead_kernel.DeadKernel().run(model) == []

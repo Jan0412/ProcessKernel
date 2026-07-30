@@ -15,55 +15,60 @@ strictly stronger: a kernel merely mentioned in dead code does not count as live
 
 from __future__ import annotations
 
+from ....core.check import Check
 from ....core.model import Finding, ModuleModel
-from .. import register
+from .. import LINT_REGISTRY
 
 
-@register("F1.2", "dead_kernel", "fail")
-def check(model: ModuleModel) -> list[Finding]:
-    if not model.kernels:
-        return []  # F1.1 covers that
+@LINT_REGISTRY.add
+class DeadKernel(Check):
+    check_id = "F1.2"
+    name = "dead_kernel"
+    severity = "fail"
 
-    launched = {ls.kernel_name for ls in model.reachable_launches}
-    # A @triton.jit *device function* is called by name from inside another kernel's
-    # body (Triton inlines it), never [grid]-launched. It is live whenever a launched
-    # kernel reaches it through the call graph -- and "launch it or remove it" would
-    # break the caller. Expand the live set by that transitive closure.
-    live = set(launched)
-    frontier = list(launched)
-    while frontier:
-        name = frontier.pop()
-        kernel = model.kernels.get(name)
-        if kernel is None:
-            continue
-        for callee in kernel.calls:
-            if callee not in live:
-                live.add(callee)
-                frontier.append(callee)
+    def run(self, model: ModuleModel) -> list[Finding]:
+        if not model.kernels:
+            return []  # F1.1 covers that
 
-    dead = [name for name in model.kernels if name not in live]
-    if not dead:
-        return []
+        launched = {ls.kernel_name for ls in model.reachable_launches}
+        # A @triton.jit *device function* is called by name from inside another kernel's
+        # body (Triton inlines it), never [grid]-launched. It is live whenever a launched
+        # kernel reaches it through the call graph -- and "launch it or remove it" would
+        # break the caller. Expand the live set by that transitive closure.
+        live = set(launched)
+        frontier = list(launched)
+        while frontier:
+            name = frontier.pop()
+            kernel = model.kernels.get(name)
+            if kernel is None:
+                continue
+            for callee in kernel.calls:
+                if callee not in live:
+                    live.add(callee)
+                    frontier.append(callee)
 
-    # A file with no entry-point class at all cannot be loaded by KernelBench's
-    # `getattr(module, "ModelNew")`, so every kernel is provably dead -- a hard fail (the
-    # strongest F1.2 instance, and the one the check used to mute to a non-actionable info).
-    # When we resolved the forward the benchmark enters we can likewise prove unreachability;
-    # only a model_class whose forward we could *not* resolve stays info (BUG-25).
-    severity = "fail" if (model.forward_entry or model.model_class is None) else "info"
-    findings = []
-    for name in sorted(dead):
-        kernel = model.kernels[name]
-        findings.append(
-            Finding(
-                check_id="F1.2",
-                severity=severity,
-                message=(
+        dead = [name for name in model.kernels if name not in live]
+        if not dead:
+            return []
+
+        # A file with no entry-point class at all cannot be loaded by KernelBench's
+        # `getattr(module, "ModelNew")`, so every kernel is provably dead -- a hard fail (the
+        # strongest F1.2 instance, and the one the check used to mute to a non-actionable info).
+        # When we resolved the forward the benchmark enters we can likewise prove unreachability;
+        # only a model_class whose forward we could *not* resolve stays info (BUG-25).
+        severity = "fail" if (model.forward_entry or model.model_class is None) else "info"
+        findings = []
+        for name in sorted(dead):
+            kernel = model.kernels[name]
+            findings.append(
+                self.finding(
                     f"Kernel `{name}` is defined but never launched from "
                     f"{model.entry or 'the entry point'}. Launch it (or remove it) -- "
-                    f"a kernel that never runs does no work."
-                ),
-                data={"kernel": name, "lineno": kernel.lineno, "entry": model.entry},
+                    f"a kernel that never runs does no work.",
+                    severity=severity,
+                    kernel=name, lineno=kernel.lineno, entry=model.entry,
+                )
             )
-        )
-    return findings
+        return findings
+
+

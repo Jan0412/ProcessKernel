@@ -167,7 +167,7 @@ class ModelNew(nn.Module):
         assert binops[0].data["ops"] == ["*"]
 
     def test_silent_on_an_unparsed_module(self):
-        assert f1_4_torch_fallback.check(ModuleModel(parse_status="syntax_error")) == []
+        assert f1_4_torch_fallback.TorchFallback().run(ModuleModel(parse_status="syntax_error")) == []
 
 
 # ---------------------------------------------------------------------------
@@ -754,4 +754,4 @@ class ModelNew(nn.Module):
         "<t>",
     )
     model.timed_scopes.add("Ghost.forward")
-    assert f1_4_torch_fallback.check(model) == []
+    assert f1_4_torch_fallback.TorchFallback().run(model) == []

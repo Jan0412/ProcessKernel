@@ -669,7 +669,7 @@ class ModelNew(nn.Module):
         "<t>",
     )
     del model.kernels["add_kernel"]
-    assert f1_3_discarded_output.check(model) == []
+    assert f1_3_discarded_output.DiscardedOutput().run(model) == []
 
 
 def test_output_returned_through_a_boolop_is_not_discarded(fired):

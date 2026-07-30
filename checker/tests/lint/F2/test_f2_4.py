@@ -493,9 +493,9 @@ class ModelNew(nn.Module):
         "<t>",
         SHAPES,
     )
-    assert len(f2_4_zeroed_overwritten_buffer.check(model)) == 1
+    assert len(f2_4_zeroed_overwritten_buffer.ZeroedOverwrittenBuffer().run(model)) == 1
     del model.kernels["exp_kernel"]
-    assert f2_4_zeroed_overwritten_buffer.check(model) == []
+    assert f2_4_zeroed_overwritten_buffer.ZeroedOverwrittenBuffer().run(model) == []
 
 
 def test_atomic_writer_role_suppresses_the_finding():
@@ -519,9 +519,9 @@ class ModelNew(nn.Module):
         "<t>",
         SHAPES,
     )
-    assert len(f2_4_zeroed_overwritten_buffer.check(model)) == 1  # a wasted zero-fill...
+    assert len(f2_4_zeroed_overwritten_buffer.ZeroedOverwrittenBuffer().run(model)) == 1  # a wasted zero-fill...
     model.kernels["exp_kernel"].params["out_ptr"].atomic = True
-    assert f2_4_zeroed_overwritten_buffer.check(model) == []  # ...until it accumulates
+    assert f2_4_zeroed_overwritten_buffer.ZeroedOverwrittenBuffer().run(model) == []  # ...until it accumulates
 
 
 def test_computed_data_dependent_scatter_needs_its_zero_init():

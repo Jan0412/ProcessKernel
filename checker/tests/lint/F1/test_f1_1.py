@@ -19,7 +19,7 @@ class TestF11NoTritonKernel:
     def test_silent_on_an_unparseable_file(self):
         """A file we could not parse has no evidence either way -- never accuse it."""
         model = ModuleModel(parse_status="syntax_error")
-        assert f1_1_no_triton_kernel.check(model) == []
+        assert f1_1_no_triton_kernel.NoTritonKernel().run(model) == []
 
 
 # ---------------------------------------------------------------------------

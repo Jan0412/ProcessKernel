@@ -357,9 +357,9 @@ class ModelNew(nn.Module):
         "<t>",
         SHAPES,
     )
-    assert len(f2_1_dead_intermediate.check(model)) == 1  # the intermediate is real
+    assert len(f2_1_dead_intermediate.DeadIntermediate().run(model)) == 1  # the intermediate is real
     del model.kernels["exp_kernel"]
     del model.kernels["scale_kernel"]
-    findings = f2_1_dead_intermediate.check(model)
+    findings = f2_1_dead_intermediate.DeadIntermediate().run(model)
     assert len(findings) == 1
     assert findings[0].data["kernels"] == []  # every pair dropped by the guard

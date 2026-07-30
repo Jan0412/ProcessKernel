@@ -30,8 +30,9 @@ the fix.
 
 from __future__ import annotations
 
+from ....core.check import Check
 from ....core.model import Buffer, Finding, KernelDef, LaunchSite, ModuleModel
-from .. import register
+from .. import LINT_REGISTRY
 from ._common import fmt_bytes, fmt_time, transfer_time
 
 #: (producer kind, consumer kind) pairs that can always be fused into one kernel.
@@ -60,33 +61,100 @@ def _is_dead_intermediate(buf: Buffer) -> bool:
     )
 
 
-@register("F2.1", "dead_intermediate", "warn")
-def check(model: ModuleModel) -> list[Finding]:
-    launches = {ls.index: ls for ls in model.reachable_launches}
-    if len(launches) < 2:
-        return []
+@LINT_REGISTRY.add
+class DeadIntermediate(Check):
+    check_id = "F2.1"
+    name = "dead_intermediate"
+    severity = "warn"
 
-    intermediates: list[tuple[Buffer, LaunchSite, list[LaunchSite]]] = []
-    for buf in model.buffers.values():
-        if not _is_dead_intermediate(buf):
-            continue
-        producer = launches.get(buf.stored_by[0])
-        consumers = [launches[i] for i in buf.loaded_by if i in launches]
-        if producer is None or not consumers:
-            continue
-        intermediates.append((buf, producer, consumers))
+    def run(self, model: ModuleModel) -> list[Finding]:
+        launches = {ls.index: ls for ls in model.reachable_launches}
+        if len(launches) < 2:
+            return []
 
-    if not intermediates:
-        return []
+        intermediates: list[tuple[Buffer, LaunchSite, list[LaunchSite]]] = []
+        for buf in model.buffers.values():
+            if not _is_dead_intermediate(buf):
+                continue
+            producer = launches.get(buf.stored_by[0])
+            consumers = [launches[i] for i in buf.loaded_by if i in launches]
+            if producer is None or not consumers:
+                continue
+            intermediates.append((buf, producer, consumers))
 
-    # Merge producer->consumer chains (k1 -> t1 -> k2 -> t2 -> k3) into one finding,
-    # so the model gets "fuse these three", not three separate suggestions.
-    chains = _build_chains(intermediates)
+        if not intermediates:
+            return []
 
-    findings: list[Finding] = []
-    for chain in chains:
-        findings.append(_finding_for(model, chain))
-    return findings
+        # Merge producer->consumer chains (k1 -> t1 -> k2 -> t2 -> k3) into one finding,
+        # so the model gets "fuse these three", not three separate suggestions.
+        chains = _build_chains(intermediates)
+
+        findings: list[Finding] = []
+        for chain in chains:
+            findings.append(self._finding_for(model, chain))
+        return findings
+
+
+    def _finding_for(self, model: ModuleModel, chain) -> Finding:
+        buffers = [buf for buf, _, _ in chain]
+        total_bytes = sum(2 * b.nbytes for b in buffers if b.nbytes)
+        known_bytes = all(b.nbytes for b in buffers)
+
+        pairs: list[tuple[str, str, bool]] = []
+        for buf, producer, consumers in chain:
+            pk = _kernel_of(model, producer)
+            for consumer in consumers:
+                ck = _kernel_of(model, consumer)
+                if pk is None or ck is None:
+                    continue
+                pairs.append((pk.name, ck.name, (pk.kind, ck.kind) in FUSIBLE))
+
+        fusible = bool(pairs) and all(ok for _, _, ok in pairs)
+        names = ", ".join(f"`{b.canonical.split('::')[-1]}`" for b in buffers)
+        kernel_names = []
+        for pk, ck, _ in pairs:
+            for name in (pk, ck):
+                if name not in kernel_names:
+                    kernel_names.append(name)
+
+        cost = ""
+        if known_bytes and total_bytes:
+            cost = (
+                f" This costs {fmt_bytes(total_bytes)} of HBM traffic "
+                f"(~{fmt_time(transfer_time(total_bytes))} at achievable bandwidth)."
+            )
+
+        if fusible:
+            chain_desc = " -> ".join(f"`{k}`" for k in kernel_names)
+            message = (
+                f"{names} {'is' if len(buffers) == 1 else 'are'} written by one kernel and "
+                f"immediately read by the next, and used nowhere else -- so "
+                f"{'it' if len(buffers) == 1 else 'they'} round-trip(s) through HBM for "
+                f"nothing (Triton does not fuse across kernel launches). "
+                f"Fuse {chain_desc} into a single kernel and keep the intermediate in "
+                f"registers.{cost}"
+            )
+            severity = "warn"
+        else:
+            kinds = ", ".join(
+                f"`{pk}` ({_kind(model, pk)}) -> `{ck}` ({_kind(model, ck)})" for pk, ck, _ in pairs
+            )
+            message = (
+                f"{names} {'is' if len(buffers) == 1 else 'are'} materialised in HBM between "
+                f"kernels ({kinds}).{cost} These iteration spaces are not trivially fusible, "
+                f"so only fuse them if the reduction fits in a single block."
+            )
+            severity = "info"
+
+        return self.finding(
+            message,
+            severity=severity,
+            intermediates=[b.canonical.split("::")[-1] for b in buffers],
+            kernels=kernel_names,
+            fusible=fusible,
+            bytes=total_bytes if known_bytes else None,
+            lineno=min((b.alloc_lineno or 0) for b in buffers),
+        )
 
 
 def _build_chains(
@@ -127,71 +195,6 @@ def _build_chains(
 
 def _kernel_of(model: ModuleModel, launch: LaunchSite) -> KernelDef | None:
     return model.kernels.get(launch.kernel_name)
-
-
-def _finding_for(model: ModuleModel, chain) -> Finding:
-    buffers = [buf for buf, _, _ in chain]
-    total_bytes = sum(2 * b.nbytes for b in buffers if b.nbytes)
-    known_bytes = all(b.nbytes for b in buffers)
-
-    pairs: list[tuple[str, str, bool]] = []
-    for buf, producer, consumers in chain:
-        pk = _kernel_of(model, producer)
-        for consumer in consumers:
-            ck = _kernel_of(model, consumer)
-            if pk is None or ck is None:
-                continue
-            pairs.append((pk.name, ck.name, (pk.kind, ck.kind) in FUSIBLE))
-
-    fusible = bool(pairs) and all(ok for _, _, ok in pairs)
-    names = ", ".join(f"`{b.canonical.split('::')[-1]}`" for b in buffers)
-    kernel_names = []
-    for pk, ck, _ in pairs:
-        for name in (pk, ck):
-            if name not in kernel_names:
-                kernel_names.append(name)
-
-    cost = ""
-    if known_bytes and total_bytes:
-        cost = (
-            f" This costs {fmt_bytes(total_bytes)} of HBM traffic "
-            f"(~{fmt_time(transfer_time(total_bytes))} at achievable bandwidth)."
-        )
-
-    if fusible:
-        chain_desc = " -> ".join(f"`{k}`" for k in kernel_names)
-        message = (
-            f"{names} {'is' if len(buffers) == 1 else 'are'} written by one kernel and "
-            f"immediately read by the next, and used nowhere else -- so "
-            f"{'it' if len(buffers) == 1 else 'they'} round-trip(s) through HBM for "
-            f"nothing (Triton does not fuse across kernel launches). "
-            f"Fuse {chain_desc} into a single kernel and keep the intermediate in "
-            f"registers.{cost}"
-        )
-        severity = "warn"
-    else:
-        kinds = ", ".join(
-            f"`{pk}` ({_kind(model, pk)}) -> `{ck}` ({_kind(model, ck)})" for pk, ck, _ in pairs
-        )
-        message = (
-            f"{names} {'is' if len(buffers) == 1 else 'are'} materialised in HBM between "
-            f"kernels ({kinds}).{cost} These iteration spaces are not trivially fusible, "
-            f"so only fuse them if the reduction fits in a single block."
-        )
-        severity = "info"
-
-    return Finding(
-        check_id="F2.1",
-        severity=severity,
-        message=message,
-        data={
-            "intermediates": [b.canonical.split("::")[-1] for b in buffers],
-            "kernels": kernel_names,
-            "fusible": fusible,
-            "bytes": total_bytes if known_bytes else None,
-            "lineno": min((b.alloc_lineno or 0) for b in buffers),
-        },
-    )
 
 
 def _kind(model: ModuleModel, kernel_name: str) -> str:
