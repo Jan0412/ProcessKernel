@@ -7,6 +7,7 @@ import os
 from conftest import GOOD_KERNEL_FILE, src
 
 import checker
+import checker.lint
 from checker import analyze_file, analyze_source, build_model
 
 
@@ -51,7 +52,7 @@ class TestDegradation:
         def boom(model):
             raise RuntimeError("stage exploded")
 
-        monkeypatch.setattr(checker, "analyze_host", boom)
+        monkeypatch.setattr(checker.lint, "analyze_host", boom)
 
         model = build_model(GOOD_KERNEL_FILE, "<test>")
 
@@ -132,13 +133,13 @@ class ModelNew(nn.Module):
             raise RuntimeError("KernelBench is on fire")
 
         monkeypatch.setattr(shapes, "reference_input_shapes", boom)
-        checker._reference_shapes.cache_clear()
+        checker.lint._reference_shapes.cache_clear()
 
         run_dir = make_run(files={(2, 0): GOOD_KERNEL_FILE})
         report = analyze_file(os.path.join(run_dir, "level_1_problem_2_sample_0_kernel.py"))
 
         assert report.parse_status == "ok"
-        checker._reference_shapes.cache_clear()
+        checker.lint._reference_shapes.cache_clear()
 
     def test_only_runs_the_requested_check(self, make_run, fake_kernelbench):
         dead = src(
@@ -163,10 +164,10 @@ class ModelNew(nn.Module):
 
 class TestReferenceShapeCache:
     def test_repeated_lookups_hit_the_cache(self, fake_kernelbench):
-        checker._reference_shapes.cache_clear()
+        checker.lint._reference_shapes.cache_clear()
 
-        first = checker._reference_shapes(1, 2)
-        second = checker._reference_shapes(1, 2)
+        first = checker.lint._reference_shapes(1, 2)
+        second = checker.lint._reference_shapes(1, 2)
 
         assert first == second == (((4, 8), "float32"), ((4, 8), "float32"))
-        assert checker._reference_shapes.cache_info().hits == 1
+        assert checker.lint._reference_shapes.cache_info().hits == 1

@@ -8,6 +8,7 @@ import pytest
 from conftest import DEAD_KERNEL_FILE, GOOD_KERNEL_FILE
 
 from checker import scan
+from checker.lint import LintAnalyzer
 from checker.scan import _tally, iter_kernel_files, scan_run
 
 TWO_FILES = {(1, 0): GOOD_KERNEL_FILE, (2, 0): DEAD_KERNEL_FILE}
@@ -93,17 +94,17 @@ class TestScanRun:
 
         assert read_rows(out)[0]["run_name"] == "bare_run"
 
-    def test_a_crashing_file_does_not_abort_the_batch(self, make_run, tmp_path, monkeypatch):
+    def test_a_crashing_file_does_not_abort_the_batch(self, make_run, tmp_path):
         """One malformed generation must not kill a 175k-file scan."""
 
-        def boom(path, only=None):
-            raise RuntimeError("analysis exploded")
+        class Exploding(LintAnalyzer):
+            def analyze_path(self, path, only=None):
+                raise RuntimeError("analysis exploded")
 
-        monkeypatch.setattr(scan, "analyze_file", boom)
         run_dir = make_run(files=TWO_FILES)
         out = tmp_path / "findings.jsonl"
 
-        stats = scan_run(run_dir, str(out), workers=1)
+        stats = scan_run(run_dir, str(out), workers=1, analyzer=Exploding())
 
         assert stats["by_status"] == {"read_error": 2}
         row = read_rows(out)[0]

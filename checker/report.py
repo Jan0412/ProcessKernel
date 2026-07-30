@@ -15,6 +15,8 @@ import json
 import statistics
 from collections.abc import Iterator
 
+from .core.analyzer import Analyzer
+from .lint import LintAnalyzer
 from .runs import iter_samples, speedup
 
 
@@ -30,9 +32,15 @@ def load_findings(path: str) -> dict[tuple[int, int, int], dict]:
     return index
 
 
-def rows(run_dir: str, findings_path: str) -> Iterator[dict]:
-    """One row per evaluated sample: outcome + static findings."""
+def rows(
+    run_dir: str, findings_path: str, analyzer: Analyzer | None = None
+) -> Iterator[dict]:
+    """One row per evaluated sample: outcome + static findings.
+
+    The check columns come from the analyzer's registry, so adding a check adds a column
+    instead of silently going missing from every report."""
     index = load_findings(findings_path)
+    check_ids = (analyzer or LintAnalyzer()).registry.check_ids
 
     for sample in iter_samples(run_dir):
         report = index.get((sample.level, sample.problem_id, sample.sample_id))
@@ -58,18 +66,18 @@ def rows(run_dir: str, findings_path: str) -> Iterator[dict]:
             "wasted_bytes": summary.get("wasted_bytes_lower_bound", 0),
             "n_fail": summary.get("n_fail", 0),
         }
-        for check_id in ("F1.1", "F1.2", "F1.3", "F1.4", "F1.5", "F1.6", "F1.7",
-                         "F2.1", "F2.2", "F2.3", "F2.4"):
+        for check_id in check_ids:
             row[check_id] = check_id in checks
         yield row
 
 
-def summarize(run_dir: str, findings_path: str) -> dict:
-    data = list(rows(run_dir, findings_path))
+def summarize(run_dir: str, findings_path: str, analyzer: Analyzer | None = None) -> dict:
+    analyzer = analyzer or LintAnalyzer()
+    data = list(rows(run_dir, findings_path, analyzer))
     if not data:
         return {"n": 0}
 
-    checks = [k for k in data[0] if k.startswith(("F1.", "F2."))]
+    checks = [k for k in data[0] if k in set(analyzer.registry.check_ids)]
     out: dict = {
         "n_samples": len(data),
         "n_correct": sum(1 for r in data if r["correct"]),

@@ -135,7 +135,7 @@ def fake_kernelbench(tmp_path, monkeypatch):
     by level/problem/GPU, so they must be cleared around any test that redirects those
     directories -- otherwise a cached lookup from the real tree leaks in.
     """
-    import checker
+    import checker.lint
     from checker import runs
 
     kb = tmp_path / "KernelBench"
@@ -166,12 +166,12 @@ def fake_kernelbench(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runs, "KERNELBENCH_DIR", str(kb))
     monkeypatch.setattr(runs, "TIMING_DIR", str(timing))
-    _clear_caches(runs, checker)
+    _clear_caches(runs, checker.lint)
     yield kb, timing
-    _clear_caches(runs, checker)
+    _clear_caches(runs, checker.lint)
 
 
-def _clear_caches(runs, checker) -> None:
+def _clear_caches(runs, lint) -> None:
     runs._level_index.cache_clear()
     runs._baselines.cache_clear()
-    checker._reference_shapes.cache_clear()
+    lint._reference_shapes.cache_clear()

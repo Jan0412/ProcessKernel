@@ -13,9 +13,10 @@ import os
 import sys
 from collections.abc import Iterator
 
-from . import analyze_file
+from .core.analyzer import Analyzer
 from .core.model import FileReport
 from .core.naming import parse_kernel_filename
+from .lint import LintAnalyzer
 from .runs import load_run
 
 
@@ -34,17 +35,19 @@ def iter_kernel_files(run_dir: str, limit: int | None = None) -> list[str]:
 
 _ONLY: set[str] | None = None
 _RUN_NAME: str | None = None
+_ANALYZER: Analyzer | None = None
 
 
-def _init_worker(only: set[str] | None, run_name: str | None) -> None:
-    global _ONLY, _RUN_NAME
+def _init_worker(only: set[str] | None, run_name: str | None, analyzer: Analyzer) -> None:
+    global _ONLY, _RUN_NAME, _ANALYZER
     _ONLY = only
     _RUN_NAME = run_name
+    _ANALYZER = analyzer
 
 
 def _work(path: str) -> str:
     try:
-        report = analyze_file(path, only=_ONLY)
+        report = _ANALYZER.analyze_path(path, only=_ONLY)
     except Exception as exc:  # noqa: BLE001 - a bad file must not kill the batch
         report = FileReport(path=path, parse_status="read_error")
         report.summary = {"notes": [f"{type(exc).__name__}: {exc}"]}
@@ -58,7 +61,9 @@ def scan_run(
     workers: int | None = None,
     limit: int | None = None,
     only: set[str] | None = None,
+    analyzer: Analyzer | None = None,
 ) -> dict:
+    analyzer = analyzer or LintAnalyzer()
     run_dir = run_dir.rstrip("/")
     try:
         run_name = load_run(run_dir).run_name
@@ -74,7 +79,7 @@ def scan_run(
     stats = {"total": total, "written": 0, "by_status": {}, "by_check": {}}
 
     with open(out_path, "w", encoding="utf-8") as out:
-        for i, line in enumerate(_run_pool(paths, workers, only, run_name), start=1):
+        for i, line in enumerate(_run_pool(paths, workers, only, run_name, analyzer), start=1):
             out.write(line + "\n")
             stats["written"] += 1
             _tally(stats, line)
@@ -86,16 +91,21 @@ def scan_run(
 
 
 def _run_pool(
-    paths: list[str], workers: int, only: set[str] | None, run_name: str | None
+    paths: list[str],
+    workers: int,
+    only: set[str] | None,
+    run_name: str | None,
+    analyzer: Analyzer,
 ) -> Iterator[str]:
     if workers <= 1:
-        _init_worker(only, run_name)
+        _init_worker(only, run_name, analyzer)
         for path in paths:
             yield _work(path)
         return
 
     ctx = mp.get_context("fork")
-    with ctx.Pool(workers, initializer=_init_worker, initargs=(only, run_name)) as pool:
+    initargs = (only, run_name, analyzer)
+    with ctx.Pool(workers, initializer=_init_worker, initargs=initargs) as pool:
         yield from pool.imap_unordered(_work, paths, chunksize=64)
 
 
