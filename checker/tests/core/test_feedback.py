@@ -8,8 +8,10 @@ optimize a kernel that is secretly calling torch).
 
 from __future__ import annotations
 
+import pytest
+
 from checker import analyze_source
-from checker.core.feedback import actionable, render
+from checker.core.feedback import Renderer, StagedRenderer, actionable, render
 from checker.core.model import FileReport, Finding
 
 from helpers import PRELUDE, forward_with
@@ -137,3 +139,40 @@ def test_a_syntax_error_renders_its_own_block():
 def test_an_empty_generation_renders_its_own_block():
     text = render(_report(parse_status="empty"))
     assert "no code at all" in text
+
+
+# -- the renderer as an object ---------------------------------------------
+# `render` is the free function the critic has always called; StagedRenderer is the same
+# behaviour as a Renderer, so the critic can compose it with the submission gate's
+# renderer without knowing which one it holds.
+
+
+def test_the_staged_renderer_is_a_renderer():
+    assert isinstance(StagedRenderer(), Renderer)
+
+
+def test_the_free_function_and_the_renderer_agree():
+    report = analyze_source(CHEATING, "k.py")
+    assert StagedRenderer().render(report) == render(report)
+
+
+def test_a_renderer_must_implement_render():
+    class Empty(Renderer):
+        pass
+
+    with pytest.raises(TypeError):
+        Empty()
+
+
+def test_the_renderer_carries_its_policy_and_cap():
+    report = analyze_source(CHEATING, "k.py")
+
+    assert StagedRenderer(policy="fails-only").render(report) == render(
+        report, policy="fails-only"
+    )
+    assert StagedRenderer(max_findings=1).render(report) == render(report, max_findings=1)
+
+
+def test_a_clean_report_renders_nothing():
+    # The early stop, stated on the object: None is what makes a clean sample free.
+    assert StagedRenderer().render(_report()) is None

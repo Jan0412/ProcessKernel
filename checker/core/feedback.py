@@ -29,6 +29,7 @@ told this last round and it is still here", which is what ``previous_check_ids``
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Literal
 
 from .model import Finding, FileReport
@@ -66,6 +67,41 @@ def actionable(report: FileReport, policy: Policy = "severity") -> list[Finding]
     raise ValueError(f"unknown feedback policy {policy!r}")
 
 
+class Renderer(ABC):
+    """Report -> prompt text, or ``None`` when there is nothing worth another round.
+
+    That ``None`` is the loop's early stop, so a renderer is not a formatting detail: it
+    decides whether a slot spends another GPU round. There are two of them -- the linter's
+    staged advice and the submission gate's blocking message -- and the critic composes
+    them, which is what this base class exists to keep uniform.
+    """
+
+    @abstractmethod
+    def render(
+        self, report: FileReport, previous_check_ids: set[str] | None = None
+    ) -> str | None: ...
+
+
+class StagedRenderer(Renderer):
+    """Severity staging: fails first, warns only once there are none, info never."""
+
+    def __init__(self, max_findings: int = 8, policy: Policy = "severity") -> None:
+        self.max_findings = max_findings
+        self.policy = policy
+
+    def render(
+        self, report: FileReport, previous_check_ids: set[str] | None = None
+    ) -> str | None:
+        if report.parse_status in ("syntax_error", "empty", "read_error"):
+            return _render_broken(report)
+
+        findings = actionable(report, self.policy)
+        if not findings:
+            return None
+
+        return _render_findings(findings, previous_check_ids or set(), self.max_findings)
+
+
 def render(
     report: FileReport,
     previous_check_ids: set[str] | None = None,
@@ -76,14 +112,7 @@ def render(
 
     That ``None`` is the loop's early stop: it is what makes a clean sample free.
     """
-    if report.parse_status in ("syntax_error", "empty", "read_error"):
-        return _render_broken(report)
-
-    findings = actionable(report, policy)
-    if not findings:
-        return None
-
-    return _render_findings(findings, previous_check_ids or set(), max_findings)
+    return StagedRenderer(max_findings, policy).render(report, previous_check_ids)
 
 
 def _render_broken(report: FileReport) -> str:
