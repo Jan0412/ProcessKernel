@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from typing import Callable
 
-from triton_lint import analyze_source
-from triton_lint.feedback import Policy
-from triton_lint.feedback import render as render_findings
+from checker import analyze_source
+from checker.feedback import Policy
+from checker.feedback import render as render_findings
 
 from .model import Problem, Review
 
@@ -77,7 +77,7 @@ def lint_critic(
 def _shapes(problem: Problem, cache: dict[tuple[int, int], list]) -> list:
     key = (problem.level, problem.problem_id)
     if key not in cache:
-        from triton_lint.shapes import shapes_from_source
+        from checker.shapes import shapes_from_source
 
         try:
             cache[key] = shapes_from_source(problem.ref_arch_src)

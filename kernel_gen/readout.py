@@ -35,7 +35,7 @@ import statistics
 from collections import Counter
 
 from kernel_gen.core.artifacts import eval_run_name
-from triton_lint.runs import iter_samples, speedup
+from checker.runs import iter_samples, speedup
 
 
 def load_slots(run_dir: str) -> dict[tuple[int, int], dict]:

@@ -73,7 +73,7 @@ from kernel_gen.core.prompts import SYSTEM_PROMPT, build_base_prompt, build_repa
 from kernel_gen.core.sampling import SamplingSpec
 from kernel_gen.core.sources import load_problems
 from kernel_gen.gen_config import print_generation_summary
-from triton_lint.model import staged_kernel_filename
+from checker.model import staged_kernel_filename
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

@@ -15,7 +15,7 @@ The slot, not the problem, is the unit of work. A slot goes ``done`` as soon as 
 critic says clean, so round 2's batch contains only what round 1 could not fix, and
 the batch shrinks as the run proceeds. Slots of the same problem stop independently.
 
-Failure policy mirrors ``triton_lint.build_model``: one bad generation must not abort
+Failure policy mirrors ``checker.build_model``: one bad generation must not abort
 a run that has hours of GPU time in it. A completion that will not parse, or a critic
 that raises, degrades that *attempt* -- it is still recorded, still written, and the
 loop moves on.

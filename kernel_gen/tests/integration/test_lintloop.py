@@ -345,7 +345,7 @@ def test_ref_dir_selects_by_the_staged_id_and_is_recorded_in_the_config(tmp_path
 
 def test_a_shard_run_records_the_name_eval_can_actually_resolve(tmp_path, monkeypatch):
     # The array run writes to runs/<run>/shard_NN. RUN_NAME is relative to runs/, and
-    # triton_lint/runs.py stamps this field onto every SampleRef -- so basename would both
+    # checker/runs.py stamps this field onto every SampleRef -- so basename would both
     # print an eval command for a directory that does not exist and make all four shards
     # of a run indistinguishable once their results are pooled.
     out = str(tmp_path / "runs" / "Qwen_kb6_lintloop_triton" / "shard_03")

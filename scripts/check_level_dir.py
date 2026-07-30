@@ -74,7 +74,7 @@ def _defines(tree: ast.Module) -> set[str]:
 
 
 def check(ref_dir: str) -> int:
-    from triton_lint.shapes import shapes_from_source
+    from checker.shapes import shapes_from_source
 
     path = Path(ref_dir)
     print(f"checking {path}\n")

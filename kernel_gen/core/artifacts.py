@@ -1,7 +1,7 @@
 """Everything the loop puts on disk, and the four contracts that constrain it.
 
 **1. The final kernel goes flat, under the canonical name.** KernelBench's eval resolves
-each sample by exact path and ``triton_lint/scan.py`` scandirs the run dir
+each sample by exact path and ``checker/scan.py`` scandirs the run dir
 non-recursively; the file stem is the primary key joining generation to eval. So the
 per-round intermediates live in ``rounds/round_{r}/`` where those globs cannot see
 them, and only :meth:`Trajectory.final` is written flat. A dirty round-0 kernel
@@ -13,7 +13,7 @@ it gets its own copy of ``generation_config.yaml`` so eval and ``load_run()`` ca
 pointed straight at it.
 
 **3. ``generation_config.yaml`` is a public API with a hand-rolled parser.**
-``triton_lint/runs.py`` reads it with a flat ``key: value`` scanner that skips any line
+``checker/runs.py`` reads it with a flat ``key: value`` scanner that skips any line
 starting with a space or a dash -- so nested values and block lists silently vanish --
 and it resolves the level as ``pseudo_level or level``, *pseudo_level winning*. An arm
 that wrote both keys would report level 5 on a KernelBench run at level 1, and every
@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import os
 
-from triton_lint.model import staged_kernel_filename
+from checker.model import staged_kernel_filename
 
 from ..gen_config import write_generation_config
 from .model import Trajectory

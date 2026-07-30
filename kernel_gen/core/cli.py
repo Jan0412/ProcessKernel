@@ -2,10 +2,10 @@
 
 One rule governs every flag added here: **an argparse dest name is a public YAML key.**
 The config is persisted as ``dict(vars(args))`` and read back by the flat scanner in
-``triton_lint/runs.py``, so a flag must serialize to a single scalar. In particular
+``checker/runs.py``, so a flag must serialize to a single scalar. In particular
 ``nargs="+"`` is forbidden -- PyYAML writes it as a block list, whose lines all start
 with ``-``, which that scanner drops. A multi-value flag is a comma-separated string,
-as ``triton_lint``'s own ``--checks`` already is.
+as ``checker``'s own ``--checks`` already is.
 """
 
 from __future__ import annotations

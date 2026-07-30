@@ -2,7 +2,7 @@
 
 The load-bearing rule (cli.py's own docstring): **an argparse dest is a public YAML
 key.** The config is persisted as ``dict(vars(args))`` and read back by a flat
-``key: value`` scanner in ``triton_lint/runs.py`` that drops any line starting with a
+``key: value`` scanner in ``checker/runs.py`` that drops any line starting with a
 space or a dash. So every flag must serialize to a single scalar -- ``nargs="+"`` is
 forbidden, because PyYAML writes a list as a block whose lines all start with ``-``.
 This file pins that contract, which no test covered before.

@@ -267,7 +267,7 @@ def shard_range(ref_dir: str, shard: int, nshards: int) -> str:
     covers every problem exactly once.
 
     A range rather than a comma list because ``--problems`` is persisted into
-    ``generation_config.yaml``, which ``triton_lint/runs.py`` reads with a flat
+    ``generation_config.yaml``, which ``checker/runs.py`` reads with a flat
     ``key: value`` scanner -- it must stay one short scalar.
     """
     if nshards < 1:

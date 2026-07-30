@@ -21,13 +21,13 @@ dev = ["pytest>=8", "pytest-cov>=7", "hypothesis>=6", "gemtest>=1", "pytest-grem
 kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
 
 [tool.pytest.ini_options]
-testpaths = ["triton_lint/tests", "kernel_gen/tests"]
+testpaths = ["checker/tests", "kernel_gen/tests"]
 # NB: do NOT add "kernel_gen/tests" to pythonpath. It puts a second conftest.py on the
-# global path, which shadows triton_lint/tests' own `from conftest import ...`. Both
+# global path, which shadows checker/tests' own `from conftest import ...`. Both
 # tests dirs bootstrap the repo root themselves in their conftest.py, and kernel_gen
 # tests keep their shared data local (no bare cross-file imports across the subdirs).
 filterwarnings = [
-    # triton_lint/scan.py forks a worker pool by design (mp.get_context("fork")). When
+    # checker/scan.py forks a worker pool by design (mp.get_context("fork")). When
     # the FULL suite is collected, a kernel_gen test module (gemtest / hypothesis) starts
     # a thread at import time first, so the fork trips CPython's fork-after-thread
     # DeprecationWarning. test_scan is verified to run correctly; silence only this one.

@@ -2,11 +2,11 @@
 
 Shared data crosses the ``unit/`` and ``integration/`` subdirs as **fixtures**, never as
 ``from conftest import ...`` -- a bare cross-file import from a subdir does not resolve,
-and putting this dir on ``pythonpath`` would shadow ``triton_lint/tests``' own conftest.
+and putting this dir on ``pythonpath`` would shadow ``checker/tests``' own conftest.
 The one consumer that needs the corpus at *collection* time (``test_golden_corpus``, to
 parametrize) reads it with its own local loader.
 
-Repo-root import is bootstrapped here so ``kernel_gen`` / ``triton_lint`` resolve without
+Repo-root import is bootstrapped here so ``kernel_gen`` / ``checker`` resolve without
 any pythonpath entry.
 """
 
@@ -23,7 +23,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-# -- shared kernel sources (mirror of triton_lint/tests/conftest, kept independent) --
+# -- shared kernel sources (mirror of checker/tests/conftest, kept independent) --
 
 _PREAMBLE = "import torch\nimport torch.nn as nn\nimport triton\nimport triton.language as tl\n"
 

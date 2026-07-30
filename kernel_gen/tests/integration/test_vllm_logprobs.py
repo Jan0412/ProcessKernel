@@ -8,7 +8,7 @@ it, and that the flat container's ``start_indices``/``end_indices`` bound each p
 A hand-written stand-in would encode our belief about all three and would go on passing
 after vLLM changed any of them, which is the one failure this file exists to catch.
 
-**Why a subprocess.** Importing vLLM starts threads, and ``triton_lint/scan.py`` uses
+**Why a subprocess.** Importing vLLM starts threads, and ``checker/scan.py`` uses
 ``mp.get_context("fork")`` -- deliberately, since the scanner never imports vLLM. But a
 pytest process that has imported vLLM then forks from a multi-threaded parent, which is
 a genuine deadlock risk and shows up as a DeprecationWarning in ``test_scan``. Keeping

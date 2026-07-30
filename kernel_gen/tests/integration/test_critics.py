@@ -85,7 +85,7 @@ def test_review_and_attempt_default_to_no_findings_and_no_trace():
 def test_shape_inference_failure_degrades_to_no_shapes_not_a_crash(monkeypatch, dead_kernel_file):
     # Shapes are best-effort (they only enrich F2's byte estimates); findings are not.
     # A reference the shape inferencer cannot read must still produce a lint verdict.
-    import triton_lint.shapes as shapes_mod
+    import checker.shapes as shapes_mod
 
     def boom(_src):
         raise RuntimeError("cannot infer shapes from this reference")

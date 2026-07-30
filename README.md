@@ -8,7 +8,7 @@ repository studies how to *detect* that gap and *close* it, without a human in t
 Three ideas are developed and evaluated against
 [KernelBench](https://github.com/ScalingIntelligence/KernelBench):
 
-1. **A deterministic, GPU-free static linter** (`triton_lint/`) that reads a generated
+1. **A deterministic, GPU-free static linter** (`checker/`) that reads a generated
    kernel and reports, in bytes and microseconds, whether it cheated or is provably slow.
 2. **A self-refinement loop** (`kernel_gen/`) that feeds those findings — and execution
    feedback — back to the model and asks it to repair its own kernel.
@@ -21,7 +21,7 @@ Three ideas are developed and evaluated against
 
 | Path | What it is |
 |---|---|
-| [`triton_lint/`](triton_lint/README.md) | The static analyzer. Pure-stdlib `ast`, ~1 ms/file, no GPU. **Start here — it has its own detailed README.** |
+| [`checker/`](checker/README.md) | The static analyzer. Pure-stdlib `ast`, ~1 ms/file, no GPU. **Start here — it has its own detailed README.** |
 | [`kernel_gen/`](kernel_gen/) | Kernel generation with vLLM: baseline sampling, execution-feedback rounds, the lint-repair loop, and reranked selection. |
 | [`reranker/`](reranker/) | Pointwise / pairwise / listwise reranker that scores candidates and keeps the best. |
 | — | Evaluation is **not** in this repo. Runs are scored by the KernelBench checkout at `/path/to/workdir/KernelBench` via `scripts/eval_from_generations.py`. |
@@ -60,10 +60,10 @@ answerable per-slot rather than across two independent draws.
 uv sync
 
 # Lint one generated kernel
-uv run python -m triton_lint check runs/<run>/level_1_problem_23_sample_0_kernel.py
+uv run python -m checker check runs/<run>/level_1_problem_23_sample_0_kernel.py
 
 # Scan a whole run folder to JSONL
-uv run python -m triton_lint scan runs/<run> --out linter_findings.jsonl --workers 32
+uv run python -m checker scan runs/<run> --out linter_findings.jsonl --workers 32
 
 # Run the generate → lint → repair loop (arm A5)
 uv run python -m kernel_gen.arms.lintloop --level 1 --all --rounds 3 --num-samples 10
@@ -83,7 +83,7 @@ Cluster jobs go through `scripts/*.sh` (SLURM) and `reranker/scripts/*.sh`.
 ## Tests
 
 ```bash
-uv run --group dev pytest                    # both suites (triton_lint + kernel_gen)
+uv run --group dev pytest                    # both suites (checker + kernel_gen)
 uv run --group dev pytest kernel_gen/tests   # just the generation pipeline
 uv run --group dev pytest kernel_gen/tests/unit          # pure functions
 uv run --group dev pytest kernel_gen/tests/integration   # cross-module seams
@@ -109,7 +109,7 @@ says a line ran; only this says a test would have noticed it being wrong. Do **n
 `--gremlin-parallel` — it collides with coverage.py's data file and errors out.
 
 Known-but-unfixed data-flow bugs are tracked as strict-xfail tests plus a row in
-`triton_lint/tests/KERNEL_GEN_BUGS.md`.
+`checker/tests/KERNEL_GEN_BUGS.md`.
 
 ---
 
@@ -118,5 +118,5 @@ Known-but-unfixed data-flow bugs are tracked as strict-xfail tests plus a row in
 - `runs/`, `KernelBench/`, `mlruns/`, and SLURM `*.err`/`*.out` logs are **git-ignored
   artifacts** — they are reproduced by the pipeline, not versioned.
 - Component-level detail lives in each subdirectory's own README, most notably
-  [`triton_lint/README.md`](triton_lint/README.md), which documents every check with
+  [`checker/README.md`](checker/README.md), which documents every check with
   its failure mode, false-positive guards, and paper references.
