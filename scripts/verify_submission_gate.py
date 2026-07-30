@@ -12,6 +12,14 @@ answer before phase F.
 
 Runs are deduplicated by directory name: the repo's `runs/` holds copies of several of the
 traced runs, and counting a slot twice would inflate the headline.
+
+**Cleanliness is recomputed, not read off the journal.** `lint_loop.jsonl` records what the
+linter said on the day the run executed, and the linter has changed since -- BUG-25 moved
+F1.2 from `info` to `fail` when the file has no model class, so thousands of slots the
+journal calls clean are already rejected by today's linter and were never the target of
+this gate. Trusting the recorded flag would credit this change with defects that a linter
+fix already caught. So each shipped kernel is re-linted here and the gate is applied only
+to the ones the *current* critic would still call clean.
 """
 
 from __future__ import annotations
@@ -26,6 +34,8 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from checker.core.feedback import StagedRenderer  # noqa: E402
+from checker.lint import LintAnalyzer  # noqa: E402
 from checker.submission import SubmissionAnalyzer  # noqa: E402
 
 DEFAULT_ROOTS = (
@@ -68,13 +78,20 @@ def main() -> None:
     args = parser.parse_args()
 
     paths = clean_kernels(tuple(args.roots.split(",")))
-    analyzer = SubmissionAnalyzer()
+    submission = SubmissionAnalyzer()
+    lint = LintAnalyzer()
+    renderer = StagedRenderer()
 
     tally: collections.Counter[str] = collections.Counter()
     rejected = []
+    still_clean = 0
     for path in paths:
         source = open(path, encoding="utf-8", errors="replace").read()
-        report = analyzer.analyze(source, path)
+        if renderer.render(lint.analyze_path(path)) is not None:
+            continue  # today's linter already stops this slot; not this gate's business
+        still_clean += 1
+
+        report = submission.analyze(source, path)
         if not report.findings:
             continue
         # First-defect-wins, so the tally is disjoint and the columns add up.
@@ -82,9 +99,10 @@ def main() -> None:
         tally[first] += 1
         rejected.append((first, path, report.findings[0].message))
 
-    print(f"kernels the loop declared CLEAN : {len(paths)}")
-    print(f"REJECTED by the submission gate  : {len(rejected)} "
-          f"({100 * len(rejected) / max(len(paths), 1):.2f}%)")
+    print(f"slots the journal recorded as clean : {len(paths)}")
+    print(f"still lint-clean under today's linter: {still_clean}")
+    print(f"REJECTED by the submission gate      : {len(rejected)} "
+          f"({100 * len(rejected) / max(still_clean, 1):.2f}% of those)")
     for check_id, count in sorted(tally.items()):
         print(f"   {count:5d}  {check_id}")
 

@@ -152,6 +152,12 @@ class ModuleModel:
     input_shapes: list[tuple[tuple[int, ...], str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
+    #: Why ``compile(source, path, "exec")`` refused this file, and on which line.
+    #: Only the submission front end fills it in -- ``ast.parse`` succeeding does not mean
+    #: CPython can load the module, and the linter has no opinion on the difference.
+    compile_error: str | None = None
+    compile_error_lineno: int | None = None
+
     # -- convenience ------------------------------------------------------
 
     @property

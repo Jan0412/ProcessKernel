@@ -1,0 +1,656 @@
+[
+  {
+    "file": "S1_0_00.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_54_sample_9_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_01.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_56_sample_6_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_02.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_56_sample_8_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_03.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_57_sample_3_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_04.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_60_sample_5_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_05.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_62_sample_9_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_06.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_64_sample_4_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_07.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_65_sample_7_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_08.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_86_sample_2_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_09.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_97_sample_5_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_10.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_56_sample_0_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_11.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_63_sample_7_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_12.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_86_sample_0_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_13.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_86_sample_8_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_14.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_50_sample_2_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_15.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_50_sample_6_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_16.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2_nothink_traced",
+    "origin": "level_1_problem_57_sample_7_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_17.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2_nothink_traced",
+    "origin": "level_1_problem_85_sample_6_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_18.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2_nothink_traced",
+    "origin": "level_1_problem_82_sample_3_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_19.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2_nothink_traced",
+    "origin": "level_1_problem_87_sample_4_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_20.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2_traced",
+    "origin": "level_1_problem_46_sample_5_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_21.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2_traced",
+    "origin": "level_1_problem_68_sample_6_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_22.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v3_traced",
+    "origin": "level_1_problem_40_sample_6_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_23.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton",
+    "origin": "level_2_problem_52_sample_4_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_24.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_no_think",
+    "origin": "level_2_problem_53_sample_3_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_25.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v2_traced",
+    "origin": "level_2_problem_75_sample_9_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_26.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v2_traced",
+    "origin": "level_2_problem_16_sample_7_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_27.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v2_traced",
+    "origin": "level_2_problem_51_sample_5_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_0_28.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v3_traced",
+    "origin": "level_2_problem_57_sample_1_kernel.py",
+    "expected": "S1.0"
+  },
+  {
+    "file": "S1_1_00.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_3_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_01.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_14_sample_0_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_02.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_29_sample_9_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_03.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_33_sample_6_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_04.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_40_sample_3_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_05.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_4_sample_2_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_06.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_52_sample_3_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_07.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_52_sample_6_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_08.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_7_sample_7_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_09.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_81_sample_8_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_10.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_83_sample_0_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_11.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_89_sample_9_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_12.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_90_sample_2_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_13.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_90_sample_8_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_14.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_15_sample_1_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_15.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_21_sample_4_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_16.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_24_sample_9_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_17.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_34_sample_8_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_18.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_42_sample_0_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_1_19.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_66_sample_7_kernel.py",
+    "expected": "S1.1"
+  },
+  {
+    "file": "S1_2_00.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_29_sample_2_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_01.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_5_sample_0_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_02.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_51_sample_8_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_03.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_v2",
+    "origin": "level_1_problem_83_sample_7_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_04.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton",
+    "origin": "level_2_problem_11_sample_3_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_05.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton",
+    "origin": "level_2_problem_41_sample_6_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_06.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton",
+    "origin": "level_2_problem_93_sample_8_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_07.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v2",
+    "origin": "level_2_problem_57_sample_4_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_08.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v2",
+    "origin": "level_2_problem_76_sample_1_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_2_09.py",
+    "run": "Qwen3.6-27B_level2_lintloop_triton_v2",
+    "origin": "level_2_problem_79_sample_5_kernel.py",
+    "expected": "S1.2"
+  },
+  {
+    "file": "S1_3_00.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_50_sample_1_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_01.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_50_sample_4_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_02.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_50_sample_5_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_03.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_86_sample_9_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_04.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_13_sample_6_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_05.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_14_sample_9_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_06.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_17_sample_0_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_07.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_18_sample_9_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_08.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_39_sample_5_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_09.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_39_sample_7_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_10.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_61_sample_9_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_11.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_63_sample_7_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_12.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_68_sample_5_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_13.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_84_sample_9_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_14.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_87_sample_9_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_15.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton",
+    "origin": "level_1_problem_98_sample_7_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_16.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_19_sample_5_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_17.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_36_sample_5_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_18.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_44_sample_7_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "S1_3_19.py",
+    "run": "Qwen3.6-27B_level1_lintloop_triton_no_think",
+    "origin": "level_1_problem_47_sample_3_kernel.py",
+    "expected": "S1.3"
+  },
+  {
+    "file": "good_00.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_100_sample_0_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_01.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_100_sample_1_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_02.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_100_sample_7_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_03.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_0_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_04.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_2_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_05.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_3_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_06.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_4_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_07.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_5_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_08.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_6_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_09.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_7_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_10.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_8_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_11.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_10_sample_9_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_12.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_0_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_13.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_1_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_14.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_2_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_15.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_3_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_16.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_4_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_17.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_5_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_18.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_6_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_19.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_7_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_20.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_8_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_21.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_11_sample_9_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_22.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_0_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_23.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_1_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_24.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_2_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_25.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_3_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_26.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_4_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_27.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_5_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_28.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_6_kernel.py",
+    "expected": null
+  },
+  {
+    "file": "good_29.py",
+    "run": "Qwen3-Coder-30B-A3B-Instruct_level1_lintloop_triton",
+    "origin": "level_1_problem_12_sample_7_kernel.py",
+    "expected": null
+  }
+]

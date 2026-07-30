@@ -33,11 +33,21 @@ class Analyzer(ABC):
         """The generic counts. The linter extends these with its own derived keys."""
         return build_summary(findings)
 
+    def should_run_checks(self, model: ModuleModel) -> bool:
+        """Whether a model is worth running checks over.
+
+        The linter needs a tree -- with nothing parsed there is no evidence for or against
+        any anti-pattern, and accusing a file we could not read is worse than silence. The
+        submission gate says the opposite: a file that does not parse is precisely the
+        thing it exists to report, so it overrides this.
+        """
+        return model.tree is not None
+
     def analyze(
         self, source: str, path: str = "", only: set[str] | None = None
     ) -> FileReport:
         model = self.build(source, path)
-        findings = self.registry.run(model, only=only) if model.tree is not None else []
+        findings = self.registry.run(model, only=only) if self.should_run_checks(model) else []
 
         summary = self.summarize(model, findings)
         if model.notes:
