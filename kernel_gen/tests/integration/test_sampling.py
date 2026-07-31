@@ -158,6 +158,63 @@ def test_scalars_derive_cleanly_over_the_stitched_trace():
         assert values[trace.seg == SEG_CODE].size > 0, name
 
 
+# -------------------------------------------------------------- the GLUED seam (KGEN-21)
+#
+# CODE above opens with a newline, so every test so far exercises a well-formed seam. When
+# pass 2 opens mid-line instead, the assembled text reads ```pythonimport torch -- and
+# _FENCE_TOKEN needs end-of-line after the info string, so it matches nothing at all. The
+# completion then falls to the no-fence path, whose first-statement resume skips the line
+# holding the fence and drops the import glued to it. Measured: 27 of 6944 two-pass
+# attempts, 8 of them with zero fenced blocks.
+
+
+def _traced_glued(code: str):
+    backend = FakeBackend(rules=[(PLAN, code)], default=PLAN + CODE_FENCE + code)
+    spec = SamplingSpec(think_temperature=1.0, temperature=0.3, trace_topk=TOPK)
+    return generate_batch_traced(backend, ["solve this"], spec)[0]
+
+
+GLUED = "import torch\nimport torch.nn as nn\n\n\nclass ModelNew:\n    pass\n```\n"
+
+
+def test_a_seam_glued_to_pass_two_still_delimits_a_fenced_block():
+    from kernel_gen.core.text import _fenced_blocks
+
+    out = _traced_glued(GLUED)
+    assert _fenced_blocks(out.text), "the injected fence must still open a block"
+
+
+def test_a_glued_seam_does_not_swallow_the_import_on_its_line():
+    # The whole cost of the bug: `import torch` shares a line with the fence, so the
+    # no-fence path's ^import anchor skips it and the kernel uses torch unimported.
+    # Compared line-wise on purpose -- `import torch` is a SUBSTRING of the surviving
+    # `import torch.nn as nn`, so a containment check passes while the import is gone.
+    out = _traced_glued(GLUED)
+    assert "import torch" in extract_code_block(out.text).splitlines()
+
+
+def test_a_glued_seam_starting_with_a_space_is_also_repaired():
+    # 22 of the 27 real cases start with a space, not an identifier.
+    out = _traced_glued(" " + GLUED)
+    assert "import torch" in extract_code_block(out.text).splitlines()
+
+
+def test_the_offsets_still_reslice_pass_two_exactly_when_the_seam_was_glued():
+    # The contract inspect_trace and the PRM line-join depend on. Repairing the seam
+    # changes its length, so code_char_start must be derived from what was written.
+    out = _traced_glued(GLUED)
+    meta = out.trace.meta
+    assert out.text[meta["code_char_start"] : meta["code_char_end"]] == GLUED
+
+
+def test_a_well_formed_seam_gains_no_second_newline():
+    # CODE already opens with "\n"; the repair must be a no-op there, not a double break.
+    out = _traced()
+    meta = out.trace.meta
+    assert out.text[meta["plan_char_end"] : meta["code_char_start"]] == CODE_FENCE
+    assert "```python\n\n" not in out.text
+
+
 # ------------------------------------------------------------------- the single pass
 
 
@@ -191,7 +248,8 @@ def test_a_backend_with_no_internals_yields_text_and_no_trace():
     )[0]
 
     assert out.trace is None  # "no trace", never an exception
-    assert out.text == PLAN_PREFIX + PLAN + CODE_FENCE + PLAN
+    # PLAN does not open with a newline, so the seam carries one for it (KGEN-21).
+    assert out.text == PLAN_PREFIX + PLAN + CODE_FENCE + "\n" + PLAN
 
 
 def test_empty_prompt_list_never_reaches_the_backend():

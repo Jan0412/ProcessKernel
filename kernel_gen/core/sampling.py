@@ -155,13 +155,17 @@ def _two_pass(
     "this finding is on line 40" back to "these tokens produced it", so they are
     recorded even for the two spans that have no tokens at all.
     """
-    text = PLAN_PREFIX + plan.text + CODE_FENCE + code.text
+    # CODE_FENCE carries no newline of its own, so when pass 2 opens mid-line the seam
+    # reads ```pythonimport torch, no fence matches, and the import sharing that line is
+    # dropped (KGEN-21). Offsets below come off `seam`, never CODE_FENCE.
+    seam = CODE_FENCE if code.text.startswith("\n") else CODE_FENCE + "\n"
+    text = PLAN_PREFIX + plan.text + seam + code.text
     if not (_traceable(plan) and _traceable(code)):
         return TracedCompletion(text=text)
 
     plan_start = len(PLAN_PREFIX)
     plan_end = plan_start + len(plan.text)
-    code_start = plan_end + len(CODE_FENCE)
+    code_start = plan_end + len(seam)
 
     trace = concat_passes(
         pack(plan.token_ids, plan.topk, k=k or 0, seg=SEG_PLAN),
