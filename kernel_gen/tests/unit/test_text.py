@@ -11,6 +11,7 @@ file carries the regression corpus for that whole class.
 from __future__ import annotations
 
 import ast
+import textwrap
 
 import pytest
 
@@ -495,3 +496,156 @@ def test_a_non_compilable_submission_still_beats_a_compilable_fragment():
     code = extract_code_block(text)
 
     assert "ModelNew" in code
+
+
+# -- KGEN-11: a submission written OUTSIDE the fenced blocks ---------------------------
+#
+# `extract_code_block` returned unconditionally once any fenced block existed, so the
+# no-fence fallback was unreachable whenever the model left even a two-line scrap in a
+# fence. Measured: 10 of 10,510 real completions shipped a fragment -- one of them 95
+# characters -- while a complete loadable kernel sat in the same string.
+
+_OUTSIDE_KERNEL = (
+    "import torch\nimport torch.nn as nn\n\n"
+    "class ModelNew(nn.Module):\n    def forward(self, x):\n        return x\n"
+)
+
+
+def test_an_unfenced_answer_after_the_last_fence_is_recovered():
+    text = "Draft:\n```python\nx = 1\n```\n\nThat was wrong. Final:\n\n" + _OUTSIDE_KERNEL
+
+    code = extract_code_block(text)
+
+    assert "class ModelNew" in code
+    assert "import torch" in code
+
+
+def test_an_answer_between_two_fenced_scraps_is_recovered():
+    """The answer need not be last: scanning only past the final fence misses this, and
+    it is one real completion in the corpus."""
+    text = (
+        "```python\nx = 1\n```\n\nFinal:\n\n" + _OUTSIDE_KERNEL + "\n```python\nz = 3\n```\n"
+    )
+
+    assert "class ModelNew" in extract_code_block(text)
+
+
+def test_a_loadable_fenced_submission_still_wins_over_an_outside_one():
+    """The 223-case guard. 223 real completions carry an outside-fence ModelNew *and* a
+    correct fenced extraction; a rule that preferred the outside one would rewrite all of
+    them."""
+    fenced = _OUTSIDE_KERNEL.replace("return x", "return x * 2")
+    text = "```python\n" + fenced + "```\n\nAside:\n\n" + _OUTSIDE_KERNEL
+
+    assert "return x * 2" in extract_code_block(text)
+
+
+def test_an_outside_region_without_forward_still_beats_a_fragment():
+    """Rejecting an outside candidate for lacking `forward` hands the answer to a
+    fragment with no entry class at all -- which violates the ladder's own dominant
+    criterion. This is the case 20,000 fuzz trials caught in a draft that the whole-corpus
+    replay called clean."""
+    text = (
+        "```python\nx = tl.load(p)\n```\n\nHere:\n\n"
+        "import torch\nimport torch.nn as nn\n\n"
+        "class ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n"
+    )
+
+    assert "class ModelNew" in extract_code_block(text)
+
+
+def test_a_completion_with_no_fence_at_all_takes_the_unchanged_path():
+    """Fence-free text must keep going through the no-fence path, which normalises fence
+    markers and can fall back to the largest parseable prefix. Routing it through the
+    ladder instead regressed a real completion from loadable to not."""
+    text = "## Plan\n\nFuse the ops.\n\n" + _OUTSIDE_KERNEL + "\nThat should be faster.\n"
+
+    code = extract_code_block(text)
+
+    assert "class ModelNew" in code
+    assert "That should be faster" not in code
+
+
+def test_the_recovered_answer_is_dedented_like_a_fenced_block():
+    text = "```python\nx = 1\n```\n\nFinal:\n\n" + textwrap.indent(_OUTSIDE_KERNEL, "    ")
+
+    code = extract_code_block(text)
+
+    assert code.startswith("import torch")
+
+
+# -- KGEN-19: an unparseable ModelNew outranks a parseable fragment --------------------
+#
+# The ladder had no tier for "contains the entry class but does not parse", so such a
+# block fell past `loadable` and `parseable` and lost to a snippet with no entry class.
+# 27 of 10,510. None becomes loadable -- the value is that the repair round and the PRM
+# label point at the model's real kernel instead of at an unrelated fragment.
+
+
+def test_an_unparseable_modelnew_block_outranks_a_parseable_fragment():
+    text = (
+        "```python\nimport triton\n```\n\n"
+        "```python\nimport torch\n\n\nclass ModelNew(nn.Module):\n"
+        "    def forward(self, x):\n        y = tl.load(\n```\n"
+    )
+
+    assert "class ModelNew" in extract_code_block(text)
+
+
+def test_a_parseable_submission_still_outranks_an_unparseable_one():
+    """Entry class dominates, and parseability breaks ties *within* it -- not above it."""
+    text = (
+        "```python\nimport torch\n\n\nclass ModelNew(nn.Module):\n"
+        "    def forward(self, x):\n        y = tl.load(\n```\n\n"
+        "```python\n" + _OUTSIDE_KERNEL + "```\n"
+    )
+
+    code = extract_code_block(text)
+
+    assert "return x" in code
+    assert "tl.load(" not in code
+
+
+def test_a_loadable_outside_answer_beats_an_unparseable_fenced_modelnew():
+    """The two fixes collide here: on 2 real completions, applying KGEN-19 first ships a
+    786- or 234-character non-loadable block instead of a 6,026- or 7,872-character
+    loadable kernel."""
+    text = (
+        "```python\nimport torch\n\n\nclass ModelNew(nn.Module):\n"
+        "    def forward(self, x):\n        y = tl.load(\n```\n\nFinal:\n\n"
+        + _OUTSIDE_KERNEL
+    )
+
+    code = extract_code_block(text)
+
+    assert "tl.load(" not in code
+    assert "return x" in code
+
+
+# -- the entry class is a real class, not a substring ---------------------------------
+
+
+def test_a_class_named_ModelNewHelper_does_not_outrank_the_real_submission():
+    """`"class ModelNew" in src` is true of `class ModelNewHelper`, so a substring test
+    ranks a later helper class above the real answer. Only the AST can tell them apart."""
+    text = (
+        "```python\n" + _OUTSIDE_KERNEL + "```\n"
+        "```python\nclass ModelNewHelper:\n    pass\n```\n"
+    )
+
+    code = extract_code_block(text)
+
+    assert "class ModelNewHelper" not in code
+    assert "return x" in code
+
+
+def test_class_ModelNew_in_a_comment_does_not_outrank_the_real_submission():
+    text = (
+        "```python\n" + _OUTSIDE_KERNEL + "```\n"
+        "```python\n# class ModelNew goes here\ny = 2\n```\n"
+    )
+
+    code = extract_code_block(text)
+
+    assert "# class ModelNew goes here" not in code
+    assert "return x" in code

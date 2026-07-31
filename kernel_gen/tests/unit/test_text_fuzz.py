@@ -99,10 +99,17 @@ def _reachable_candidates(raw: str) -> list[str]:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="KGEN-11: a loadable ModelNew written outside the fenced blocks is unreachable, "
-           "because the no-fence fallback only runs when there are no fenced blocks at all. "
-           "146/2000 generated completions violate the property. Delete this marker with "
-           "the ladder fix.",
+    reason="Residual, and confined to the no-fence path. The ladder fix took this from "
+           "146/2000 generated completions to 7/2000, and every survivor has ZERO fenced "
+           "blocks: it reaches the no-fence path, which resumes at the FIRST Python "
+           "statement rather than ranking candidates. That path is deliberately untouched "
+           "-- routing fence-free text through the ladder regressed a real completion from "
+           "loadable to not (level_1_problem_76_sample_4 r0, 0 fence markers, 13411 chars "
+           "recovered only by _largest_parseable_prefix). Measured on real data the gap is "
+           "empty: of 171 completions with no fenced blocks, 131 extract without a "
+           "ModelNew and NONE of them had a loadable one reachable -- they are genuine "
+           "model failures. Fixing this means ranking inside the no-fence path too, which "
+           "needs its own before/after replay.",
 )
 def test_a_loadable_modelnew_anywhere_is_never_discarded():
     rng = random.Random(SEED)

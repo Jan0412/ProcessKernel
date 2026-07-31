@@ -5,7 +5,7 @@ format. The correctness claims survive a model change; the frequency claims do n
 battery is the part that does -- each case is a shape a *different* model could plausibly
 emit, and several are already handled only by luck.
 
-The three ``xfail`` cases are the ranking bugs KGEN-11 and KGEN-19 fix.
+The ranking bugs KGEN-11 and KGEN-19 are covered here alongside the fence shapes.
 """
 
 from __future__ import annotations
@@ -93,32 +93,29 @@ def test_modelnew_bound_by_assignment_is_a_submission():
     assert "ModelNew" in extract_code_block(raw)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known, deliberately unfixed: a ``` inside a docstring reads as a closing "
-           "fence. A docstring-aware walk was prototyped and changed 0 of 10,510 real "
-           "completions, so it was not built. Delete this marker if you build it.",
-)
 def test_a_docstring_fence_does_not_truncate_the_block():
+    # A ``` inside a docstring closes the block early at the text level, but the region
+    # after it is now an ordinary candidate, so the kernel is still reachable.
     raw = _fence('s = """\n```\n"""\n' + KERNEL)
     assert ENTRY_CLASS in extract_code_block(raw)
 
 
-# -- the three ranking bugs, red until KGEN-11 / KGEN-19 land ---------------------
+# -- the ranking bugs KGEN-11 and KGEN-19 --------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="KGEN-11: an answer between fences is unreachable")
 def test_an_answer_between_two_fenced_scraps_is_recovered():
     raw = _fence("x = 1\n") + "\nFinal:\n\n" + KERNEL + "\n" + _fence("z = 3\n")
     assert ENTRY_CLASS in extract_code_block(raw)
 
 
-@pytest.mark.xfail(strict=True, reason="KGEN-19: ModelNewHelper matches the substring test")
-def test_a_class_named_ModelNewHelper_is_not_a_submission():
-    raw = _fence("x = 1\n") + _fence("class ModelNewHelper:\n    pass\n")
-    assert "ModelNewHelper" not in extract_code_block(raw)
+def test_a_class_named_ModelNewHelper_does_not_outrank_the_real_submission():
+    raw = _fence(KERNEL) + _fence("class ModelNewHelper:\n    pass\n")
+    out = extract_code_block(raw)
+    assert "class ModelNewHelper" not in out
+    assert ENTRY_CLASS in out
 
 
-@pytest.mark.xfail(strict=True, reason="KGEN-19: a comment matches the substring test")
-def test_class_ModelNew_in_a_comment_is_not_a_submission():
-    raw = _fence("x = 1\n") + _fence("# class ModelNew goes here\ny = 2\n")
-    assert "# class ModelNew goes here" not in extract_code_block(raw)
+def test_class_ModelNew_in_a_comment_does_not_outrank_the_real_submission():
+    raw = _fence(KERNEL) + _fence("# class ModelNew goes here\ny = 2\n")
+    out = extract_code_block(raw)
+    assert "# class ModelNew goes here" not in out
+    assert ENTRY_CLASS in out
