@@ -28,6 +28,40 @@ ENTRY_CLASS = "class ModelNew"
 #: time (5,844 of 45,853 in the level 1+2 traces).
 _FENCE_TOKEN = re.compile(r"```([A-Za-z0-9_+#-]*)[ \t]*(?:\r?\n|$)")
 
+#: Where prose stops and Python starts. Used to skip a "## Plan" heading or a numbered
+#: list ahead of unfenced code.
+_FIRST_STATEMENT = re.compile(r"^[ \t]*(?:import\s|from\s|@|def\s|class\s)", re.MULTILINE)
+
+
+def _parses(src: str) -> bool:
+    try:
+        ast.parse(src)
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _loads(src: str) -> bool:
+    """What the evaluator actually needs: ``exec(compile(...))``, not just a parse.
+
+    ``compile`` runs the symbol-table and codegen passes on top of the parser, so it
+    rejects source ``ast.parse`` accepts -- a duplicated kernel parameter being by far
+    the most common in practice. Raises wider than ``SyntaxError`` (``ValueError`` on
+    a null byte, ``IndentationError``, ``MemoryError`` on pathological nesting), hence
+    the broad except.
+    """
+    try:
+        compile(src, "<block>", "exec")
+        return True
+    except Exception:  # noqa: BLE001 - the family is wider than SyntaxError
+        return False
+
+
+def _resume_at_first_statement(src: str) -> str:
+    """``src`` from its first Python statement, dedented; ``''`` when there is none."""
+    head = _FIRST_STATEMENT.search(src)
+    return textwrap.dedent(src[head.start():]).strip() if head else ""
+
 
 def _fenced_blocks(text: str) -> list[str]:
     """The completion's fenced code blocks, paired open->close in document order.
@@ -99,28 +133,6 @@ def extract_code_block(text: str) -> str:
     untouched.
     """
 
-    def _parses(src: str) -> bool:
-        try:
-            ast.parse(src)
-            return True
-        except (SyntaxError, ValueError):
-            return False
-
-    def _loads(src: str) -> bool:
-        """What the evaluator actually needs: ``exec(compile(...))``, not just a parse.
-
-        ``compile`` runs the symbol-table and codegen passes on top of the parser, so it
-        rejects source ``ast.parse`` accepts -- a duplicated kernel parameter being by far
-        the most common in practice. Raises wider than ``SyntaxError`` (``ValueError`` on
-        a null byte, ``IndentationError``, ``MemoryError`` on pathological nesting), hence
-        the broad except.
-        """
-        try:
-            compile(src, "<block>", "exec")
-            return True
-        except Exception:  # noqa: BLE001 - the family is wider than SyntaxError
-            return False
-
     blocks = _fenced_blocks(text)
     if blocks:
         # Containing ModelNew stays the dominant criterion and loadability only breaks
@@ -143,9 +155,8 @@ def extract_code_block(text: str) -> str:
     # and deleting it outright would splice that line onto the next one.
     stripped = textwrap.dedent(_FENCE_TOKEN.sub("\n", text.strip()))
     if not _parses(stripped):
-        head = re.search(r"^[ \t]*(?:import\s|from\s|@|def\s|class\s)", stripped, re.MULTILINE)
-        if head:
-            candidate = textwrap.dedent(stripped[head.start():]).strip()
+        candidate = _resume_at_first_statement(stripped)
+        if candidate:
             if _parses(candidate):
                 return candidate
             salvage = _largest_parseable_prefix(candidate)
