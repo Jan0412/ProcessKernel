@@ -131,6 +131,16 @@ class StagedRenderer(Renderer):
         )
 
 
+def feedback(
+    report: FileReport,
+    previous_check_ids: set[str] | None = None,
+    max_findings: int = 8,
+    policy: Policy = "severity",
+) -> Feedback:
+    """Prompt-ready feedback and the ids it contains. The function the critic injects."""
+    return StagedRenderer(max_findings, policy).feedback(report, previous_check_ids)
+
+
 def render(
     report: FileReport,
     previous_check_ids: set[str] | None = None,
@@ -141,7 +151,7 @@ def render(
 
     That ``None`` is the loop's early stop: it is what makes a clean sample free.
     """
-    return StagedRenderer(max_findings, policy).render(report, previous_check_ids)
+    return feedback(report, previous_check_ids, max_findings, policy).text
 
 
 def _render_broken(report: FileReport) -> str:

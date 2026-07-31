@@ -20,7 +20,7 @@ import pytest
 from kernel_gen.core import artifacts
 from kernel_gen.core.backend import Backend, FakeBackend
 from kernel_gen.core.critics import lint_critic
-from kernel_gen.core.engine import run_rounds
+from kernel_gen.core.engine import _previous_check_ids, run_rounds
 from kernel_gen.core.model import Attempt, Problem, Trajectory
 from kernel_gen.core.sampling import (
     CODE_FENCE,
@@ -94,6 +94,52 @@ def test_attempt_and_review_still_hide_heavy_fields_from_the_journal():
 
 
 # ---- class B: the right element chosen (on real data) --------------------
+
+
+# The round -> "what was the model told" rule, which is a seam by construction: the critic
+# writes it and both the repair prompt and the readout read it. KGEN-17/18 were one field
+# meaning two different things at the two ends.
+
+
+def _traj_with(data: dict) -> Trajectory:
+    from kernel_gen.core.model import Review
+
+    traj = Trajectory(problem=Problem(level=1, problem_id=1, name="x", ref_arch_src=""),
+                      sample_id=0)
+    traj.attempts.append(
+        Attempt(round=0, raw="", code="", review=Review(text="", clean=False, data=data))
+    )
+    return traj
+
+
+@pytest.mark.parametrize(
+    "data, expected, why",
+    [
+        ({"shown_check_ids": ["S1.0"], "check_ids": []}, {"S1.0"},
+         "gate-blocked: the prompt named S1.0 and no lint check ran"),
+        ({"shown_check_ids": ["F1.2"], "check_ids": ["F1.2", "F1.4"]}, {"F1.2"},
+         "severity staging hid the warn, so it was never shown"),
+        ({"shown_check_ids": ["S1.3"], "check_ids": ["F1.2"]}, {"S1.3"},
+         "the gate replaced the lint text entirely"),
+        ({"shown_check_ids": [], "check_ids": ["F1.2"]}, set(),
+         "nothing was shown: must NOT fall back to what fired"),
+        ({"check_ids": ["F1.2", "F1.4"]}, {"F1.2", "F1.4"},
+         "pre-gate journal: no shown_check_ids, so reproduce the old behaviour exactly"),
+        ({"check_ids": []}, set(), "pre-gate journal with nothing to say"),
+        ({}, set(), "a record with neither key"),
+    ],
+)
+def test_the_previous_round_is_read_as_what_was_shown(data, expected, why):
+    assert _previous_check_ids(_traj_with(data)) == expected, why
+
+
+def test_a_slot_with_no_previous_round_has_nothing_to_repeat():
+    traj = Trajectory(problem=Problem(level=1, problem_id=1, name="x", ref_arch_src=""),
+                      sample_id=0)
+    assert _previous_check_ids(traj) == set()
+
+    traj.attempts.append(Attempt(round=0, raw="", code="", review=None))
+    assert _previous_check_ids(traj) == set()  # a critic that crashed claims nothing
 
 
 def test_extraction_is_the_last_valid_modelnew_on_the_whole_corpus():

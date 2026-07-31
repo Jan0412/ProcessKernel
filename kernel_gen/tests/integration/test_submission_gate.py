@@ -178,3 +178,55 @@ def test_a_repeated_submission_defect_is_marked_as_repeated(critic, problem):
     text = critic(problem, DUPLICATE_ARG, {"S1.0"}).text
 
     assert "still here" in text
+
+
+# -- what the prompt actually said (KGEN-17/18) ------------------------------
+# `check_ids` above is the linter's and stays that way. What the two downstream readers
+# need is the disjoint question -- which ids reached the prompt -- and when the gate
+# blocks, the answer is not a subset of `check_ids` at all.
+
+CHEATING_AND_BROKEN = PRELUDE + '''
+
+@triton.jit
+def k(x_ptr, o_ptr, W, W, BLOCK: tl.constexpr):
+    pass
+
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        return torch.conv2d(x, x)
+'''
+
+
+def test_the_review_records_what_the_prompt_contained(critic, problem):
+    assert critic(problem, DUPLICATE_ARG, set()).data["shown_check_ids"] == ["S1.0"]
+
+
+def test_a_suppressed_lint_finding_is_not_recorded_as_shown(critic, problem):
+    """KGEN-17's inversion, at the source. The lint findings fired but were replaced by
+    the gate's message, so carrying them forward claims the model was told something it
+    never saw."""
+    review = critic(problem, CHEATING_AND_BROKEN, set())
+
+    assert "S1.0" in review.data["shown_check_ids"]
+    assert not [c for c in review.data["shown_check_ids"] if c.startswith("F")]
+    # the record still has the lint findings; only the prompt did not
+    assert review.data["check_ids"]
+
+
+def test_a_clean_kernel_records_nothing_shown(critic, problem):
+    # Present and empty, not absent: absent is what a pre-gate journal looks like.
+    review = critic(problem, VALID, set())
+
+    assert review.data["shown_check_ids"] == []
+
+
+def test_shown_ids_are_exactly_the_ids_in_the_prompt(critic, problem):
+    """The invariant the whole fix rests on, asserted on the critic's own output."""
+    import re
+
+    for source in (VALID, DUPLICATE_ARG, MISSING_IMPORT, CHEATING_AND_BROKEN, NO_ENTRY_CLASS):
+        review = critic(problem, source, set())
+        bulleted = set(re.findall(r"^- \*\*([A-Z]\d+\.\d+)\*\*", review.text, re.MULTILINE))
+
+        assert set(review.data["shown_check_ids"]) == bulleted, source

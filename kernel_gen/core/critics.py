@@ -24,8 +24,8 @@ from __future__ import annotations
 from typing import Callable
 
 from checker import analyze_source
-from checker.core.feedback import Policy
-from checker.core.feedback import render as render_findings
+from checker.core.feedback import Feedback, Policy
+from checker.core.feedback import feedback as feedback_findings
 from checker.submission import SubmissionAnalyzer
 from checker.submission.feedback import BlockingRenderer
 
@@ -33,7 +33,7 @@ from .model import Problem, Review
 
 
 def lint_critic(
-    render: Callable[..., str | None] = render_findings,
+    feedback: Callable[..., Feedback] = feedback_findings,
     only: set[str] | None = None,
     policy: Policy = "severity",
     max_findings: int = 8,
@@ -59,14 +59,15 @@ def lint_critic(
             fallback_shapes=_shapes(problem, shape_cache),
         )
         submission_report = submission.analyze(code, path="<generated>")
-        blocked = blocking.render(submission_report, previous_check_ids)
+        blocked = blocking.feedback(submission_report, previous_check_ids)
 
-        text = blocked if blocked is not None else render(
+        shown = blocked if blocked.text is not None else feedback(
             report,
             previous_check_ids=previous_check_ids,
             max_findings=max_findings,
             policy=policy,
         )
+        text = shown.text
         summary = report.summary
         return Review(
             text=text or "",
@@ -81,7 +82,13 @@ def lint_critic(
                 "n_fail": summary.get("n_fail", 0),
                 "n_warn": summary.get("n_warn", 0),
                 "check_ids": summary.get("check_ids", []),
-                "submission_ok": blocked is None,
+                "submission_ok": blocked.text is None,
+                # What the prompt ACTUALLY contained, which `check_ids` above cannot say:
+                # the gate replaces the lint text, severity staging hides warns behind
+                # fails, and the cap truncates. Both readers of this journal -- the repeat
+                # marker and the readout's per-check table -- need what was shown, not
+                # what fired (KGEN-17, KGEN-18).
+                "shown_check_ids": sorted(shown.check_ids),
             },
             # The full findings, carried past the summary that used to be all the loop
             # kept. Each one holds a `lineno` in its data, which is a verifier pointing

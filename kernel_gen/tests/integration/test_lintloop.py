@@ -89,6 +89,13 @@ class ModelNew(nn.Module):
 
 BROKEN = "```python\nclass ModelNew(nn.Module:\n```"  # will not parse
 
+# Parses and lints (F1.2 fail + F1.4 warn), but `nn` is never imported, so the submission
+# gate blocks it and its lint findings never reach the prompt.
+MISSING_NN_IMPORT = CHEATING.replace("import torch.nn as nn\n", "")
+
+# Launches the kernel, then hands the result back to torch: F1.4 alone, no F1.2.
+LAUNCH_THEN_TORCH = HONEST.replace("        return out\n", "        return torch.relu(out)\n")
+
 PROBLEM = Problem(level=1, problem_id=19, name="19_ReLU.py", ref_arch_src=REF)
 REPAIR_MARKER = "## Your previous solution"
 
@@ -156,6 +163,61 @@ def test_findings_that_survive_a_round_are_marked_in_the_next_prompt(tmp_path):
     round_1, round_2 = backend.batches[1][0], backend.batches[2][0]
     assert "still here" not in round_1  # nothing to compare against yet
     assert "still here" in round_2  # …and by round 2 the model has ignored it twice
+
+
+# -- the repeat marker tells the truth (KGEN-17) -----------------------------
+# Asserted on the prompt the fake backend actually received, so nothing is hand-fed. The
+# marker claims "you were told this last round", and each of these is a way that claim
+# used to be false.
+
+
+def test_a_repeated_submission_defect_is_marked_through_the_loop(tmp_path):
+    """The test whose absence let KGEN-17 ship. A file that will not parse fires S1.0 and
+    no lint check at all, so the round recorded no ids and the defect could repeat forever
+    without ever being called a repeat."""
+    backend = FakeBackend(default=BROKEN)  # never repairs
+    run(backend, str(tmp_path), num_samples=1)
+
+    round_1, round_2 = backend.batches[1][0], backend.batches[2][0]
+    assert "S1.0" in round_1 and "still here" not in round_1
+    marked = [line for line in round_2.splitlines() if "still here" in line]
+    assert len(marked) == 1 and "S1.0" in marked[0]
+
+
+def test_a_suppressed_lint_finding_is_not_claimed_as_repeated(tmp_path):
+    """KGEN-17b, cause 1. Round 0 is blocked by the gate, so its F1.2 was never shown --
+    and round 2 must not tell the model it was."""
+    backend = FakeBackend(rules=[(REPAIR_MARKER, CHEATING)], default=MISSING_NN_IMPORT)
+    run(backend, str(tmp_path), num_samples=1)
+
+    round_1, round_2 = backend.batches[1][0], backend.batches[2][0]
+    assert "S1.3" in round_1 and "F1.2" not in round_1  # the gate replaced the lint text
+    assert "F1.2" in round_2  # now the linter gets its turn …
+    assert "still here" not in round_2  # … for the first time, and says so
+
+
+def test_a_warn_hidden_by_severity_staging_is_not_claimed_as_repeated(tmp_path):
+    """KGEN-17b, cause 2 -- the 15.2% of real rounds. Round 0 trips F1.2 (fail) and F1.4
+    (warn); staging shows only the fail. When round 1 clears the fail and F1.4 finally
+    surfaces, it is new to the model however long it has been in the code."""
+    backend = FakeBackend(rules=[(REPAIR_MARKER, LAUNCH_THEN_TORCH)], default=CHEATING)
+    run(backend, str(tmp_path), num_samples=1)
+
+    round_1, round_2 = backend.batches[1][0], backend.batches[2][0]
+    assert "F1.2" in round_1 and "F1.4" not in round_1  # staging hid the warn
+    assert "F1.4" in round_2
+    assert "still here" not in round_2
+
+
+def test_the_journal_records_what_each_prompt_contained(tmp_path):
+    """The field both readers consume, written by the loop rather than by a fixture."""
+    backend = FakeBackend(default=MISSING_NN_IMPORT)
+    trajs = run(backend, str(tmp_path), num_samples=1)
+
+    shown = [a.review.data["shown_check_ids"] for a in trajs[0].attempts]
+    assert all(ids == ["S1.3"] for ids in shown), shown
+    # what fired is still recorded separately, and still the linter's
+    assert "F1.2" in trajs[0].attempts[0].review.data["check_ids"]
 
 
 def test_a_generation_that_does_not_parse_is_told_so(tmp_path):

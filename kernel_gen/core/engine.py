@@ -152,8 +152,17 @@ def _review(
 
 
 def _previous_check_ids(traj: Trajectory) -> set[str]:
-    """What the critic complained about in this slot's previous round, if any."""
+    """What the model was actually TOLD in this slot's previous round, if anything.
+
+    Not what fired: the repeat marker asserts "you were told this last round", so feeding
+    it suppressed ids makes the prompt claim something untrue (KGEN-17). `check_ids` is the
+    fallback for journals written before `shown_check_ids` existed, which reproduces the
+    old behaviour exactly rather than pretending the record says more than it does.
+    """
     last = traj.last
     if last is None or last.review is None:
         return set()
-    return set(last.review.data.get("check_ids") or [])
+    data = last.review.data
+    if "shown_check_ids" in data:
+        return set(data["shown_check_ids"] or [])
+    return set(data.get("check_ids") or [])

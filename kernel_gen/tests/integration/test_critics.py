@@ -50,8 +50,10 @@ def test_findings_stay_out_of_the_serialized_review(problem, dead_kernel_file):
 
     assert review.findings  # captured ...
     assert "findings" not in record  # ... and not journaled
-    # submission_ok (KGEN-14) is the one key added since: a bool per round, against a
-    # journal that is read end-to-end on every resumed run.
+    # Two keys have been added since, against a journal that is read end-to-end on every
+    # resumed run: submission_ok (KGEN-14), a bool per round, and shown_check_ids
+    # (KGEN-17/18), the ids the prompt actually contained -- bounded by max_findings, so
+    # at most 8 short strings per round.
     assert set(record) == {
         "clean",
         "parse_status",
@@ -59,6 +61,7 @@ def test_findings_stay_out_of_the_serialized_review(problem, dead_kernel_file):
         "n_warn",
         "check_ids",
         "submission_ok",
+        "shown_check_ids",
     }
 
 
@@ -77,6 +80,7 @@ def test_the_journal_record_for_a_whole_slot_is_unchanged_in_shape(problem, dead
         "n_warn",
         "check_ids",
         "submission_ok",
+        "shown_check_ids",  # KGEN-17/18; see the note in the test above
     }
 
 
