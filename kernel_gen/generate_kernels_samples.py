@@ -19,11 +19,9 @@ Example (single problem):
 """
 
 import argparse
-import ast
 import os
 import re
 import sys
-import textwrap
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -32,6 +30,7 @@ sys.path.insert(0, SCRIPT_DIR)
 KERNELBENCH_SRC = os.path.join(SCRIPT_DIR, "KernelBench", "src")
 sys.path.insert(0, KERNELBENCH_SRC)
 
+from core.text import extract_code_block  # noqa: E402
 from gen_config import print_generation_summary, write_generation_config
 
 
@@ -46,56 +45,6 @@ def parse_problems(spec: str) -> list[int]:
         else:
             ids.append(int(part))
     return ids
-
-
-def extract_code_block(text: str) -> str:
-    """The model's **final** complete kernel file, dedented; else its best effort.
-
-    Not the first fenced block, which is what this used to return. Reasoning models
-    revise in the open: they write a kernel, then "Wait, ``tl.dot`` expects ``a`` to be
-    ``(BLOCK_K, 1)``...", then write it again. Measured on the first traced run
-    (Qwen3.6-27B, KernelBench level 1), 12 of 14 completions had a later, better block
-    than the one taken, and four took a bare fragment with no imports and no class.
-    See ``kernel_gen/core/text.py``, which is the copy under test.
-    """
-
-    def _parses(src: str) -> bool:
-        try:
-            ast.parse(src)
-            return True
-        except (SyntaxError, ValueError):
-            return False
-
-    # Pair fences open->close in document order (mirror of kernel_gen/core/text.py, the
-    # tested copy). An info-tagged ```python OPENS; a bare ``` CLOSES; a bare ``` seen
-    # outside a block is a stray closer and is skipped (KGEN-3); a block left open at
-    # end-of-text is the max_tokens tail (KGEN-2). A regex cannot tell an opening fence
-    # from a closing one, which is why this walk replaced one.
-    blocks = []
-    start = None
-    for m in re.finditer(r"```([A-Za-z0-9_+#-]*)[ \t]*(?:\r?\n|$)", text):
-        opener = bool(m.group(1))
-        if start is not None:
-            blocks.append(text[start : m.start()])
-            start = m.end() if opener else None
-        elif opener:
-            start = m.end()
-    if start is not None:
-        blocks.append(text[start:])
-    blocks = [textwrap.dedent(b).strip() for b in blocks]
-    if blocks:
-        parseable = [b for b in blocks if _parses(b)]
-        submissions = [b for b in parseable if "class ModelNew" in b]
-        return (submissions or parseable or blocks[:1])[-1]
-
-    stripped = textwrap.dedent(re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip()))
-    if not _parses(stripped):
-        head = re.search(r"^[ \t]*(?:import\s|from\s|@|def\s|class\s)", stripped, re.MULTILINE)
-        if head:
-            candidate = textwrap.dedent(stripped[head.start():]).strip()
-            if _parses(candidate):
-                return candidate
-    return stripped.strip()
 
 
 def problem_id_from_name(name: str, fallback: int) -> int:

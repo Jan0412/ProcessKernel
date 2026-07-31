@@ -22,10 +22,16 @@ Two properties are load-bearing and easy to destroy by accident:
 
 A DELIBERATE, TIME-BOXED FORK
 -----------------------------
-``text.py`` and ``sampling.py`` re-implement ``extract_code_block``,
-``problem_id_from_name``, ``parse_problems``, ``load_model`` and the two-pass
-think/code sampler from ``generate_kernels_samples.py`` -- roughly 120 duplicated
-lines. This is not drift and it is not an oversight.
+``text.py`` and ``sampling.py`` re-implement ``problem_id_from_name``,
+``parse_problems``, ``load_model`` and the two-pass think/code sampler from
+``generate_kernels_samples.py`` -- roughly 90 duplicated lines. This is not drift
+and it is not an oversight.
+
+``extract_code_block`` used to be on this list too, until its copies drifted far
+enough to ship an empty file for real model successes (KGEN-15, same defect class
+as KGEN-9). The three ``generate_kernels_*``/``generate_kernelbook_samples.py``
+scripts now import it from ``text.py`` instead of carrying their own copy -- the
+one piece of this fork that stopped being worth re-deriving by hand.
 
 Pointing ``generate_kernels_samples.py`` at this package would change arm A1's
 output: its sampler shape changes (``n=1`` per slot), and it would gain the

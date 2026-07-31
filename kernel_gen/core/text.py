@@ -1,7 +1,10 @@
 """Pure string helpers: completion -> code, CLI spec -> ids, problem name -> id.
 
-Duplicated from ``generate_kernels_samples.py`` on purpose -- see this package's
-docstring. Keep them byte-equivalent in behavior until the arms are ported.
+``parse_int_spec``/``problem_id_from_name`` are duplicated from
+``generate_kernels_samples.py`` on purpose -- see this package's docstring. Keep them
+byte-equivalent in behavior until the arms are ported. ``extract_code_block`` is NOT
+duplicated: the three ``generate_kernels_*``/``generate_kernelbook_samples.py`` scripts
+import it from here directly (KGEN-15) -- this is its only copy.
 """
 
 from __future__ import annotations
