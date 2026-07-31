@@ -166,6 +166,22 @@ def report_speed(baseline: dict, refined: dict, buckets: dict) -> dict:
     }
 
 
+def _shown_check_ids(entry: dict) -> list:
+    """What the model was actually TOLD this round.
+
+    Not what fired. The submission gate's message *replaces* the lint feedback, severity
+    staging hides every warn while a fail exists, and ``max_findings`` truncates -- so
+    ``check_ids`` (the linter's own summary) attributes a round to checks that never
+    reached the prompt, and misses the submission defects entirely. Journals written
+    before ``shown_check_ids`` existed never recorded what was shown, so they fall back to
+    the old field and reproduce their old numbers exactly rather than pretending
+    otherwise (KGEN-18).
+    """
+    if "shown_check_ids" in entry:
+        return entry["shown_check_ids"]
+    return entry.get("check_ids", [])
+
+
 def report_lint(trajectories: dict, rounds: int) -> dict:
     """The mechanism, NOT the result. See this module's docstring."""
     if not trajectories:
@@ -174,11 +190,18 @@ def report_lint(trajectories: dict, rounds: int) -> dict:
 
     print()
     print("=" * 68)
-    print("  What the linter saw, round by round  [mechanism, not result]")
+    print("  What the model was TOLD, round by round  [mechanism, not result]")
     print("-" * 68)
 
     per_round_ids: list[Counter] = [Counter() for _ in range(rounds)]
     per_round_n = [0] * rounds
+    # Counted only over rounds that carry `submission_ok`: the gate postdates the older
+    # journals, and a missing flag is "not recorded", not "was not blocked".
+    n_blocked = [0] * rounds
+    n_gated = [0] * rounds
+    # Journals predating `shown_check_ids` cannot say what was shown, so the caption below
+    # must not claim they do -- that would be the very defect this section was fixed for.
+    n_recorded_shown = 0
     clean_at = Counter()
 
     for record in trajectories.values():
@@ -187,8 +210,12 @@ def report_lint(trajectories: dict, rounds: int) -> dict:
             if r >= rounds:
                 continue
             per_round_n[r] += 1
-            for check_id in entry.get("check_ids", []):
+            n_recorded_shown += "shown_check_ids" in entry
+            for check_id in _shown_check_ids(entry):
                 per_round_ids[r][check_id] += 1
+            if "submission_ok" in entry:
+                n_gated[r] += 1
+                n_blocked[r] += not entry["submission_ok"]
         if record.get("clean"):
             clean_at[record["final_round"]] += 1
 
@@ -199,6 +226,13 @@ def report_lint(trajectories: dict, rounds: int) -> dict:
         if per_round_n[r]:
             print(f"    round {r}: {per_round_n[r]:>5} ran, "
                   f"{clean_at[r]:>5} went clean here")
+
+    if any(n_gated):
+        print("-" * 68)
+        print("  Unloadable at the gate (scored zero however well it lints):")
+        for r in range(rounds):
+            if n_gated[r]:
+                print(f"    round {r}: {_rate(n_blocked[r], n_gated[r])}")
 
     check_ids = sorted({c for counter in per_round_ids for c in counter})
     if check_ids:
@@ -213,13 +247,27 @@ def report_lint(trajectories: dict, rounds: int) -> dict:
             )
             print(f"  {check_id:<8}{cells}")
         print("-" * 68)
+        if n_recorded_shown:
+            print("  Each round is counted under the checks its prompt actually named, so")
+            print("  a check that fired while the file was unloadable -- or that staging")
+            print("  hid behind a fail -- is NOT counted. S1.* are the submission gate's.")
+        else:
+            print("  This journal predates `shown_check_ids`, so it never recorded what")
+            print("  the model was told and these rows are the linter's raw findings.")
+            print("  Rounds whose feedback was replaced by the submission gate, or whose")
+            print("  warns were staged out behind a fail, are counted here under checks")
+            print("  that never reached the prompt. Treat the rows as upper bounds.")
         print("  Rates are over the slots that RAN that round, and the slots that run a")
-        print("  later round are exactly the ones the linter was unhappy with -- so a rate")
-        print("  that climbs is expected and means nothing on its own. F1.6 is the one to")
-        print("  watch: it fires on a kernel that copies its input and computes nothing,")
-        print("  and a loop is exactly the thing that could induce one. But a rise is")
-        print("  equally consistent with 'the model learned to evade a check we put in its")
-        print("  prompt', and this arm alone cannot separate those two.")
+        print("  later round are exactly the ones the critic was unhappy with, so a rate")
+        print("  that climbs is expected and means nothing on its own -- a cohort that")
+        print("  simply persists raises every rate it is counted in.")
+        if any(n_gated):
+            print("  Read a rise against the gate rate above before reading it as the")
+            print("  loop inducing a defect.")
+        print("  F1.6 -- a kernel that copies its input and computes nothing -- is still")
+        print("  the one worth watching, but a rise in it is equally consistent with 'the")
+        print("  model learned to evade a check we put in its prompt', and this arm alone")
+        print("  cannot separate those two.")
     print("=" * 68)
 
     return {
@@ -227,6 +275,8 @@ def report_lint(trajectories: dict, rounds: int) -> dict:
         "n_clean": sum(clean_at.values()),
         "clean_by_round": dict(clean_at),
         "check_counts_by_round": [dict(c) for c in per_round_ids],
+        "n_blocked_by_round": n_blocked,
+        "n_gated_by_round": n_gated,
     }
 
 

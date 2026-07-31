@@ -133,6 +133,31 @@ def test_the_previous_round_is_read_as_what_was_shown(data, expected, why):
     assert _previous_check_ids(_traj_with(data)) == expected, why
 
 
+@pytest.mark.parametrize(
+    "data, expected, why",
+    [
+        ({"shown_check_ids": ["S1.0"], "check_ids": []}, {"S1.0"},
+         "gate-blocked: the prompt named S1.0 and no lint check ran"),
+        ({"shown_check_ids": ["F1.2"], "check_ids": ["F1.2", "F1.4"]}, {"F1.2"},
+         "severity staging hid the warn, so it was never shown"),
+        ({"shown_check_ids": [], "check_ids": ["F1.2"]}, set(),
+         "nothing was shown: must NOT fall back to what fired"),
+        ({"check_ids": ["F1.2", "F1.4"]}, {"F1.2", "F1.4"}, "pre-gate journal"),
+        ({}, set(), "a record with neither key"),
+    ],
+)
+def test_the_prompt_and_the_readout_read_the_round_identically(data, expected, why):
+    """The property the whole KGEN-17/18 fix rests on. These two consumers sit at opposite
+    ends of the run -- the repair prompt during it, the readout after -- and each used to
+    re-derive "what was the model told" on its own. One field, one rule, or the experiment
+    and the thing it reports on drift apart silently."""
+    from kernel_gen.readout import _shown_check_ids
+
+    entry = {"round": 0, "n_chars": 10, "clean": False, **data}
+
+    assert _previous_check_ids(_traj_with(data)) == set(_shown_check_ids(entry)) == expected, why
+
+
 def test_a_slot_with_no_previous_round_has_nothing_to_repeat():
     traj = Trajectory(problem=Problem(level=1, problem_id=1, name="x", ref_arch_src=""),
                       sample_id=0)
