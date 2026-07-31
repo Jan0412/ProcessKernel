@@ -207,18 +207,25 @@ def write_traces(
             "system_prompt": system_prompt,
             "prompt": attempt.prompt,
             "raw": attempt.raw,
-            "n_chars_code": len(attempt.code),
+            # The extracted kernel the critic was actually handed, verbatim -- NOT its
+            # length, and not something to re-derive later. `extract_code_block`'s ranking
+            # has changed six times (KGEN-9, 11, 14, 15, 19, 21), so re-extracting `raw` at
+            # read time returns a DIFFERENT string for a record captured under an older
+            # ranking: measured over 10,510 real records, 292 (2.78%) had drifted that way
+            # (KGEN-20). Storing it costs ~22% on top of `raw` and removes the drift
+            # mechanism rather than detecting it.
+            "code": attempt.code,
             "clean": bool(attempt.review and attempt.review.clean),
             # `feedback` is the rendered critic text -- the exact string folded into the
             # NEXT round's prompt; `findings` is the same verdict structured, with a lineno
             # per entry. Both kept: the text is what the model sees, the structure is what a
             # reward model reads.
             #
-            # Each lineno is 1-based into `extract_code_block(raw)` -- the string the critic
-            # was handed -- NOT into `raw`, and NOT into raw sliced at `code_char_start`.
-            # That slice keeps the newline after the fence, the closing fence and any
-            # trailing prose, so it is off by at least one line and for a single-pass run
-            # is the whole completion. Resolve a lineno by re-extracting.
+            # Each lineno is 1-based into `code` above -- NOT into `raw`, and NOT into raw
+            # sliced at `code_char_start`. That slice keeps the newline after the fence, the
+            # closing fence and any trailing prose, so it is off by at least one line and
+            # for a single-pass run is the whole completion (KGEN-10). Resolve a lineno by
+            # reading `code`; re-extracting `raw` is what KGEN-20 removed.
             "feedback": attempt.review.text if attempt.review else "",
             "findings": attempt.review.findings if attempt.review else [],
             "trace": None,

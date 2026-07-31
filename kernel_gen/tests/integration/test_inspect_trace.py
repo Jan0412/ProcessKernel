@@ -46,7 +46,10 @@ def run_dir(tmp_path):
             Attempt(
                 round=0,
                 raw=completion.text,
-                code="import torch",
+                # What `engine.py` actually stores: the extraction of THIS raw, not a
+                # placeholder. The join under test resolves linenos against it, so a
+                # fixture disconnected from `raw` would make every assertion below vacuous.
+                code=extract_code_block(completion.text),
                 review=Review(text="F1.2", clean=False, data={"n_fail": 1},
                               findings=[FINDING]),
                 trace=completion.trace,
@@ -96,13 +99,13 @@ def test_a_finding_resolves_to_the_source_line_the_linter_actually_meant(run_dir
     # cannot see: it pins that the finding is PRINTED with its number, not that the source
     # shown next to it is the right line.
     #
-    # linenos are 1-based into extract_code_block(raw). Slicing raw at code_char_start
-    # instead keeps the newline after the fence, the closing fence and any trailing prose,
-    # so every line comes out shifted -- on real traces, 479 of 480 findings landed on the
-    # wrong line and several onto reasoning prose rather than code.
+    # linenos are 1-based into the code the critic was handed -- `record["code"]`, stored
+    # verbatim at write time. Slicing raw at code_char_start instead keeps the newline
+    # after the fence, the closing fence and any trailing prose, so every line comes out
+    # shifted -- on real traces, 479 of 480 findings landed on the wrong line and several
+    # onto reasoning prose rather than code (KGEN-10).
     record = inspect_trace.load_records(run_dir, 0)[0]
-    code_lines = extract_code_block(record["raw"]).splitlines()
-    expected = code_lines[FINDING["data"]["lineno"] - 1].strip()
+    expected = record["code"].splitlines()[FINDING["data"]["lineno"] - 1].strip()
     assert expected == "pass"  # the fixture's line 5, stated so the test is readable
 
     inspect_trace.inspect(run_dir, record, 0, n_tokens=5)
@@ -110,6 +113,54 @@ def test_a_finding_resolves_to_the_source_line_the_linter_actually_meant(run_dir
         line for line in capsys.readouterr().out.splitlines() if "F1.2" in line and "line 5" in line
     )
     assert finding_line.rstrip().endswith(f"| {expected}")
+
+
+def test_the_line_join_uses_the_stored_code_not_a_fresh_extraction(run_dir, capsys):
+    """KGEN-20: the join must survive a change to ``extract_code_block``.
+
+    The reader used to re-derive the code by re-running the extractor over ``raw``, so a
+    trace captured under an older ranking silently re-joined against different text under
+    a newer one -- no error, no warning. Measured over 10,510 real records, 292 (2.78%)
+    had already drifted that way, printing the wrong line for 119 findings and a blank one
+    for 20 more.
+
+    Simulated here by storing code that a fresh extraction demonstrably would NOT produce.
+    That divergence is what six real extractor changes (KGEN-9, 11, 14, 15, 19, 21) each
+    manufactured for the records written before them.
+    """
+    marker = "return marker_the_extractor_cannot_reach(x)"
+    drifted = f"import torch\n\n\nclass ModelNew:\n    {marker}\n"
+
+    records = inspect_trace.load_records(run_dir, 0)
+    record = dict(records[0], code=drifted)
+    # The scenario is only meaningful if the two really disagree.
+    assert marker not in extract_code_block(record["raw"])
+
+    inspect_trace.inspect(run_dir, record, 0, n_tokens=5)
+    finding_line = next(
+        line for line in capsys.readouterr().out.splitlines() if "F1.2" in line and "line 5" in line
+    )
+    assert finding_line.rstrip().endswith(f"| {marker}")
+
+
+def test_a_record_written_before_the_code_field_does_not_crash(run_dir, capsys):
+    # Pre-KGEN-20 journals carry `n_chars_code` and no `code`. Re-extracting for them would
+    # reintroduce the very drift this fix removes, so the reader says so and skips the
+    # lookup rather than printing a line it cannot vouch for.
+    record = inspect_trace.load_records(run_dir, 0)[0]
+    record.pop("code")
+
+    inspect_trace.inspect(run_dir, record, 0, n_tokens=5)
+    out = capsys.readouterr().out
+
+    assert "no stored code" in out
+    assert "F1.2" in out and "line 5" in out  # the finding itself still reports
+
+
+def test_the_reader_no_longer_re_extracts_the_code(run_dir):
+    # The meta-guard on the fix: the drift is impossible only while there is no second
+    # extraction path left to drift. A re-introduced fallback would pass every test above.
+    assert not hasattr(inspect_trace, "extract_code_block")
 
 
 def test_the_summary_reports_how_many_plans_were_cut_off(run_dir, capsys):

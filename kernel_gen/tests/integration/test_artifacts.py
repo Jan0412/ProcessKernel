@@ -139,6 +139,19 @@ def test_findings_are_persisted_with_their_line_numbers(tmp_path):
     assert record["clean"] is False
 
 
+def test_the_graded_code_is_persisted_verbatim_not_as_a_length(tmp_path):
+    # KGEN-20. The record used to keep `n_chars_code` and leave the reader to re-derive the
+    # code by re-running the extractor over `raw` -- which silently returns something else
+    # once the extractor's ranking changes, as it has six times (KGEN-9, 11, 14, 15, 19, 21).
+    # A lineno is 1-based into THIS string, so THIS string is what has to survive.
+    out = str(tmp_path)
+    artifacts.write_traces(out, [_slot(out)], 0)
+
+    record = _records(out)[0]
+    assert record["code"] == "import torch"  # _slot's attempt.code, byte for byte
+    assert "n_chars_code" not in record  # len(record["code"]) recovers it
+
+
 def test_the_record_carries_the_system_prompt_user_prompt_and_feedback(tmp_path):
     # The three fields that make a line a self-contained training example: the constant
     # system message, the exact user turn the model saw, and the rendered critic text
