@@ -96,7 +96,7 @@ THINK_TEMP="${THINK_TEMP:-1.0}"
 MODEL_SLUG=$(basename "$MODEL")
 TAG=$([ "$DATASET" = "kernelbook" ] && echo "kb" || echo "level")
 # OUTPUT_DIR="$SLURM_SUBMIT_DIR/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v2"
-OUTPUT_DIR="/path/to/workdir/KernelBench/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v3"
+OUTPUT_DIR="/path/to/workdir/KernelBench/runs/${MODEL_SLUG}_${TAG}${LEVEL}_lintloop_triton_v4"
 
 if [ "$THINK_TEMP" = "0" ]; then
     OUTPUT_DIR="${OUTPUT_DIR}_nothink"
