@@ -96,7 +96,7 @@ def test_kgen9_real_completions_recover_an_unfenced_answer(case):
 def test_kgen2_real_completions_recover_the_unterminated_final(case):
     # KGEN-2, now fixed: each of these real completions has a complete earlier block that
     # USED to win over the cut-off final ModelNew. Extraction now recovers the tail. See
-    # checker/tests/KERNEL_GEN_BUGS.md.
+    # kernel_gen/tests/KERNEL_GEN_BUGS.md.
     assert extract_code_block(case["raw"]).strip() == case["oracle"].strip()
 
 
@@ -106,7 +106,7 @@ def test_kgen3_real_completions_survive_a_stray_closing_fence(case):
     # parseable ModelNew (the oracle) that a stray closing fence used to hide -- the old
     # regex paired that stray ``` with the real block's ```python opener and shipped the
     # inter-block prose. _fenced_blocks now ignores a bare ``` outside a block, so the
-    # real block is recovered. See checker/tests/KERNEL_GEN_BUGS.md.
+    # real block is recovered. See kernel_gen/tests/KERNEL_GEN_BUGS.md.
     out = extract_code_block(case["raw"])
     assert "class ModelNew" in out
     assert out.strip() == case["oracle"].strip()
