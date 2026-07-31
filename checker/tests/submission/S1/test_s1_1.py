@@ -50,6 +50,25 @@ def test_the_finding_is_fail_severity():
     assert s1_1(PRELUDE + KERNEL)[0].severity == "fail"
 
 
+def test_an_empty_file_is_rejected():
+    """KGEN-22. An empty file compiles fine -- `compile("")` succeeds -- so S1.0 is right
+    to stay silent, and the analyzer's own docstring says the empty case "is S1.1's
+    business". It binds no `ModelNew`, so it is exactly this check's question."""
+    assert [f.check_id for f in s1_1("")] == ["S1.1"]
+
+
+def test_a_whitespace_only_file_is_rejected():
+    assert [f.check_id for f in s1_1("   \n\n\t\n")] == ["S1.1"]
+
+
+def test_an_empty_file_is_not_reported_as_loadable():
+    """The consequence that made this worth fixing: `submission_ok` claimed the evaluator
+    could load a file with nothing in it."""
+    report = SubmissionAnalyzer().analyze("", "<test>")
+
+    assert report.findings, "an empty file is not loadable"
+
+
 def test_a_class_named_Model_is_rejected_and_the_message_says_so():
     """The most recoverable version of this defect: the work is done, the name is wrong."""
     source = PRELUDE + KERNEL + '''

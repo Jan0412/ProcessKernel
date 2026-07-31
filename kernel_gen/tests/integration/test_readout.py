@@ -240,11 +240,12 @@ def test_a_post_gate_journal_is_captioned_as_what_was_shown(capsys):
 
 
 def test_every_round_that_did_not_go_clean_names_at_least_one_check():
-    """The rows must sum to the denominator. The one documented exception is a generation
-    that contained no code at all: it fires no check because there is nothing to check --
-    2 of 3812 real non-clean rounds, and it must not grow silently."""
+    """The rows must sum to the denominator. Since KGEN-22 closed the empty-file hole in
+    S1.1 there is no exception left: `scripts/verify_attribution.py` reports 0 of 3812 real
+    non-clean rounds attributed to nothing, down from 1139."""
     shapes = [
         _round(0, shown=["S1.0"], submission_ok=False, parse_status="syntax_error"),
+        _round(0, shown=["S1.1"], submission_ok=False, parse_status="empty"),
         _round(0, shown=["S1.3"], check_ids=["F1.2"], submission_ok=False),
         _round(0, shown=["F1.2"], check_ids=["F1.2", "F1.4"], submission_ok=True),
         _round(0, shown=["F2.1"], check_ids=["F2.1"], submission_ok=True),
@@ -252,6 +253,3 @@ def test_every_round_that_did_not_go_clean_names_at_least_one_check():
     for shape in shapes:
         table = _table({(1, 0): _traj((1, 0), [shape])})
         assert table[0], f"non-clean round attributed to nothing: {shape}"
-
-    empty = _round(0, shown=[], check_ids=[], submission_ok=True, parse_status="empty")
-    assert _table({(1, 0): _traj((1, 0), [empty])})[0] == {}

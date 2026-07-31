@@ -52,15 +52,21 @@ def _rounds() -> list[dict]:
     return out
 
 
-def _would_fire_s1_0(entry: dict) -> bool:
-    """Whether the submission gate would have caught this round's file.
+def _gate_check(entry: dict) -> str | None:
+    """Which submission check would have caught this round's file, if any.
 
-    Judged from `parse_status`, which the journal does record: S1.0 wraps `compile()`,
-    and `compile()` parses first, so anything the linter called a syntax error is
-    something the gate rejects. `empty` is the documented residual -- there is no code to
-    reject, and nothing else fires either.
+    Judged from `parse_status`, which the journal does record. S1.0 wraps `compile()`, and
+    `compile()` parses first, so anything the linter called a syntax error is something the
+    gate rejects. An empty file is the opposite case -- it compiles fine, so S1.0 is right
+    to stay silent, and S1.1 owns it because a module with no body binds no `ModelNew`
+    (KGEN-22).
     """
-    return entry.get("parse_status") == "syntax_error"
+    status = entry.get("parse_status")
+    if status == "syntax_error":
+        return "S1.0"
+    if status == "empty":
+        return "S1.1"
+    return None
 
 
 def main() -> None:
@@ -71,10 +77,11 @@ def main() -> None:
 
     non_clean = [e for e in rounds if not e["clean"]]
     before = [e for e in non_clean if not e.get("check_ids")]
-    after = [e for e in before if not _would_fire_s1_0(e)]
+    after = [e for e in before if _gate_check(e) is None]
 
     by_status = collections.Counter(e.get("parse_status") for e in before)
     residual = collections.Counter(e.get("parse_status") for e in after)
+    gained = collections.Counter(_gate_check(e) for e in before if _gate_check(e))
 
     n = len(non_clean)
     print(f"rounds journaled        : {len(rounds)}")
@@ -90,22 +97,18 @@ def main() -> None:
         print(f"     parse_status={status:<13}: {count}")
     print("-" * 60)
     moved = len(before) - len(after)
-    print(f"rounds that gain a row  : {moved}, all of them to S1.0")
+    print(f"rounds that gain a row  : {moved}")
+    for check_id, count in sorted(gained.items()):
+        print(f"     -> {check_id}: {count}")
 
-    # If a syntax_error round did NOT move, the S1.0 predicate is narrower than compile().
-    unmoved = [e for e in after if e.get("parse_status") == "syntax_error"]
-    if unmoved:
+    # A syntax_error round that did not move means the S1.0 predicate is narrower than
+    # compile(); an empty one means S1.1 is not owning the case its own analyzer assigns it.
+    if after:
         raise SystemExit(
-            f"FAIL: {len(unmoved)} syntax_error rounds still attributed to nothing; "
-            f"the S1.0 predicate is narrower than compile()"
+            f"FAIL: {len(after)} non-clean rounds still attributed to no check "
+            f"({dict(residual)}); every one should be caught by the submission gate"
         )
-    for entry in after:
-        if entry.get("parse_status") != "empty":
-            raise SystemExit(
-                f"FAIL: unexpected residual parse_status={entry.get('parse_status')!r}; "
-                f"only 'empty' (a generation with no code at all) is a known residual"
-            )
-    print("OK: the only rounds left unattributed contained no code at all.")
+    print("OK: every non-clean round is attributed to at least one check.")
 
 
 if __name__ == "__main__":

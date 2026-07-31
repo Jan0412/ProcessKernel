@@ -58,13 +58,20 @@ class NoEntryClass(Check):
     def run(self, model: ModuleModel) -> list[Finding]:
         # A file that does not compile never gets far enough to bind anything. S1.0
         # reports the cause; repeating it here as a missing class reports a consequence.
-        if model.tree is None or model.compile_error is not None:
+        if model.compile_error is not None:
             return []
 
-        if ENTRY in module_level_bindings(model.tree):
+        # `tree is None` is not the same question. The front end nulls it for an empty
+        # source as well as an unparseable one -- but an empty file parses and compiles
+        # fine, which is why S1.0 stays silent on it and why this check is the one that
+        # owns it (see SubmissionAnalyzer.build). An empty module binds nothing, so it
+        # falls through to the no-class branch below (KGEN-22).
+        tree = model.tree if model.tree is not None else ast.Module(body=[], type_ignores=[])
+
+        if ENTRY in module_level_bindings(tree):
             return []
 
-        classes = [n.name for n in model.tree.body if isinstance(n, ast.ClassDef)]
+        classes = [n.name for n in tree.body if isinstance(n, ast.ClassDef)]
         if classes:
             listed = ", ".join(f"`{c}`" for c in classes)
             detail = (
