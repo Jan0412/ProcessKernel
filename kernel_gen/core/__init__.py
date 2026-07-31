@@ -1,6 +1,6 @@
 """Shared machinery for kernel-generation arms: problems in, kernel files out.
 
-The four ``generate_kernels_*.py`` scripts each carry their own copy of the same
+The three ``generate_*.py`` scripts each carry their own copy of the same
 ``main()``: load a dataset, build a prompt per problem, sample N completions,
 extract the code block, write ``level_{L}_problem_{P}_sample_{S}_kernel.py``. That
 shape is fine for a one-shot generation and hopeless for a *loop*, which needs to

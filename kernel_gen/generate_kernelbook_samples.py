@@ -28,8 +28,6 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-KERNELBENCH_SRC = os.path.join(SCRIPT_DIR, "KernelBench", "src")
-sys.path.insert(0, KERNELBENCH_SRC)
 
 from gen_config import print_generation_summary, write_generation_config
 from generate_kernels_samples import extract_code_block, generate_samples, load_model
