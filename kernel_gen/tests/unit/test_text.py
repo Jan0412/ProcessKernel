@@ -649,3 +649,23 @@ def test_class_ModelNew_in_a_comment_does_not_outrank_the_real_submission():
 
     assert "# class ModelNew goes here" not in code
     assert "return x" in code
+
+
+def test_a_parseable_submission_outranks_an_unparseable_one_even_when_neither_loads():
+    """Tier order within the entry class: parses beats does-not-parse.
+
+    The earlier test uses a *loadable* submission, so the top tier answers it and the
+    ordering of the two tiers below is never exercised. Here nothing loads -- the first
+    block parses but `def k(x, W, W)` is rejected by compile() -- so the result depends
+    entirely on `submissions` being tried before `entry_blocks`.
+    """
+    text = (
+        "```python\nimport torch\n\n\ndef k(x, W, W):\n    pass\n\n\n"
+        "class ModelNew:\n    def forward(self, x):\n        return x\n```\n\n"
+        "```python\nclass ModelNew:\n    def forward(self, x):\n        y = tl.load(\n```\n"
+    )
+
+    code = extract_code_block(text)
+
+    assert "def k(x, W, W)" in code
+    assert "tl.load(" not in code
