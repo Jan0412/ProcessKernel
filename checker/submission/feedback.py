@@ -10,7 +10,7 @@ is suboptimal; it is being told the file never ran.
 
 from __future__ import annotations
 
-from ..core.feedback import Renderer
+from ..core.feedback import Feedback, Renderer
 from ..core.model import FileReport
 
 _HEADER = "## Your previous solution could not be loaded"
@@ -23,11 +23,11 @@ _INSTRUCTION = (
 
 
 class BlockingRenderer(Renderer):
-    def render(
+    def feedback(
         self, report: FileReport, previous_check_ids: set[str] | None = None
-    ) -> str | None:
+    ) -> Feedback:
         if not report.findings:
-            return None
+            return Feedback(None, frozenset())
 
         previous = previous_check_ids or set()
         lines = [
@@ -45,4 +45,7 @@ class BlockingRenderer(Renderer):
             )
             lines.append(f"- **{finding.check_id}** {finding.message}{repeat}")
         lines.extend(["", _INSTRUCTION])
-        return "\n".join(lines)
+        # Nothing is staged and nothing is capped here, so what fired is what was shown.
+        return Feedback(
+            "\n".join(lines), frozenset(f.check_id for f in report.findings)
+        )

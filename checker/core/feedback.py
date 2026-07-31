@@ -30,6 +30,7 @@ told this last round and it is still here", which is what ``previous_check_ids``
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Literal
 
 from .model import Finding, FileReport
@@ -67,6 +68,21 @@ def actionable(report: FileReport, policy: Policy = "severity") -> list[Finding]
     raise ValueError(f"unknown feedback policy {policy!r}")
 
 
+@dataclass(frozen=True)
+class Feedback:
+    """Prompt text, and exactly the check ids that appear in it.
+
+    Two things downstream need to know what the model was *told*, not what *fired*: the
+    repeat marker ("you were told this last round") and the readout's per-check table.
+    Those differ whenever staging suppresses a warn, the cap truncates, or the submission
+    gate replaces the lint text -- and only the renderer knows. So it says so, rather than
+    leaving every consumer to guess from a summary that cannot express it.
+    """
+
+    text: str | None
+    check_ids: frozenset[str]
+
+
 class Renderer(ABC):
     """Report -> prompt text, or ``None`` when there is nothing worth another round.
 
@@ -77,9 +93,15 @@ class Renderer(ABC):
     """
 
     @abstractmethod
+    def feedback(
+        self, report: FileReport, previous_check_ids: set[str] | None = None
+    ) -> Feedback: ...
+
     def render(
         self, report: FileReport, previous_check_ids: set[str] | None = None
-    ) -> str | None: ...
+    ) -> str | None:
+        """Text only. Derived, so text and ids cannot drift apart."""
+        return self.feedback(report, previous_check_ids).text
 
 
 class StagedRenderer(Renderer):
@@ -89,17 +111,24 @@ class StagedRenderer(Renderer):
         self.max_findings = max_findings
         self.policy = policy
 
-    def render(
+    def feedback(
         self, report: FileReport, previous_check_ids: set[str] | None = None
-    ) -> str | None:
+    ) -> Feedback:
         if report.parse_status in ("syntax_error", "empty", "read_error"):
-            return _render_broken(report)
+            # This block names no check, so it reports none -- the file never reached one.
+            return Feedback(_render_broken(report), frozenset())
 
         findings = actionable(report, self.policy)
         if not findings:
-            return None
+            return Feedback(None, frozenset())
 
-        return _render_findings(findings, previous_check_ids or set(), self.max_findings)
+        # Selected once, then used for both the text and the ids: the cap and the staging
+        # are exactly the steps every downstream reconstruction used to get wrong.
+        shown = _shown(findings, self.max_findings)
+        return Feedback(
+            _render_findings(shown, previous_check_ids or set(), len(findings) - len(shown)),
+            frozenset(f.check_id for f in shown),
+        )
 
 
 def render(
@@ -132,14 +161,20 @@ def _render_broken(report: FileReport) -> str:
     )
 
 
-def _render_findings(
-    findings: list[Finding], previous: set[str], max_findings: int
-) -> str:
-    # Fails first, so the cap -- when it bites -- drops performance advice rather than
-    # a correctness violation.
+def _shown(findings: list[Finding], max_findings: int) -> list[Finding]:
+    """The findings the cap actually leaves in the prompt.
+
+    Fails first, so the cap -- when it bites -- drops performance advice rather than a
+    correctness violation.
+    """
     fails = [f for f in findings if f.severity == "fail"][:max_findings]
     warns = [f for f in findings if f.severity == "warn"][: max_findings - len(fails)]
-    n_hidden = len(findings) - len(fails) - len(warns)
+    return fails + warns
+
+
+def _render_findings(shown: list[Finding], previous: set[str], n_hidden: int) -> str:
+    fails = [f for f in shown if f.severity == "fail"]
+    warns = [f for f in shown if f.severity == "warn"]
 
     lines = [_HEADER, ""]
     lines.append(

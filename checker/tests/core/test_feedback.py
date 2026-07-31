@@ -8,10 +8,18 @@ optimize a kernel that is secretly calling torch).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from checker import analyze_source
-from checker.core.feedback import Renderer, StagedRenderer, actionable, render
+from checker.core.feedback import (
+    Feedback,
+    Renderer,
+    StagedRenderer,
+    actionable,
+    render,
+)
 from checker.core.model import FileReport, Finding
 
 from helpers import PRELUDE, forward_with
@@ -156,7 +164,8 @@ def test_the_free_function_and_the_renderer_agree():
     assert StagedRenderer().render(report) == render(report)
 
 
-def test_a_renderer_must_implement_render():
+def test_a_renderer_must_implement_feedback():
+    # `render` is derived, so `feedback` is the one a subclass has to supply.
     class Empty(Renderer):
         pass
 
@@ -183,3 +192,96 @@ def test_an_unknown_policy_is_refused():
     "show nothing" and quietly end every slot."""
     with pytest.raises(ValueError, match="unknown feedback policy"):
         actionable(_report(), policy="whatever")
+
+
+# -- what the text actually contains (KGEN-17/18) ---------------------------
+# Two readers downstream -- the repair prompt's repeat marker and the readout's mechanism
+# table -- were re-deriving "what was the model told" from a summary that cannot express
+# it, because staging and the cap happen here. So the renderer says it outright.
+
+
+def _ids_in(text: str | None) -> set[str]:
+    """The check ids actually bulleted in the prompt, read back out of the text."""
+    return set(re.findall(r"^- \*\*([A-Z]\d+\.\d+)\*\*", text or "", re.MULTILINE))
+
+
+def test_the_ids_reported_are_exactly_the_ids_in_the_text():
+    report = _report(
+        _finding("F1.4", "fail"),
+        _finding("F1.2", "fail"),
+        _finding("F2.1", "warn"),
+        _finding("F9.9", "info"),
+    )
+    result = StagedRenderer(policy="all").feedback(report)
+
+    assert result.check_ids == _ids_in(result.text)
+    assert result.check_ids == {"F1.4", "F1.2", "F2.1"}  # info is never actionable
+
+
+def test_a_suppressed_warn_is_not_reported_as_shown():
+    """The 15.2% case: severity staging hides every warn while a fail exists, but the
+    summary's `check_ids` still lists them -- which is how a round got marked as repeating
+    advice the model was never given."""
+    report = _report(
+        _finding("F1.4", "fail"), _finding("F2.1", "warn"), _finding("F2.3", "warn")
+    )
+    result = StagedRenderer(policy="severity").feedback(report)
+
+    assert result.check_ids == {"F1.4"}
+    assert "F2.1" not in result.text and "F2.3" not in result.text
+
+
+def test_a_truncated_finding_is_not_reported_as_shown():
+    report = _report(*[_finding(f"F1.{i}", "fail") for i in range(1, 4)])
+    result = StagedRenderer(max_findings=1).feedback(report)
+
+    assert result.check_ids == _ids_in(result.text)
+    assert len(result.check_ids) == 1
+
+
+def test_a_file_that_does_not_parse_reports_no_ids():
+    """Honest, and the reason the empty-source rounds stay the known residual: this block
+    names no check, so there is nothing to report."""
+    result = StagedRenderer().feedback(_report(parse_status="syntax_error"))
+
+    assert result.text is not None
+    assert result.check_ids == frozenset()
+
+
+def test_a_clean_report_reports_no_text_and_no_ids():
+    result = StagedRenderer().feedback(_report())
+
+    assert result.text is None
+    assert result.check_ids == frozenset()
+
+
+@pytest.mark.parametrize("policy", ["severity", "fails-only", "all"])
+@pytest.mark.parametrize("cap", [1, 2, 8])
+def test_render_still_returns_exactly_what_feedback_says(policy, cap):
+    """`render` is derived from `feedback`, so there is exactly one selection path and the
+    two can never drift."""
+    for source in (CHEATING, HONEST, "def forward(x:\n"):
+        report = analyze_source(source, "k.py")
+        renderer = StagedRenderer(max_findings=cap, policy=policy)
+
+        assert renderer.render(report) == renderer.feedback(report).text
+        assert render(report, max_findings=cap, policy=policy) == renderer.feedback(
+            report
+        ).text
+
+
+def test_the_reported_ids_survive_the_repeat_marker():
+    # The marker appends to the bullet; the id must still be reported exactly once.
+    report = _report(_finding("F1.4", "fail"), _finding("F1.2", "fail"))
+    result = StagedRenderer().feedback(report, previous_check_ids={"F1.4"})
+
+    assert result.check_ids == {"F1.4", "F1.2"} == _ids_in(result.text)
+
+
+def test_feedback_is_hashable_and_frozen():
+    # It gets stored on a Review and compared; accidental mutation would desync text/ids.
+    result = Feedback(text="x", check_ids=frozenset({"F1.4"}))
+
+    assert hash(result)
+    with pytest.raises(Exception):
+        result.text = "y"

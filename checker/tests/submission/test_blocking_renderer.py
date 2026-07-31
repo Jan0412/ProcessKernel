@@ -7,6 +7,8 @@ every kernel forever or blocks none.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from checker.core.feedback import Renderer
@@ -97,3 +99,43 @@ def test_a_first_time_finding_is_not_marked():
 @pytest.mark.parametrize("source", [GOOD, DUPLICATE_ARG, MISSING_NN])
 def test_rendering_never_raises(source):
     BlockingRenderer().render(SubmissionAnalyzer().analyze(source, "<test>"))
+
+
+# -- what the text actually contains (KGEN-17/18) ---------------------------
+
+
+def _feedback(source: str, previous: set[str] | None = None):
+    return BlockingRenderer().feedback(
+        SubmissionAnalyzer().analyze(source, "<test>"), previous
+    )
+
+
+def test_the_blocking_renderer_reports_every_finding():
+    """Nothing is staged here -- every S1.* is the same kind of thing -- so what fired and
+    what was shown are the same set."""
+    result = _feedback(DUPLICATE_ARG)
+
+    assert result.check_ids == {"S1.0"}
+    assert set(re.findall(r"^- \*\*(S\d+\.\d+)\*\*", result.text, re.MULTILINE)) == {
+        "S1.0"
+    }
+
+
+def test_a_loadable_file_reports_no_text_and_no_ids():
+    result = _feedback(GOOD)
+
+    assert result.text is None
+    assert result.check_ids == frozenset()
+
+
+def test_the_reported_ids_survive_the_repeat_marker():
+    assert _feedback(DUPLICATE_ARG, previous={"S1.0"}).check_ids == {"S1.0"}
+
+
+@pytest.mark.parametrize("source", [GOOD, DUPLICATE_ARG, MISSING_NN])
+def test_render_still_returns_exactly_what_feedback_says(source):
+    report = SubmissionAnalyzer().analyze(source, "<test>")
+    renderer = BlockingRenderer()
+
+    assert renderer.render(report) == renderer.feedback(report).text
+    assert renderer.render(report, {"S1.0"}) == renderer.feedback(report, {"S1.0"}).text
