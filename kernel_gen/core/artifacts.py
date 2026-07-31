@@ -79,7 +79,14 @@ def write_config(out_dir: str, config: dict, dataset: str) -> str:
         config.pop("pseudo_level", None)
 
     path = write_generation_config(out_dir, config)
-    write_generation_config(round_dir(out_dir, 0), config)
+
+    # A distinct run_name (KGEN-12): checker/runs.py:load_run prefers the stored value
+    # over the directory basename, so a plain copy makes round_0 indistinguishable from
+    # its parent to anything that later groups samples by run_name.
+    round0_config = dict(config)
+    if round0_config.get("run_name"):
+        round0_config["run_name"] = f"{round0_config['run_name']}/rounds/round_0"
+    write_generation_config(round_dir(out_dir, 0), round0_config)
     return path
 
 
