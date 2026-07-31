@@ -15,6 +15,10 @@ Categories (see fixtures/completions/corpus.jsonl):
   kgen9_broken            -> unfenced answer + the sampler's trailing ```python; recovered
                              since KGEN-9. Both were catalogued as model_failed until the
                              fix showed they contain a complete ModelNew.
+  kgen11_broken           -> the answer written OUTSIDE every fenced block; unreachable
+                             until the ladder took outside regions as candidates
+  kgen19_broken           -> a block spelling ModelNew that does not parse, which used to
+                             lose to a parseable fragment with no entry class
   model_failed            -> no valid ModelNew anywhere (the model failed, not a bug)
 """
 
@@ -35,6 +39,8 @@ WELLFORMED = [c for c in CORPUS if c["category"] in _CORRECT]
 KGEN2 = [c for c in CORPUS if c["category"] == "kgen2_broken"]
 KGEN3 = [c for c in CORPUS if c["category"] == "kgen3_broken"]
 KGEN9 = [c for c in CORPUS if c["category"] == "kgen9_broken"]
+KGEN11 = [c for c in CORPUS if c["category"] == "kgen11_broken"]
+KGEN19 = [c for c in CORPUS if c["category"] == "kgen19_broken"]
 FAILED = [c for c in CORPUS if c["category"] == "model_failed"]
 
 
@@ -47,7 +53,7 @@ def test_the_corpus_covers_every_behaviour():
     # would silently stop testing it. Fail loudly instead.
     cats = {c["category"] for c in CORPUS}
     assert {"single_block", "revision", "kgen2_broken", "kgen3_broken", "kgen9_broken",
-            "model_failed"} <= cats
+            "kgen11_broken", "kgen19_broken", "model_failed"} <= cats
 
 
 @pytest.mark.parametrize("case", WELLFORMED, ids=_id(WELLFORMED))
@@ -104,3 +110,31 @@ def test_kgen3_real_completions_survive_a_stray_closing_fence(case):
     out = extract_code_block(case["raw"])
     assert "class ModelNew" in out
     assert out.strip() == case["oracle"].strip()
+
+
+@pytest.mark.parametrize("case", KGEN11, ids=_id(KGEN11))
+def test_kgen11_real_completions_recover_an_answer_written_outside_the_fences(case):
+    # KGEN-11, now fixed. The model closed a draft's fence and wrote its real answer as
+    # plain text, so `extract_code_block` -- which returned as soon as any fenced block
+    # existed -- shipped whatever scrap happened to be fenced. One of these shipped 95
+    # characters while a 10,373-character loadable kernel sat in the same string.
+    out = extract_code_block(case["raw"])
+    assert out.strip() == case["oracle"].strip()
+    tree = ast.parse(out)  # a correct extraction is valid Python
+    model_new = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "ModelNew"
+    )
+    # Instantiable AND callable -- a recovery that lost forward() would still score zero.
+    assert "forward" in [m.name for m in model_new.body if isinstance(m, ast.FunctionDef)]
+    compile(out, "<kernel>", "exec")  # and loadable, which is what eval needs
+
+
+@pytest.mark.parametrize("case", KGEN19, ids=_id(KGEN19))
+def test_kgen19_real_completions_keep_the_entry_class_over_a_parseable_fragment(case):
+    # KGEN-19, now fixed. With no block both parsing AND defining ModelNew, the ladder
+    # fell past the blocks that merely spell it and shipped a fragment with no entry class
+    # -- pointing the repair round at the wrong file. None of these becomes loadable; the
+    # value is that the feedback and the PRM label name the model's real kernel.
+    out = extract_code_block(case["raw"])
+    assert out.strip() == case["oracle"].strip()
+    assert "class ModelNew" in out
