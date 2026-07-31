@@ -193,6 +193,19 @@ def test_a_pre_gate_journal_prints_no_blocked_line(capsys):
     assert summary["n_gated_by_round"] == [0, 0, 0]
 
 
+def test_rounds_beyond_the_requested_window_are_ignored():
+    # `--rounds` narrower than the journal: the extra rounds must not widen the table or
+    # the denominators, or the rates silently describe a different window than the header.
+    trajectories = {
+        (1, 0): _traj((1, 0), [_round(0, shown=["F1.2"], submission_ok=True),
+                               _round(1, shown=["F1.4"], submission_ok=False)])
+    }
+    summary = report_lint(trajectories, 1)
+
+    assert summary["check_counts_by_round"] == [{"F1.2": 1}]
+    assert summary["n_gated_by_round"] == [1]
+
+
 def test_an_empty_trajectory_set_is_still_handled(capsys):
     assert report_lint({}, 3) == {}
     assert "skipping the mechanism section" in capsys.readouterr().out
