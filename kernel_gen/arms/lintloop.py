@@ -313,13 +313,13 @@ def main() -> None:
         artifacts.write_attempts(out_dir, active, round_index)
         finished = [t for t in active if t.done]
         artifacts.write_kernels(out_dir, finished)
-        artifacts.append_jsonl(lint_log_path(out_dir), [t.to_dict() for t in finished])
         if args.trace:
             # Every slot that ran this round, not only the finished ones: a slot's
             # round-1 attempt is training data whether or not round 2 improved on it,
             # and it is unreachable once the trajectory moves on. Journaled per round
             # for the same reason the kernels are -- a crash costs only what is
-            # in flight.
+            # in flight. Written before the lint_log.jsonl append below, so a crash
+            # mid-write leaves the slot NOT marked done rather than done with no trace.
             artifacts.write_traces(
                 out_dir,
                 active,
@@ -328,6 +328,7 @@ def main() -> None:
                 vocab_size=getattr(backend, "vocab_size", None),
                 system_prompt=SYSTEM_PROMPT,
             )
+        artifacts.append_jsonl(lint_log_path(out_dir), [t.to_dict() for t in finished])
 
     trajectories = run_rounds(
         backend,
