@@ -30,9 +30,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-KERNELBENCH_SRC = os.path.join(SCRIPT_DIR, "KernelBench", "src")
-sys.path.insert(0, KERNELBENCH_SRC)
 
+from core.text import extract_code_block  # noqa: E402
 from gen_config import print_generation_summary, write_generation_config
 
 # Reranker tokenization constants — must match reranker/src/dataset.py exactly.
@@ -57,13 +56,6 @@ def parse_problems(spec: str) -> list[int]:
     return ids
 
 
-def extract_code_block(text: str) -> str:
-    match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip())
-
-
 def problem_id_from_name(name: str, fallback: int) -> int:
     """Extract the real KernelBench problem id from the problem name.
 
@@ -84,9 +76,16 @@ def load_model(model_id: str, load_in_4bit: bool):
     num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
     kwargs = dict(
         dtype="auto",
-        max_model_len=16384,
+        # See generate_kernels_samples.load_model: the longest one-shot prompt plus a
+        # full generation needs ~33k tokens; 40960 leaves headroom. KV cache is
+        # allocated on demand, so the raised cap does not inflate memory.
+        max_model_len=40960,
         gpu_memory_utilization=0.80,
         tensor_parallel_size=num_gpus,
+        # We only ever send text prompts. On a VL checkpoint (e.g. Qwen3.6) startup
+        # otherwise profiles the vision tower and dies at cublasCreate; zeroing every
+        # modality limit skips that. No-op on text-only models.
+        language_model_only=True,
     )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"

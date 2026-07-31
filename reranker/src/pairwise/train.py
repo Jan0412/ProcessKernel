@@ -112,6 +112,10 @@ def main() -> None:
         head_info=head_info,
         loss_type=cfg.pairwise.loss_type,
         margin=cfg.pairwise.margin,
+        weighted=cfg.pairwise.weighted_loss,
+        alpha=cfg.pairwise.loss_alpha,
+        group_weight_mass=train_ds.group_weight_mass if cfg.pairwise.weighted_loss else None,
+        n_pairs=len(train_ds),
         pair_collator=PairwiseCollator(tokenizer),
         eval_pairs_dataset=eval_pairs,
     )

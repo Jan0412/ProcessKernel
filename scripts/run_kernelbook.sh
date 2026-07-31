@@ -73,7 +73,7 @@ uv run python kernel_gen/generate_kernelbook_samples.py \
     --option one_shot \
     --gpu-name A100 \
     --max-new-tokens 16384 \
-    --max-model-len 24576 \
+    --max-model-len 40960 \
     --gpu-memory-utilization 0.92 \
     --trust-remote-code \
     --skip-existing

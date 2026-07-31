@@ -19,12 +19,29 @@ genuinely meaningful dims (RGB ``3``, spatial ``64``, ``784``) untouched. With
 and keeps the largest size whose Model actually runs; the chosen scale is recorded
 per row in the manifest. Pass ``--scale off`` for the original tiny-input behaviour.
 
+"Actually runs" is judged against *eval* conditions, not an empty card. Two guards
+make the smoke test reject a scale that would ship a reference every sample OOMs on:
+
+  * ``--smoke-mem-gb`` caps the CUDA allocator to the memory a sample really gets at
+    eval (it shares the GPU with the candidate model and other processes). Without
+    it, a reference needing e.g. 32 GiB passes on an idle 80GB card, then OOMs for
+    all 10 samples at eval — labelling every candidate wrong regardless of quality.
+  * ``--max-numel-ratio`` rejects "coupled init-dim" blowups, where a placeholder dim
+    that becomes an *output axis* (e.g. ``Linear(1, dimension)``) is up-scaled along
+    with the input, turning an ``S**2`` input into an ``S**3`` output.
+
+A rejected rung sends the row one step down the ladder (it is shrunk and re-tested),
+so such rows are kept at a smaller GPU-meaningful size rather than dropped. Every
+rejected rung and its reason is recorded per row in the manifest.
+
 Example:
     python convert_kernelbook.py \\
         --rows 0-499 \\
         --scale uniform \\
         --smoke-test \\
-        --out ~/KernelBench/KernelBench/level5
+        --smoke-mem-gb 12 \\
+        --max-numel-ratio 50 \\
+        --out ~/KernelBench/KernelBench/level6
 """
 
 import argparse
@@ -83,6 +100,28 @@ def main():
         default=300.0,
         help="Per-row time budget in seconds for --smoke-test build+forward; "
         "rows exceeding it are rejected (default: 300; 0 disables)",
+    )
+    parser.add_argument(
+        "--smoke-mem-gb",
+        type=float,
+        default=12.0,
+        help="Per-row GPU memory budget in GiB for --smoke-test (default: 12; 0 "
+        "disables). The smoke test runs on an *empty* card, but at eval time a "
+        "sample shares the GPU with the candidate model and other processes — so "
+        "a reference validated against the full 80GB can still OOM every sample "
+        "at eval. Capping the allocator here makes such a scale fail the smoke "
+        "test, so --scale-fallback down-scales the row instead of shipping a "
+        "reference that poisons all its labels.",
+    )
+    parser.add_argument(
+        "--max-numel-ratio",
+        type=float,
+        default=50.0,
+        help="Reject a scaled row whose forward output element count exceeds this "
+        "multiple of its input element count (default: 50; 0 disables). Catches "
+        "'coupled init-dim' blowups, where a placeholder dim that becomes an "
+        "output axis (e.g. Linear(1, dimension)) is up-scaled alongside the input, "
+        "turning an S**2 input into an S**3 output — absurd even when it fits.",
     )
     parser.add_argument(
         "--max-src-chars",
@@ -160,7 +199,8 @@ def main():
     print(f"Rows to convert  : {len(row_ids)}")
     print(
         f"Smoke test       : {args.smoke_test} (device={args.smoke_device}, "
-        f"timeout={args.smoke_timeout:g}s)"
+        f"timeout={args.smoke_timeout:g}s, mem_budget={args.smoke_mem_gb:g}GiB, "
+        f"max_numel_ratio={args.max_numel_ratio:g}x)"
     )
 
     manifest_path = os.path.join(args.out, "manifest.json")
@@ -176,12 +216,26 @@ def main():
         "skipped_convert": 0,
         "skipped_smoke": 0,
         "skipped_exists": 0,
+        # Rows where at least one scale rung was rejected by the new guards, i.e.
+        # a reference that would have OOM'd (or been absurd) at eval and poisoned
+        # every one of its labels. These are the rows the guards actually saved.
+        "guard_oom": 0,
+        "guard_blowup": 0,
     }
 
     # Each row's smoke test runs in an isolated, restartable child process so a
     # pathological row (OOM, segfault, CUDA abort, or hang) only kills the child
     # and is recorded as a skip — never the whole run. Reused so CUDA stays warm.
-    runner = SmokeRunner(device=args.smoke_device, timeout=args.smoke_timeout) if args.smoke_test else None
+    runner = (
+        SmokeRunner(
+            device=args.smoke_device,
+            timeout=args.smoke_timeout,
+            mem_budget_gb=args.smoke_mem_gb,
+            max_numel_ratio=args.max_numel_ratio,
+        )
+        if args.smoke_test
+        else None
+    )
 
     for row_id in row_ids:
         try:
@@ -217,11 +271,16 @@ def main():
         converted = None
         applied = None
         last_reason = ""
+        # Every rung the ladder had to reject, kept for the manifest so it is
+        # auditable *why* a row landed at the scale it did (memory budget, output
+        # blowup, plain crash) rather than just recording the surviving scale.
+        rejected: list[dict] = []
         for label, cfg in candidates:
             try:
                 cand = convert_row(python_code, module_name, scale=cfg)
             except ConversionError as e:
                 last_reason = str(e)
+                rejected.append({"scale": label, "reason": last_reason})
                 continue
             if not args.smoke_test:
                 converted, applied = cand, label
@@ -231,6 +290,19 @@ def main():
                 converted, applied = cand, label
                 break
             last_reason = reason
+            rejected.append({"scale": label, "reason": reason})
+
+        # Did the guards (not a plain crash) force this row down the ladder? These
+        # are exactly the references that would have OOM'd every sample at eval.
+        blowup_hit = any("footprint blowup" in r["reason"] for r in rejected)
+        oom_hit = any(
+            "OutOfMemory" in r["reason"] or "out-of-memory" in r["reason"]
+            for r in rejected
+        )
+        if blowup_hit:
+            stats["guard_blowup"] += 1
+        if oom_hit:
+            stats["guard_oom"] += 1
 
         if converted is None:
             if args.smoke_test:
@@ -250,6 +322,7 @@ def main():
             "repo_link": row.get("repo_link"),
             "file": fname,
             "scale": applied,
+            "rejected_scales": rejected,
         }
         stats["written"] += 1
         if applied not in ("off", f"{args.scale}x1"):
@@ -268,6 +341,8 @@ def main():
         "max_src_chars": args.max_src_chars,
         "smoke_test": args.smoke_test,
         "smoke_device": args.smoke_device,
+        "smoke_mem_gb": args.smoke_mem_gb,
+        "max_numel_ratio": args.max_numel_ratio,
         "overwrite": args.overwrite,
         **stats,
     }
@@ -281,6 +356,11 @@ def main():
         f"skipped_convert={stats['skipped_convert']}  "
         f"skipped_smoke={stats['skipped_smoke']}  skipped_size={stats['skipped_size']}  "
         f"skipped_exists={stats['skipped_exists']}"
+    )
+    print(
+        f"  guards   : mem-budget caught {stats['guard_oom']} rows, "
+        f"numel-ratio caught {stats['guard_blowup']} rows "
+        f"(these would have OOM'd at eval and mislabeled every sample)"
     )
     print(f"  manifest : {manifest_path}")
     print(f"  stats    : {stats_path}")

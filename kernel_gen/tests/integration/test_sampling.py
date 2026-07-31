@@ -1,0 +1,329 @@
+"""The two-pass think/code sampler: the text reassembly AND the trace-array alignment.
+
+Two concerns, one module (``core/sampling.py``), so one test file.
+
+*Text* (bottom section): the prefill, the stop string, and the reassembly -- if the
+halves are stitched back wrong, ``extract_code_block`` silently returns prose and every
+kernel in the run is garbage.
+
+*Arrays* (top sections): the same seam is harder to get right for the token trace,
+because the assembled string contains two spans that no token produced (the ``## Plan``
+prefill and the ``` ```python ``` fence), while pass 1 returns tokens that no kept
+character accounts for (the ones that spelled the fence). Both facts are recorded rather
+than patched over, so both get a test that says so out loud.
+"""
+
+from __future__ import annotations
+
+from kernel_gen.core.backend import FakeBackend
+from kernel_gen.core.sampling import (
+    CODE_FENCE,
+    PLAN_PREFIX,
+    SamplingSpec,
+    generate_batch,
+    generate_batch_traced,
+)
+from kernel_gen.core.text import extract_code_block
+from kernel_gen.core.trace import SEG_CODE, SEG_PLAN, derive_scalars
+
+PLAN = "fuse the elementwise ops\n"
+CODE = "\nimport torch\n```\n"
+TOPK = 8
+
+
+def _model() -> FakeBackend:
+    return FakeBackend(rules=[(PLAN, CODE)], default=PLAN + CODE_FENCE + CODE)
+
+
+def _traced(spec_kwargs: dict | None = None):
+    spec = SamplingSpec(think_temperature=1.0, temperature=0.3, trace_topk=TOPK)
+    for key, value in (spec_kwargs or {}).items():
+        setattr(spec, key, value)
+    return generate_batch_traced(_model(), ["solve this"], spec)[0]
+
+
+# ------------------------------------------------------------------ non-regression
+
+
+def test_generate_batch_still_returns_plain_strings():
+    # Every existing caller goes through this. It must be the old function in behaviour.
+    out = generate_batch(_model(), ["solve this"], SamplingSpec(think_temperature=1.0))
+    assert out == [PLAN_PREFIX + PLAN + CODE_FENCE + CODE]
+
+
+def test_tracing_off_changes_nothing_about_the_text():
+    off = generate_batch_traced(_model(), ["a", "b"], SamplingSpec(think_temperature=1.0))
+    on = generate_batch_traced(
+        _model(), ["a", "b"], SamplingSpec(think_temperature=1.0, trace_topk=TOPK)
+    )
+
+    assert [c.text for c in off] == [c.text for c in on]
+    assert off[0].trace is not None  # ids are free even with no top-K requested
+    assert off[0].trace.k == 0
+    assert on[0].trace.k == TOPK
+
+
+def test_the_think_path_is_still_exactly_two_backend_calls():
+    backend = _model()
+    generate_batch_traced(
+        backend, [f"p{i}" for i in range(5)], SamplingSpec(think_temperature=1.0, trace_topk=4)
+    )
+    assert [len(b) for b in backend.batches] == [5, 5]
+
+
+# ------------------------------------------------------------------------ the seam
+
+
+def test_seg_flips_exactly_at_the_plan_code_boundary():
+    trace = _traced().trace
+    n_plan = trace.meta["n_plan_tokens"]
+
+    assert trace.seg[:n_plan].tolist() == [SEG_PLAN] * n_plan
+    assert set(trace.seg[n_plan:].tolist()) == {SEG_CODE}
+    assert n_plan + trace.meta["n_code_tokens"] == len(trace)
+
+
+def test_every_array_has_one_entry_per_token():
+    trace = _traced().trace
+    lengths = {
+        array.shape[0]
+        for array in (
+            trace.token_ids,
+            trace.topk_ids,
+            trace.topk_lp,
+            trace.sampled_lp,
+            trace.sampled_rank,
+            trace.seg,
+        )
+    }
+    assert lengths == {len(trace)}
+
+
+def test_the_char_offsets_reslice_the_completion_into_its_two_halves():
+    # The join that later credit assignment depends on: a linter finding carries a line
+    # number into THIS string, and these offsets are what map it back to a segment.
+    out = _traced()
+    meta = out.trace.meta
+
+    assert out.text[meta["plan_char_start"] : meta["plan_char_end"]] == PLAN
+    assert out.text[meta["code_char_start"] : meta["code_char_end"]] == CODE
+
+
+def test_the_spans_no_token_produced_are_identifiable_from_the_offsets():
+    # [0, plan_char_start) is the prefill and [plan_char_end, code_char_start) is the
+    # fence. Both are prompt text. A consumer that assumed every character had a token
+    # behind it would silently shift every offset by the length of these two strings.
+    out = _traced()
+    meta = out.trace.meta
+
+    assert out.text[: meta["plan_char_start"]] == PLAN_PREFIX
+    assert out.text[meta["plan_char_end"] : meta["code_char_start"]] == CODE_FENCE
+
+
+def test_the_plan_half_has_more_tokens_than_its_text_and_says_so():
+    # vLLM keeps the tokens that spelled the stop string. Those trailing tokens are the
+    # model committing to start coding; they are kept, and the flag is what tells a
+    # consumer not to expect a clean character mapping at the end of the plan segment.
+    trace = _traced().trace
+    text_only = FakeBackend(default=PLAN).complete_traced(
+        ["x"], temperature=1.0, max_tokens=64
+    )[0]
+
+    assert trace.meta["plan_tokens_overrun_text"] is True
+    assert trace.meta["n_plan_tokens"] > len(text_only.token_ids)
+
+
+def test_both_temperatures_are_recorded_so_the_halves_stay_interpretable():
+    # Confidence is captured pre-temperature (raw_logprobs), but the sampled TOKEN was
+    # drawn post-temperature. Without both values on the trace, nobody can tell later
+    # which regime a given token was drawn under.
+    meta = _traced().trace.meta
+    assert (meta["plan_temperature"], meta["code_temperature"]) == (1.0, 0.3)
+
+
+def test_finish_reasons_are_recorded_for_both_passes():
+    meta = _traced().trace.meta
+    assert meta["plan_finish_reason"] == "stop"
+    assert meta["plan_stop_reason"] == CODE_FENCE
+    assert "code_finish_reason" in meta
+
+
+def test_scalars_derive_cleanly_over_the_stitched_trace():
+    trace = _traced().trace
+    scalars = derive_scalars(trace.topk_lp, trace.sampled_lp, vocab_size=FakeBackend().vocab_size)
+
+    assert {v.shape for v in scalars.values()} == {(len(trace),)}
+    for name, values in scalars.items():
+        assert values[trace.seg == SEG_PLAN].size > 0, name
+        assert values[trace.seg == SEG_CODE].size > 0, name
+
+
+# -------------------------------------------------------------- the GLUED seam (KGEN-21)
+#
+# CODE above opens with a newline, so every test so far exercises a well-formed seam. When
+# pass 2 opens mid-line instead, the assembled text reads ```pythonimport torch -- and
+# _FENCE_TOKEN needs end-of-line after the info string, so it matches nothing at all. The
+# completion then falls to the no-fence path, whose first-statement resume skips the line
+# holding the fence and drops the import glued to it. Measured: 27 of 6944 two-pass
+# attempts, 8 of them with zero fenced blocks.
+
+
+def _traced_glued(code: str):
+    backend = FakeBackend(rules=[(PLAN, code)], default=PLAN + CODE_FENCE + code)
+    spec = SamplingSpec(think_temperature=1.0, temperature=0.3, trace_topk=TOPK)
+    return generate_batch_traced(backend, ["solve this"], spec)[0]
+
+
+GLUED = "import torch\nimport torch.nn as nn\n\n\nclass ModelNew:\n    pass\n```\n"
+
+
+def test_a_seam_glued_to_pass_two_still_delimits_a_fenced_block():
+    from kernel_gen.core.text import _fenced_blocks
+
+    out = _traced_glued(GLUED)
+    assert _fenced_blocks(out.text), "the injected fence must still open a block"
+
+
+def test_a_glued_seam_does_not_swallow_the_import_on_its_line():
+    # The whole cost of the bug: `import torch` shares a line with the fence, so the
+    # no-fence path's ^import anchor skips it and the kernel uses torch unimported.
+    # Compared line-wise on purpose -- `import torch` is a SUBSTRING of the surviving
+    # `import torch.nn as nn`, so a containment check passes while the import is gone.
+    out = _traced_glued(GLUED)
+    assert "import torch" in extract_code_block(out.text).splitlines()
+
+
+def test_a_glued_seam_starting_with_a_space_is_also_repaired():
+    # 22 of the 27 real cases start with a space, not an identifier.
+    out = _traced_glued(" " + GLUED)
+    assert "import torch" in extract_code_block(out.text).splitlines()
+
+
+def test_the_offsets_still_reslice_pass_two_exactly_when_the_seam_was_glued():
+    # The contract inspect_trace and the PRM line-join depend on. Repairing the seam
+    # changes its length, so code_char_start must be derived from what was written.
+    out = _traced_glued(GLUED)
+    meta = out.trace.meta
+    assert out.text[meta["code_char_start"] : meta["code_char_end"]] == GLUED
+
+
+def test_a_well_formed_seam_gains_no_second_newline():
+    # CODE already opens with "\n"; the repair must be a no-op there, not a double break.
+    out = _traced()
+    meta = out.trace.meta
+    assert out.text[meta["plan_char_end"] : meta["code_char_start"]] == CODE_FENCE
+    assert "```python\n\n" not in out.text
+
+
+# ------------------------------------------------------------------- the single pass
+
+
+def test_single_pass_produces_one_segment_and_no_seam():
+    out = generate_batch_traced(
+        _model(), ["solve this"], SamplingSpec(think_temperature=None, trace_topk=TOPK)
+    )[0]
+
+    assert out.text == PLAN + CODE_FENCE + CODE
+    assert out.trace.meta["passes"] == 1
+    assert out.trace.meta["n_plan_tokens"] == 0
+    assert set(out.trace.seg.tolist()) == {SEG_CODE}
+    assert out.text[out.trace.meta["code_char_start"] : out.trace.meta["code_char_end"]] == out.text
+
+
+# ---------------------------------------------------------------------- degradation
+
+
+def test_a_backend_with_no_internals_yields_text_and_no_trace():
+    from kernel_gen.core.backend import Backend
+
+    class TextOnly(Backend):
+        def render_chat(self, system, user):
+            return user
+
+        def complete(self, prompts, *, temperature, max_tokens, stop=None):
+            return [PLAN] * len(prompts)
+
+    out = generate_batch_traced(
+        TextOnly(), ["x"], SamplingSpec(think_temperature=1.0, trace_topk=TOPK)
+    )[0]
+
+    assert out.trace is None  # "no trace", never an exception
+    # PLAN does not open with a newline, so the seam carries one for it (KGEN-21).
+    assert out.text == PLAN_PREFIX + PLAN + CODE_FENCE + "\n" + PLAN
+
+
+def test_empty_prompt_list_never_reaches_the_backend():
+    backend = _model()
+    assert generate_batch_traced(backend, [], SamplingSpec(trace_topk=TOPK)) == []
+    assert backend.batches == []
+
+
+# ------------------------------------------------- text reassembly (the plain path)
+#
+# The original test_sampling.py: the two halves of the TEXT are stitched correctly, over
+# the plain generate_batch (no trace). If this breaks, extract_code_block returns prose.
+
+
+def test_single_pass_sends_one_prompt_per_slot():
+    backend = _model()
+    out = generate_batch(backend, ["a", "b", "c"], SamplingSpec(think_temperature=None))
+
+    assert len(out) == 3
+    assert len(backend.batches) == 1  # one call, not one per prompt
+    assert len(backend.batches[0]) == 3
+    assert extract_code_block(out[0]) == "import torch"
+
+
+def test_think_pass_prefills_the_plan_heading_and_stops_at_the_fence():
+    backend = _model()
+    generate_batch(backend, ["solve this"], SamplingSpec(think_temperature=1.0))
+
+    plan_batch, code_batch = backend.batches
+    # Instruct models ignore "plan first" and emit the fence immediately; the prefill
+    # is what forces them to start in prose.
+    assert plan_batch[0].endswith(PLAN_PREFIX)
+    # Pass 1 stopped at the fence, so pass 2 resumes from a prompt ending in it --
+    # which is why the model continues with code and not with more prose.
+    assert code_batch[0] == plan_batch[0] + PLAN + CODE_FENCE
+
+
+def test_think_reassembly_round_trips_through_extract_code_block():
+    backend = _model()
+    completion = generate_batch(backend, ["solve this"], SamplingSpec(think_temperature=1.0))[0]
+
+    assert completion == PLAN_PREFIX + PLAN + CODE_FENCE + CODE
+    # The whole point: the stitched halves still look like one normal fenced answer.
+    assert extract_code_block(completion) == "import torch"
+
+
+def test_think_path_batches_every_slot_in_one_call_per_pass():
+    backend = _model()
+    generate_batch(backend, [f"p{i}" for i in range(7)], SamplingSpec(think_temperature=1.0))
+
+    assert len(backend.batches) == 2  # exactly two passes, not two per prompt
+    assert [len(b) for b in backend.batches] == [7, 7]
+
+
+def test_the_system_prompt_is_rendered_into_every_prompt():
+    backend = _model()
+    generate_batch(backend, ["solve this"], SamplingSpec(system="BE TERSE"))
+
+    assert "BE TERSE" in backend.batches[0][0]
+
+
+def test_a_plan_truncated_before_the_fence_is_counted_out_loud(capsys):
+    # A plan that hits --max-new-tokens still gets a fence appended and a kernel written
+    # from it. That has always happened silently; the sampler now says how often.
+    class TruncatingBackend(FakeBackend):
+        def complete_traced(self, prompts, **kwargs):
+            out = super().complete_traced(prompts, **kwargs)
+            for completion in out:
+                completion.finish_reason = "length"
+            return out
+
+    generate_batch_traced(
+        TruncatingBackend(default=PLAN + CODE_FENCE + CODE),
+        ["a", "b"],
+        SamplingSpec(think_temperature=1.0, temperature=0.3),
+    )
+    assert "plans hit --max-new-tokens" in capsys.readouterr().out

@@ -1,0 +1,221 @@
+FAMILY 2 — MEMORY TRAFFIC / FUSION
+================================================================================
+Question: not "did it cheat" but "is it slow, and provably so".
+
+Everything here is expressed in BYTES and MICROSECONDS, not counts. This is the
+central design decision of the family and it is worth stating plainly:
+
+  "You have too many kernels" is a message a model can satisfy by fusing the WRONG
+  pair — which breaks correctness. "This intermediate costs 33.6 MB of HBM traffic;
+  fuse kernel A into kernel B" names a specific memory transaction and a specific,
+  provably safe fix.
+
+
+THE SOUNDNESS ARGUMENT
+--------------------------------------------------------------------------------
+**Triton has no cross-launch fusion pass.** Unlike TorchInductor, nothing merges
+`k1[grid](...)` and `k2[grid](...)`. So a tensor written by one launch and read by
+the next PROVABLY makes a full round trip through HBM. We are not estimating or
+guessing about performance — we are reading off a memory transaction that is
+guaranteed to happen. That is what makes a static analysis of this sound rather
+than heuristic.
+
+
+THE FUSIBILITY GATE (why we stay silent more often than we could)
+--------------------------------------------------------------------------------
+KernelBenchX (arXiv:2605.04956) found that 72% of Fusion tasks fail across all five
+methods they evaluated, and — crucially — that iterative refinement raises the
+compile rate (52.3% -> 68.8%) while LOWERING average speedup (1.58x -> 1.44x).
+
+Telling a model to fuse a pair that cannot legally be fused is how you reproduce
+that degradation with your own hands. So F2.1 emits a fusion SUGGESTION only when
+the producer/consumer iteration spaces are provably compatible; otherwise it reports
+the cost and says nothing about the fix.
+
+Kernel kinds are classified from the body: tl.dot -> matmul; tl.sum/max/min, or an
+accumulator updated inside a loop -> reduction; a store tracing to a load with no
+arithmetic -> copy; else elementwise.
+
+  FUSIBLE (suggestion emitted):
+    elementwise -> elementwise   inline the second computation
+    elementwise -> reduction     the reduction loads and transforms before reducing
+    matmul      -> elementwise   epilogue fusion
+    copy        -> anything
+
+  NOT SUGGESTED (cost reported only):
+    reduction -> elementwise     softmax-shaped; fusible ONLY if the reduced axis
+                                 fits in one block, which we do not try to prove
+    reduction -> reduction       over different axes: not fusible at all
+
+
+--------------------------------------------------------------------------------
+F2.1  dead_intermediate                                    severity: warn / info
+--------------------------------------------------------------------------------
+Detects: a buffer allocated in host code, written by exactly ONE launch, read by
+one or more OTHER launches, and never returned or read by host code.
+
+    tmp = torch.empty_like(x)
+    exp_kernel[grid](x, tmp, n)       # tmp written to HBM...
+    scale_kernel[grid](tmp, out, n)   # ...and immediately read back
+    return out                        # tmp never escapes
+
+Cost: 2 x numel x itemsize bytes (one write, one read) that a fused kernel would
+not pay. Converted to microseconds at achievable HBM bandwidth (~80% of peak).
+
+Chains (k1 -> t1 -> k2 -> t2 -> k3, all elementwise) are merged into ONE finding —
+"fuse these three" — rather than emitted as separate suggestions.
+
+False-positive guards:
+  * the buffer is ALSO returned (multi-output models) -> not dead, must materialise
+  * the kernel both loads and stores it (in-place accumulator) -> not a producer
+  * alias resolution first: `t2 = t1.view(...)` is a second name for the same
+    storage; without unioning aliases we would wrongly call t1 "read by only one
+    kernel"
+  * an intermediate smaller than L2 (~50 MB on H100, 40 MB on A100) may never reach
+    HBM, so the penalty can be overstated. We therefore do NOT hardcode a threshold
+    — we emit the byte count as data and let the downstream consumer decide.
+
+References:
+  Liger-Kernel (Hsu et al., 2024) — arXiv:2410.10989. Fusing ops (RMSNorm,
+    LayerNorm, SwiGLU, cross-entropy) into monolithic Triton kernels eliminates
+    intermediate tensor materialisation, reduces HBM<->SRAM traffic and kernel
+    launch overhead: ~20% training throughput gain, ~60% memory reduction. This is
+    the quantitative justification for treating a materialised intermediate as an
+    anti-pattern.
+  KernelEvolve (Meta, 2025) — arXiv:2512.23236. The Conv2d case: the unfused path
+    pays a full tensor pass per auxiliary kernel.
+  KernelBenchX (2026) — arXiv:2605.04956. The reason the suggestion is gated (see
+    THE FUSIBILITY GATE above).
+
+
+--------------------------------------------------------------------------------
+F2.2  launch_overhead / launch_in_loop                     severity: fail / warn
+--------------------------------------------------------------------------------
+Two findings from one analysis.
+
+(a) launch_in_loop — FAIL. A kernel launched from a host-side Python for/while loop:
+
+        for i in range(batch):
+            kernel[grid](x[i], out[i], n)   # 32 serialised launches
+
+    N launches, fully serialised, N x the overhead, and it means the model failed to
+    parallelise over a dimension it should have put in the grid. High precision, high
+    severity, trivially actionable.
+
+(b) launch_overhead — WARN/INFO. Each launch costs ~5 us (CPU-side launch + GPU
+    scheduling). On a typical KernelBench Level-1 problem — a 1024x1024 fp32
+    elementwise op, 4 MB in / 4 MB out — the memory time is ~3 us. Four launches is
+    ~20 us of overhead against ~3 us of real work: the kernel is LAUNCH-BOUND and
+    kernel count is the single dominant term in its runtime.
+
+DELIBERATELY NOT A LINT ON THE COUNT. The count is a cost term and a piece of
+context, not an instruction — the actionable instruction comes from F2.1, which
+names a specific, provably-safe pair to fuse. What F2.2 contributes is the REGIME:
+it tells the model WHY fusing matters here, which makes it far more likely to do it
+properly rather than cosmetically.
+
+Reference:
+  KernelEvolve (Meta, 2025) — arXiv:2512.23236. Concrete case study: a PyTorch
+  Conv2d workaround launches four auxiliary kernels (unsqueeze, layout conversion,
+  conv, squeeze), each incurring a full tensor pass; the Triton solution fuses this
+  into two kernels and wins end-to-end. Kernel count is literally the deterministic
+  pattern that explains the speed difference.
+
+
+--------------------------------------------------------------------------------
+F2.3  layout_churn                                                severity: warn
+--------------------------------------------------------------------------------
+Detects: host-code operations that launch a HIDDEN kernel and cost a full tensor
+pass. The key distinction:
+
+  FREE (metadata only, no kernel):
+      .view  .reshape  .permute  .transpose  .squeeze  .unsqueeze  .expand  slicing
+
+  COSTS A FULL PASS + A LAUNCH:
+      .contiguous()  ON A NON-CONTIGUOUS TENSOR   (i.e. after permute/transpose/.T)
+      .clone()
+      .to(dtype)     (a cast — but NOT .to(device), which we exclude)
+      torch.cat / torch.stack
+      .repeat        (note: .repeat copies, .expand does not)
+
+    x.permute(0, 2, 1).contiguous()
+
+is a hidden kernel moving 2 x numel x itemsize bytes, sitting in HOST code where
+nobody is looking for it.
+
+WHY THIS IS THE MOST UNDERRATED CHECK IN THE SUITE: it catches solutions that a
+@triton.jit counter scores as perfectly clean. KernelEvolve's Conv2d case — the
+motivating example for kernel-counting — consists of unsqueeze (free), a LAYOUT
+CONVERSION (a real kernel, a full pass), the conv, and squeeze (free). None of those
+four is a @triton.jit function. A decorator-counting analysis sees ONE kernel and
+misses the entire cost. The expensive kernels are often the ones with no decorator
+on them.
+
+Suggested fix for the permute->contiguous case is what Triton's API exists for:
+kernels take STRIDE ARGUMENTS precisely so the host does not have to materialise a
+transposed copy. For .to(dtype): cast inside the kernel on load,
+`tl.load(...).to(tl.float32)`.
+
+Reference:
+  KernelEvolve (Meta, 2025) — arXiv:2512.23236 (the layout-conversion kernel in the
+  Conv2d case study).
+
+
+--------------------------------------------------------------------------------
+F2.4  zeroed_overwritten_buffer                                   severity: warn
+--------------------------------------------------------------------------------
+Detects: a buffer allocated with torch.zeros / zeros_like that is a store target of
+a kernel which never loads it and performs no atomic on it.
+
+    out = torch.zeros_like(x)        # pays for a full memset kernel...
+    add_kernel[grid](x, y, out, n)   # ...then overwrites every element
+
+torch.zeros launches a memset: a full write pass, numel x itemsize bytes, entirely
+wasted. torch.empty_like gives the same result for free.
+
+CRITICAL false-positive guard: if the kernel uses tl.atomic_add (or otherwise reads
+the buffer back as an accumulator), the zero-init is REQUIRED and "fixing" this
+would introduce a correctness bug. We check the parameter's role first: fire only
+when the kernel stores to it, never loads it, and performs no atomic on it.
+
+Note: a mask like `offs < n` does NOT disqualify the finding. The mask only prevents
+out-of-bounds writes; every in-bounds element is still written.
+
+Also excluded structurally: nn.Parameter(torch.zeros(...)) in __init__, because
+buffer collection only walks host code reachable from forward.
+
+Reference: no direct paper precedent — this is a novel check. It applies the
+memory-traffic principle from Liger-Kernel (arXiv:2410.10989) — a wasted full-tensor
+pass — to allocation rather than to fusion.
+
+
+================================================================================
+WHAT THESE COMPOSE INTO
+================================================================================
+The reason to express all four in bytes rather than counts is that they SUM:
+
+    total_bytes = essential_io          (from the reference model's inputs/outputs)
+                + wasted_intermediates  (F2.1)
+                + layout_copies         (F2.3)
+                + zero_init             (F2.4)
+
+    T_static  ~=  max(FLOPs / peak_compute, total_bytes / achievable_BW)
+                + n_launches x launch_overhead        (F2.2)
+
+giving a single number: memory efficiency = essential_bytes / total_bytes, in [0,1].
+That is a static, deterministic, GRADED speed-quality score — the thing the
+literature does not currently have. It is the static counterpart to SOL-ExecBench
+(arXiv:2603.19173), which computes an ideal T_SOL from the reference via a roofline
+bound; here we compute the ACTUAL cost from the generated code, and the ratio is a
+predicted speedup with no GPU in the loop.
+
+
+WHAT FAMILY 2 CANNOT CATCH
+================================================================================
+* Compute-bound ops (matmul). Tile-level inefficiency — a bad BLOCK_M, low occupancy
+  — is invisible to this analysis. A dumb matmul and a good matmul look identical.
+* Cases where shapes are not statically resolvable. We emit findings WITHOUT byte
+  estimates rather than guessing; a finding with a wrong number is worse than one
+  with no number.
+* L2 residency. An intermediate smaller than L2 may never reach HBM at all, so the
+  penalty is an upper bound on the waste, not an exact figure.

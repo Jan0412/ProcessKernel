@@ -27,9 +27,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-KERNELBENCH_SRC = os.path.join(SCRIPT_DIR, "KernelBench", "src")
-sys.path.insert(0, KERNELBENCH_SRC)
 
+from core.text import extract_code_block  # noqa: E402
 from gen_config import print_generation_summary, write_generation_config
 
 
@@ -44,13 +43,6 @@ def parse_problems(spec: str) -> list[int]:
         else:
             ids.append(int(part))
     return ids
-
-
-def extract_code_block(text: str) -> str:
-    match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return re.sub(r"^```[a-zA-Z]*\n?|```$", "", text.strip())
 
 
 def problem_id_from_name(name: str, fallback: int) -> int:
@@ -68,10 +60,21 @@ def load_model(
     model_id: str,
     load_in_4bit: bool,
     gpu_memory_utilization: float = 0.92,
-    max_model_len: int = 16384,
+    # A few KernelBench one-shot prompts (example kernel + reference arch) reach ~16.4k
+    # tokens, which left no room for output under a 16384 cap and aborted the level-2
+    # Qwen3.6 run at "prompt contains at least 16385 input tokens". 40960 fits the
+    # longest prompt plus a full 16384-token generation; every model we use has a
+    # >=40960 native context, and KV cache is allocated on demand so this does not
+    # inflate memory.
+    max_model_len: int = 40960,
     trust_remote_code: bool = False,
     max_num_seqs: int = 32,
 ):
+    # The FLA "packed recurrent decode" kernel (default on) corrupts the CUDA
+    # context on Qwen3.6's GDN layers; see kernel_gen/core/backend.py for the
+    # full story. Harmless for models without GDN layers.
+    os.environ.setdefault("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "0")
+
     from vllm import LLM
 
     # gpu_memory_utilization is the fraction of *total* VRAM vLLM may use for
@@ -100,6 +103,11 @@ def load_model(
         # The custom CUDA IPC all-reduce kernel fails with 'invalid argument'
         # on H100 nodes without NVLink IPC support. NCCL is always correct.
         disable_custom_all_reduce=True,
+        # We only ever send text. On a VL checkpoint, startup otherwise profiles the
+        # vision tower with a dummy max-size image, and the first GEMM in that path
+        # OOMs cuBLAS's handle workspace. Zeroing every modality limit skips that
+        # profiling. No-op on text-only models.
+        language_model_only=True,
     )
     if load_in_4bit:
         kwargs["quantization"] = "bitsandbytes"

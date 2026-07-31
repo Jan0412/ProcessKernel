@@ -61,8 +61,28 @@ pairwise:
   split_ratios: [0.85, 0.15]       # train / val (pairwise needs no test set)
   split_seed: 42
   stratify_by_level: true
-  pair_mode: compiled_wrong        # compiled_wrong | all_negative
-  max_negatives_per_positive: null # null = full cross product (P x N per problem)
+  pair_mode: compiled_wrong        # compiled_wrong | all_negative | speed
+  max_negatives_per_positive: 8    # cap partners per anchor (null = full cross product,
+                                   # which repeats the same rows in many correlated pairs)
+  max_pairs_per_problem: 60        # cap each problem's total pairs so candidate-rich
+                                   # problems don't dominate the epoch (null = uncapped)
+  dedup_by_code_hash: true         # drop duplicate kernel sources before pairing —
+                                   # identical code must never be ranked against itself
   loss_type: logistic              # logistic | margin
   margin: 1.0
   pair_seed: 42
+  # --- `speed` pair_mode only (fast_p) -------------------------------------
+  # Grade compiling kernels like listwise: wrong -> rel 0, correct -> rel = 1 + p
+  # where p = normalized speedup over the per-problem PyTorch baseline. Every pair
+  # with a relevance gap >= min_rel_gap is emitted (correct>wrong AND fast>slow).
+  speedup_lo: 0.25                 # speedup mapped to p=0 (log2 lower bound)
+  speedup_hi: 4.0                  # speedup mapped to p=1 (log2 upper bound)
+  speed_quant: 0.1                 # HARD deadband: snap p to a 0.1 grid (like listwise) so
+                                   # timing-noise speedup differences grade equally -> no pair
+  min_rel_gap: 0.0                 # keep 0: quant already removes exact ties; a positive
+                                   # threshold here stacks a 2nd filter that guillotines the
+                                   # common 0.1-gap speed pairs (0.2 dropped ~95% of them)
+  weighted_loss: true              # SOFT weighting: weight each pair by its rel gap so near-
+                                   # tie speed pairs contribute little without being dropped —
+                                   # the pairwise analogue of listwise's ΔNDCG (normalized by
+                                   # the dataset-mean weight in the trainer)

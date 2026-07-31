@@ -39,6 +39,10 @@ class DataConfig:
     #   compiled_wrong -> only kernels that compiled but are incorrect (drop
     #                     compile-failure negatives); positives are kept either way.
     negative_mode: str = "all_negative"
+    # Per-problem PyTorch-eager baseline runtimes (KernelBench `timing/<hw>/...`),
+    # joined by build_dataset to emit a `speedup = baseline / kernel_runtime` per
+    # correct candidate. Resolved relative to the project root (reranker/).
+    baseline_timing_json: str = "../timing/A100/baseline_time_torch.json"
 
     def levels_for_run_dirs(self) -> list[int]:
         """Return a per-run-dir level list, broadcasting a scalar `level`."""
@@ -102,11 +106,66 @@ class PairwiseConfig:
     split_ratios: list[float] = field(default_factory=lambda: [0.85, 0.15])
     split_seed: int = 42
     stratify_by_level: bool = True
-    pair_mode: str = "compiled_wrong"        # compiled_wrong | all_negative
-    max_negatives_per_positive: Optional[int] = None  # None = full cross product
+    pair_mode: str = "compiled_wrong"        # compiled_wrong | all_negative | speed
+    max_negatives_per_positive: Optional[int] = None  # cap partners per anchor (None = full cross product)
+    max_pairs_per_problem: Optional[int] = None  # cap each problem's total pairs (None = uncapped)
+    dedup_by_code_hash: bool = True  # drop duplicate kernel sources before pairing (mirrors listwise)
     loss_type: str = "logistic"              # logistic | margin
     margin: float = 1.0
     pair_seed: int = 42
+    # `speed` pair_mode (fast_p): grade compiling kernels like listwise
+    # (wrong -> 0, correct -> 1 + speed_p) and pair every rel gap >= min_rel_gap.
+    speedup_lo: float = 0.25      # speedup mapped to p=0 (log2 lower bound)
+    speedup_hi: float = 4.0       # speedup mapped to p=1 (log2 upper bound)
+    speed_quant: float = 0.0      # deadband: snap p to this grid (0 = off) so sub-noise
+                                  # speedup differences grade equally -> no spurious pair
+    min_rel_gap: float = 0.0      # min relevance difference to form a pair
+    weighted_loss: bool = False   # optional: SOFT weighting via group-split + alpha
+                                  # (the pairwise analogue of listwise's grouped ΔNDCG)
+    loss_alpha: float = 0.5       # weight of correctness vs speed pairs in the loss
+                                  # (0.5 = equal; lower pushes harder on fast-vs-slow).
+                                  # Only used when weighted_loss is on.
+
+
+@dataclass
+class ListwiseConfig:
+    """Listwise (LambdaRank) training settings (used only by reranker.src.listwise.*).
+
+    Reads the same labeled source dataset as the pointwise pipeline
+    (``data.dataset_jsonl``), builds its own fresh problem-level train/val split
+    (no test), and materializes one fixed-size, speed-graded candidate *list* per
+    eligible problem. Relevance: negatives (compiled-but-wrong) get 0; correct
+    kernels get ``1 + p`` where ``p`` is the normalized speedup over the per-problem
+    PyTorch baseline (``data.baseline_timing_json``). Non-compiling kernels are
+    excluded upstream via ``data.negative_mode = compiled_wrong``.
+    """
+
+    lists_train_jsonl: str = "data/lists_train.jsonl"
+    lists_val_jsonl: str = "data/lists_val.jsonl"
+    lists_splits_json: str = "data/lists_splits.json"
+    # Fresh problem-level split (train / val only; listwise needs no test set).
+    split_ratios: list[float] = field(default_factory=lambda: [0.85, 0.15])
+    split_seed: int = 42
+    stratify_by_level: bool = True
+    list_size: int = 16          # L: fixed budget of candidates per problem
+    min_list_size: int = 2       # skip problems with fewer (deduped) candidates
+    max_positives: int = 10      # cap positives per list (spread-preserving subsample)
+    max_negatives: int = 6       # cap negatives per list so speed pairs aren't drowned
+    min_positives: int = 1       # skip problems with fewer positives (guardrail; 1 = keep all)
+    speedup_lo: float = 0.25     # speedup mapped to p=0 (log2 lower bound)
+    speedup_hi: float = 2.5      # speedup mapped to p=1 (log2 upper bound; ~p95 of data)
+    speedup_stat: str = "mean"   # which dataset speedup grades the lists:
+                                 #   mean -> `speedup` (KernelBench fast_p convention)
+                                 #   min  -> `speedup_min` (noise-robust min/min timing)
+    speed_quant: float = 0.0     # deadband: snap p to this grid (0 = off) so sub-noise
+                                 # speedup differences don't create spurious ranking pairs
+    dedup_by_code_hash: bool = True
+    sigma: float = 1.0           # logistic slope in the LambdaRank loss
+    loss_alpha: float = 0.5      # weight of correctness vs speed pairs in the loss
+                                 # (0.5 = equal; lower pushes harder on fast-vs-slow)
+    speed_gap_eval: float = 0.25  # min rel gap for the eval_speed_pair_acc_big metric
+                                  # (speed-pair accuracy on clearly-separated pairs only)
+    list_seed: int = 42
 
 
 @dataclass
@@ -127,6 +186,7 @@ class RerankerConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     mlflow: MLflowConfig = field(default_factory=MLflowConfig)
     pairwise: PairwiseConfig = field(default_factory=PairwiseConfig)
+    listwise: ListwiseConfig = field(default_factory=ListwiseConfig)
 
 
 def _resolve(path: str) -> str:
@@ -136,10 +196,23 @@ def _resolve(path: str) -> str:
     return os.path.normpath(os.path.join(PROJECT_ROOT, path))
 
 
-def _from_dict(cls, data: dict) -> Any:
-    """Recursively build a (nested) dataclass from a plain dict."""
+def _from_dict(cls, data: dict, section: str = "") -> Any:
+    """Recursively build a (nested) dataclass from a plain dict.
+
+    Unknown keys raise instead of being silently dropped — a typo in the YAML
+    (e.g. ``speedup_qant``) would otherwise leave the default in place with no
+    warning, so the config on disk and the config actually used would diverge.
+    """
     # `from __future__ import annotations` makes field types strings — resolve them.
     hints = typing.get_type_hints(cls)
+    known = {f.name for f in fields(cls)}
+    unknown = set(data) - known
+    if unknown:
+        where = section or cls.__name__
+        raise KeyError(
+            f"Unknown config key(s) in '{where}': {sorted(unknown)}. "
+            f"Valid keys: {sorted(known)}"
+        )
     kwargs = {}
     for f in fields(cls):
         if f.name not in data:
@@ -147,7 +220,8 @@ def _from_dict(cls, data: dict) -> Any:
         value = data[f.name]
         ftype = hints.get(f.name, f.type)
         if is_dataclass(ftype) and isinstance(value, dict):
-            kwargs[f.name] = _from_dict(ftype, value)
+            child = f"{section}.{f.name}" if section else f.name
+            kwargs[f.name] = _from_dict(ftype, value, section=child)
         else:
             kwargs[f.name] = value
     return cls(**kwargs)
