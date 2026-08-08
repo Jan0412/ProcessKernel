@@ -3,8 +3,8 @@
 Shared data crosses the ``unit/`` and ``integration/`` subdirs as **fixtures**, never as
 ``from conftest import ...`` -- a bare cross-file import from a subdir does not resolve,
 and putting this dir on ``pythonpath`` would shadow ``checker/tests``' own conftest.
-The one consumer that needs the corpus at *collection* time (``test_golden_corpus``, to
-parametrize) reads it with its own local loader.
+The consumers that need the corpus at *collection* time, to parametrize, read it with
+their own local loader -- a session fixture cannot feed ``parametrize``.
 
 Repo-root import is bootstrapped here so ``kernel_gen`` / ``checker`` resolve without
 any pythonpath entry.

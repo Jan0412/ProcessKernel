@@ -98,8 +98,8 @@ def _defines_entry(src: str) -> bool:
     )
 
 
-def _fenced_blocks(text: str) -> list[str]:
-    """The completion's fenced code blocks, paired open->close in document order.
+def fence_spans(text: str) -> list[tuple[int, int]]:
+    """Char spans of fenced code-block CONTENT, paired open->close in document order.
 
     Replaces a regex (```` ```...``` ````, non-greedy) that could not tell an opening
     fence from a closing one -- both read as ```` ``` ````. A stray closing fence (the
@@ -113,24 +113,39 @@ def _fenced_blocks(text: str) -> list[str]:
     back openers (a ```python with no bare close before the next ```python) close the
     first and open the next. A block still open at end-of-text is the ``max_tokens`` tail
     (KGEN-2), returned as a candidate so a truncated final answer is not invisible.
+
+    Spans, not strings, because the PRM's chunker needs offsets into the original text
+    (it cuts at logical lines inside each span). **Not index-aligned with**
+    :func:`_fenced_blocks`, which drops the spans that dedent to nothing (KGEN-9).
+    Nothing needs both views at once; if something ever does, share that predicate rather
+    than copying it -- and do not pair by content, real completions repeat a block.
     """
-    blocks: list[str] = []
+    spans: list[tuple[int, int]] = []
     start: int | None = None  # char index where the open block's content begins, or None
     for m in _FENCE_TOKEN.finditer(text):
         opener = bool(m.group(1))
         if start is not None:  # inside a block: any fence ends it
-            blocks.append(text[start : m.start()])
+            spans.append((start, m.start()))
             start = m.end() if opener else None  # an opener immediately reopens
         elif opener:  # outside a block: only an info-tagged fence starts one
             start = m.end()
         # a bare ``` outside a block is a stray closer -- ignore it
     if start is not None:  # unterminated final block: the model hit max_tokens mid-answer
-        blocks.append(text[start:])
-    # Empty blocks are dropped: an empty string is never the model's answer, and one is
-    # manufactured by the two-pass sampler whenever pass 2 returns nothing -- the injected
-    # CODE_FENCE then trails the text with no content after it. `ast.parse("")` succeeds,
-    # so an empty block used to rank as a valid candidate and win (KGEN-9).
-    return [b for b in (textwrap.dedent(b).strip() for b in blocks) if b]
+        spans.append((start, len(text)))
+    return spans
+
+
+def _fenced_blocks(text: str) -> list[str]:
+    """:func:`fence_spans`' content, dedented and stripped; empty blocks dropped.
+
+    An empty string is never the model's answer, and one is manufactured by the two-pass
+    sampler whenever pass 2 returns nothing -- the injected CODE_FENCE then trails the
+    text with no content after it. `ast.parse("")` succeeds, so an empty block used to
+    rank as a valid candidate and win (KGEN-9).
+    """
+    return [
+        b for b in (textwrap.dedent(text[a:b]).strip() for a, b in fence_spans(text)) if b
+    ]
 
 
 def extract_code_block(text: str) -> str:
@@ -154,7 +169,7 @@ def extract_code_block(text: str) -> str:
        to its largest parseable prefix when even that does not parse, but only when the
        salvage contains :data:`ENTRY_CLASS` (KGEN-9).
 
-    Block boundaries come from :func:`_fenced_blocks`, which pairs fences by an open/close
+    Block boundaries come from :func:`fence_spans`, which pairs fences by an open/close
     walk rather than a regex, so three failure modes are handled at the source: a
     superseded first draft (ranked below the final block, KGEN-1); a final block cut off
     by ``max_tokens`` with no closing fence (recovered as the open tail, KGEN-2); and a

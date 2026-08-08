@@ -11,13 +11,18 @@ file carries the regression corpus for that whole class.
 from __future__ import annotations
 
 import ast
+import json
+import pathlib
 import textwrap
 
 import pytest
 
 from kernel_gen.core.text import (
+    _FENCE_TOKEN,
+    _fenced_blocks,
     _largest_parseable_prefix,
     extract_code_block,
+    fence_spans,
     parse_int_spec,
     problem_id_from_name,
 )
@@ -669,3 +674,87 @@ def test_a_parseable_submission_outranks_an_unparseable_one_even_when_neither_lo
 
     assert "def k(x, W, W)" in code
     assert "tl.load(" not in code
+
+
+# -- fence_spans: the same walk, as offsets ---------------------------------------------
+#
+# The PRM chunker cuts at logical lines *inside* each fenced block and stores char offsets
+# into the untouched completion, so it needs the walk's spans, not its dedented strings.
+# One walk, two views: every test above pins the view, these pin that they agree.
+
+_GOLDEN = pathlib.Path(__file__).parents[1] / "fixtures" / "completions" / "corpus.jsonl"
+_GOLDEN_CASES = [
+    json.loads(line) for line in _GOLDEN.read_text().splitlines() if line.strip()
+]
+GOLDEN_RAW = [c["raw"] for c in _GOLDEN_CASES]
+GOLDEN_IDS = [c["id"] for c in _GOLDEN_CASES]
+
+
+@pytest.mark.parametrize("raw", GOLDEN_RAW, ids=GOLDEN_IDS)
+def test_every_span_is_delimited_by_real_fence_markers(raw):
+    # The mutation guard. Both views derive from one walk, so comparing them cannot catch
+    # a moved boundary; the fence markers can. A span starts where a marker ends, ends
+    # where the next one starts (or at EOF), and never contains one.
+    marks = list(_FENCE_TOKEN.finditer(raw))
+    opens = {m.end() for m in marks}
+    closes = {m.start() for m in marks} | {len(raw)}
+    for a, z in fence_spans(raw):
+        assert a in opens
+        assert z in closes
+        # Searched over the whole text, not the slice: `_FENCE_TOKEN` ends in `|$`, which
+        # a slice would re-anchor -- ``` at the end of a span would false-match.
+        assert not any(a < m.start() < z for m in marks)
+
+
+@pytest.mark.parametrize("raw", GOLDEN_RAW, ids=GOLDEN_IDS)
+def test_fence_spans_and_fenced_blocks_do_not_drift_apart(raw):
+    # Weak by construction -- `_fenced_blocks` is defined in terms of `fence_spans`, so
+    # this only fires if someone gives it a second walk of its own. That is the drift
+    # worth guarding: two fence walkers in the tree is how KGEN-3 became possible.
+    rebuilt = [
+        b for b in (textwrap.dedent(raw[a:z]).strip() for a, z in fence_spans(raw)) if b
+    ]
+    assert rebuilt == _fenced_blocks(raw)
+
+
+@pytest.mark.parametrize("raw", GOLDEN_RAW, ids=GOLDEN_IDS)
+def test_fence_spans_are_ordered_disjoint_and_inside_the_text(raw):
+    spans = fence_spans(raw)
+    assert all(0 <= a <= z <= len(raw) for a, z in spans)
+    assert spans == sorted(spans)
+    assert all(prev[1] <= nxt[0] for prev, nxt in zip(spans, spans[1:]))
+
+
+def test_a_span_whose_content_is_blank_yields_no_block():
+    # The KGEN-9 shape: the two-pass sampler's trailing ```python with nothing after it.
+    # The span exists, the block does not -- so the two lists are NOT index-aligned, and
+    # 2 of the 36 real completions above are exactly this.
+    raw = "the answer is above\n```python\n"
+    assert fence_spans(raw) == [(len(raw), len(raw))]
+    assert _fenced_blocks(raw) == []
+
+
+def test_fence_spans_index_the_original_text_not_a_dedented_copy():
+    # The offsets are the whole point: slicing at them must return the block's own bytes,
+    # indentation included, because a cut offset has to land in the completion as stored.
+    raw = "Here:\n\n    ```python\n    import torch\n    ```\n"
+    (start, end), = fence_spans(raw)
+    assert raw[start:end] == "    import torch\n    "  # up to the closer's backticks
+    assert _fenced_blocks(raw) == ["import torch"]  # the dedented view of the same bytes
+
+
+def test_back_to_back_openers_produce_two_spans():
+    # The reopen rule, pinned at the span level. `extract_code_block` cannot pin it:
+    # `_outside_fence_regions` splits on every fence token independently, so it recovers
+    # the second block as an outside candidate even when the walk drops it.
+    raw = "```python\ndraft\n```python\nfinal\n```\n"
+    assert [raw[a:z] for a, z in fence_spans(raw)] == ["draft\n", "final\n"]
+
+
+def test_an_unterminated_block_spans_to_the_end_of_the_text():
+    raw = "```python\nimport torch\nclass ModelNew:\n"
+    assert fence_spans(raw) == [(len("```python\n"), len(raw))]
+
+
+def test_a_stray_closer_outside_a_block_opens_no_span():
+    assert fence_spans("prose\n```\nmore prose\n") == []
