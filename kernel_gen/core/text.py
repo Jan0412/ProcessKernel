@@ -114,11 +114,10 @@ def fence_spans(text: str) -> list[tuple[int, int]]:
     first and open the next. A block still open at end-of-text is the ``max_tokens`` tail
     (KGEN-2), returned as a candidate so a truncated final answer is not invisible.
 
-    Spans, not strings, because the PRM's chunker needs offsets into the original text
-    (it cuts at logical lines inside each span). **Not index-aligned with**
-    :func:`_fenced_blocks`, which drops the spans that dedent to nothing (KGEN-9).
-    Nothing needs both views at once; if something ever does, share that predicate rather
-    than copying it -- and do not pair by content, real completions repeat a block.
+    Spans, not strings, because the PRM's chunker cuts at offsets into the original text.
+    **Not index-aligned with** :func:`_fenced_blocks`, which drops spans that dedent to
+    nothing (KGEN-9); do not pair the two by content either, real completions repeat a
+    block verbatim.
     """
     spans: list[tuple[int, int]] = []
     start: int | None = None  # char index where the open block's content begins, or None

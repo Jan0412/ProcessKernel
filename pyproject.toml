@@ -21,11 +21,13 @@ dev = ["pytest>=8", "pytest-cov>=7", "hypothesis>=6", "gemtest>=1", "pytest-grem
 kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
 
 [tool.pytest.ini_options]
-testpaths = ["checker/tests", "kernel_gen/tests"]
+testpaths = ["checker/tests", "kernel_gen/tests", "reranker/tests"]
 # NB: do NOT add "kernel_gen/tests" to pythonpath. It puts a second conftest.py on the
 # global path, which shadows checker/tests' own `from conftest import ...`. Both
 # tests dirs bootstrap the repo root themselves in their conftest.py, and kernel_gen
 # tests keep their shared data local (no bare cross-file imports across the subdirs).
+# reranker/tests takes the other route: __init__.py all the way down, so pytest finds the
+# repo root itself and no conftest reaches the global path. Do not mix the two per dir.
 filterwarnings = [
     # checker/scan.py forks a worker pool by design (mp.get_context("fork")). When
     # the FULL suite is collected, a kernel_gen test module (gemtest / hypothesis) starts
@@ -37,11 +39,11 @@ filterwarnings = [
 # Coverage is a FLOOR, not the quality bar -- pytest-gremlins (mutation testing) is that.
 # --cov is deliberately NOT in addopts so the inner-loop `pytest` stays fast:
 #     uv run --group dev pytest --cov --cov-branch
-# All three sources sit at 100% line and branch; the floor is 95 so a real regression
+# The sources sit at or near 100% line and branch; the floor is 95 so a real regression
 # fails CI. NB: coverage wants dotted module names here, not paths -- a path silently
 # reports "module was never imported" and measures nothing.
 [tool.coverage.run]
-source = ["kernel_gen.core", "checker.core", "checker.submission"]
+source = ["kernel_gen.core", "checker.core", "checker.submission", "reranker.src.prm"]
 branch = true
 
 [tool.coverage.report]
