@@ -47,14 +47,26 @@ for flat in (False, True):
 
     rows = _topk(container)
     assert len(rows) == 2, (flat, rows)
-    assert dict(rows[0]) == {3: -1.2, 7: -0.2}, (flat, rows[0])
-    assert dict(rows[1]) == {99: -9.0, 1: -0.1, 2: -2.0}, (flat, rows[1])
+    # The whole point of the bug: the flat container does NOT dedupe, so the sampled
+    # token's copy survives and the row is 3 wide. Comparing as dicts -- which is what
+    # this assertion used to do -- collapses the duplicate and passes either way, which
+    # is exactly why the contract test never caught KGEN-25.
+    assert rows[0] == ([(3, -1.2), (7, -0.2), (3, -1.2)] if flat else [(3, -1.2), (7, -0.2)]), (
+        flat,
+        rows[0],
+    )
+    assert rows[1] == [(99, -9.0), (1, -0.1), (2, -2.0)], (flat, rows[1])
 
     trace = pack([3, 99], rows, k=2)
     assert trace.topk_ids[0].tolist() == [7, 3], trace.topk_ids[0]   # sorted, not as given
     assert trace.sampled_rank.tolist() == [2, 3], trace.sampled_rank
     assert abs(trace.sampled_lp[1] + 9.0) < 1e-4, trace.sampled_lp   # kept past truncation
     assert 99 not in trace.topk_ids
+    # K distinct alternatives per row whichever container produced them: the duplicate
+    # must not cost the row its real rank-K entry.
+    for row in trace.topk_ids.tolist():
+        assert len(set(row)) == len(row) == 2, (flat, row)
+    assert trace.meta["trace_k"] == 2, trace.meta
 
 assert _topk(None) is None
 

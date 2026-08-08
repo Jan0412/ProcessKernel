@@ -19,6 +19,7 @@ from kernel_gen.core.trace import (
     SEG_CODE,
     SEG_PLAN,
     concat_passes,
+    dedupe_rows,
     derive_scalars,
     pack,
     rank1_calibration,
@@ -63,11 +64,10 @@ def test_pack_keeps_the_sampled_token_even_when_it_is_not_the_argmax():
 
 
 def test_pack_sorts_rows_because_vllm_puts_the_sampled_token_first():
-    # vLLM builds each position as {token_id: Logprob} with the SAMPLED token inserted
-    # before the top-K, and a dict keeps first-insertion order even when the duplicate
-    # key is overwritten. So a row genuinely arrives with the argmax in position 1, not
-    # 0, whenever sampling took a runner-up. Trusting that order would file the sampled
-    # token's logprob under top1_lp for exactly the tokens where the difference matters.
+    # vLLM prepends the SAMPLED token to the top-K, so a row genuinely arrives with the
+    # argmax in position 1, not 0, whenever sampling took a runner-up. Trusting that
+    # order would file the sampled token's logprob under top1_lp for exactly the tokens
+    # where the difference matters.
     as_vllm_returns_it = [[(3, math.log(0.3)), (7, math.log(0.6)), (9, math.log(0.1))]]
     trace = pack([3], as_vllm_returns_it, k=3)
 
@@ -85,6 +85,73 @@ def test_pack_truncates_to_k_but_reads_the_sampled_logprob_first():
     assert 99 not in trace.topk_ids
     assert trace.sampled_lp[0] == pytest.approx(math.log(0.01), abs=1e-5)
     assert trace.sampled_rank[0] == 3  # rank survives even though the entry is dropped
+
+
+def test_pack_drops_vllms_duplicated_sampled_token_and_keeps_the_real_rank_k():
+    # KGEN-25. vLLM's sampler emits (num tokens) x (num_logprobs + 1) -- the sampled
+    # token's id concatenated onto the top-K indices -- and FlatLogprobs appends that
+    # verbatim, so the sampled token appears twice whenever it ranked inside the top-K.
+    # Truncating without deduping keeps the repeat and silently discards the real
+    # rank-K alternative, which is what destroyed `margin` across the whole v4 corpus.
+    top4 = [(10, math.log(0.5)), (11, math.log(0.3)), (12, math.log(0.15))]
+    as_vllm_returns_it = [[(11, math.log(0.3))] + top4]  # sampled id 11, also at rank 2
+    trace = pack([11], as_vllm_returns_it, k=3)
+
+    assert trace.topk_ids[0].tolist() == [10, 11, 12], "the rank-3 entry must survive"
+    assert trace.sampled_rank[0] == 2, "the repeat must not shift the recorded rank"
+    scalars = derive_scalars(trace.topk_lp)
+    assert scalars["margin"][0] == pytest.approx(0.2, abs=1e-3), "p1 - p2, not p1 - p1"
+
+
+def test_pack_records_the_k_it_actually_stored():
+    # A repaired corpus and a natively-generated one differ in K while having identical
+    # array shapes, and entropy/deepconf_c/tail_mass are not comparable across K. The
+    # file says which it is rather than leaving a reader to infer it.
+    assert pack([1], [[(1, -0.2), (2, -1.0)]], k=2).meta["trace_k"] == 2
+    assert pack([1], None, k=7).meta["trace_k"] == 7
+
+
+def test_dedupe_rows_uses_ids_not_adjacency_because_ties_separate_the_copies():
+    # float16 logprobs tie constantly, and a stable sort can put the two copies of the
+    # sampled token either side of an equal-scoring neighbour. An adjacency check would
+    # miss those rows -- measured at ~1% of the real corpus.
+    ids = np.array([[5, 7, 5, 9]], dtype=np.int32)
+    lp = np.array([[-0.5, -0.5, -0.5, -2.0]], dtype=np.float16)
+    out_ids, out_lp = dedupe_rows(ids, lp, 3)
+
+    assert out_ids[0].tolist() == [5, 7, 9]
+    assert out_lp[0].tolist() == pytest.approx([-0.5, -0.5, -2.0], abs=1e-3)
+
+
+def test_dedupe_rows_is_idempotent_so_a_repair_can_be_re_run():
+    ids = np.array([[10, 11, 11, 12]], dtype=np.int32)
+    lp = np.array([[-0.1, -0.9, -0.9, -1.5]], dtype=np.float16)
+    once = dedupe_rows(ids, lp, 3)
+    twice = dedupe_rows(*once, 3)
+
+    assert once[0].tolist() == twice[0].tolist() == [[10, 11, 12]]
+    assert np.array_equal(once[1], twice[1])
+
+
+def test_dedupe_rows_keeps_padding_out_of_the_distinctness_test():
+    # PAD_ID repeats legitimately -- it is absence, not an alternative -- so it must not
+    # be collapsed into a single column and drag real entries left.
+    ids = np.array([[4, 4, PAD_ID, PAD_ID]], dtype=np.int32)
+    lp = np.array([[-0.3, -0.3, -np.inf, -np.inf]], dtype=np.float16)
+    out_ids, out_lp = dedupe_rows(ids, lp, 3)
+
+    assert out_ids[0].tolist() == [4, PAD_ID, PAD_ID]
+    assert np.isneginf(np.asarray(out_lp[0, 1:], dtype=np.float64)).all()
+
+
+def test_dedupe_rows_returns_the_widths_and_dtypes_the_trace_format_promises():
+    ids = np.array([[1, 2], [3, 3]], dtype=np.int32)
+    lp = np.array([[-0.1, -0.2], [-0.3, -0.3]], dtype=np.float16)
+    out_ids, out_lp = dedupe_rows(ids, lp, 5)  # asked for more than the input holds
+
+    assert out_ids.shape == out_lp.shape == (2, 5)
+    assert (out_ids.dtype, out_lp.dtype) == (np.int32, np.float16)
+    assert out_ids[1].tolist() == [3, PAD_ID, PAD_ID, PAD_ID, PAD_ID]
 
 
 def test_pack_pads_short_rows_rather_than_going_ragged():

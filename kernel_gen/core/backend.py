@@ -96,6 +96,28 @@ class Backend:
         ]
 
 
+def _is_deepseek_v4(model_id: str) -> bool:
+    """Architecture probe, read before the engine exists so it can pick a KV dtype.
+
+    Swallows everything: a checkpoint this cannot read is one whose KV dtype we leave
+    at vLLM's default, and getting that wrong on a DSv4 model fails loudly at startup
+    rather than quietly at generation.
+
+    ``local_files_only`` is the load-bearing argument. Without it a repo id that is not
+    cached -- every id the unit tests pass -- reaches for the Hub and *hangs* instead of
+    raising, so the except below never runs. Every caller here already resolves from
+    cache (lintloop.sh exports HF_HUB_OFFLINE=1), so nothing real is lost.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+        archs = config.architectures or []
+    except Exception:
+        return False
+    return "DeepseekV4ForCausalLM" in archs
+
+
 class VLLMBackend(Backend):
     """vLLM offline inference. Loads the model in ``__init__``."""
 
@@ -191,6 +213,24 @@ class VLLMBackend(Backend):
         if load_in_4bit:
             kwargs["quantization"] = "bitsandbytes"
             kwargs["load_format"] = "bitsandbytes"
+        if _is_deepseek_v4(model_id):
+            # DeepSeek-V4 stores KV in DeepSeek's own fp8_ds_mla block format and asserts
+            # on anything else, so vLLM's default "auto" aborts model construction:
+            # "DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, got auto". Not a
+            # tuning knob -- on SM90 the only DSv4 attention class is FlashMLA, whose
+            # use_fp8_ds_mla_layout is True; the bf16-capable FlashInfer one needs SM100+.
+            kwargs["kv_cache_dtype"] = "fp8_ds_mla"
+            # The MXFP4 experts must not go to Marlin. gpt-oss and DSv4 take *different*
+            # backend selectors: gpt-oss's lists TRITON and lands there, while the generic
+            # one is [flashinfer_trtllm, deep_gemm, marlin, batched_marlin] -- the first
+            # two are SM100+, so SM90 falls to Marlin, whose fp4 expert repack dies with
+            # "the provided PTX was compiled with an unsupported toolchain" on the r570
+            # driver these nodes run (reproduced standalone, job 2405134). Triton is not
+            # an option: it accepts only SWIGLUOAI, and DSv4's MoE is SILU + swiglu_limit,
+            # so forcing it would either be rejected or silently apply gpt-oss's
+            # alpha=1.702/beta=1.0 to a model trained with 1.0/0.0. Humming takes
+            # (mxfp4 weights, bf16 activations) with SILU at capability >=7.5.
+            kwargs["kernel_config"] = {"moe_backend": "humming"}
 
         print(f"Loading model {model_id} with vLLM …")
         self.llm = LLM(model=model_id, **kwargs)
@@ -421,13 +461,17 @@ def _fake_tokens(
             ((seed + 7919 * (j + 1)) % FAKE_VOCAB, -0.1 - 0.7 * j) for j in range(k)
         ]
         # seed % (k + 1) == k is the "sampled token fell outside the top-K" case, which
-        # is the one that makes rows ragged and the sampled logprob unrecoverable from
-        # the truncated array -- so the fake produces it about one token in K+1.
+        # is the one that makes the sampled logprob unrecoverable from the truncated
+        # array -- so the fake produces it about one token in K+1.
         index = seed % (k + 1)
         if index < k:
             alternatives[index] = (sampled_id, alternatives[index][1])
-            row = [alternatives[index]] + [a for i, a in enumerate(alternatives) if i != index]
+            sampled = alternatives[index]
         else:
-            row = [(sampled_id, -0.1 - 0.7 * k)] + alternatives
-        rows.append(row)
+            sampled = (sampled_id, -0.1 - 0.7 * k)
+        # vLLM prepends the sampled token to the WHOLE top-K without deduping, so a row
+        # is always K+1 wide and repeats the sampled token whenever it ranked inside the
+        # top-K (KGEN-25). Dropping the repeat here instead would leave every test in
+        # this repo exercising a shape production never emits.
+        rows.append([sampled] + alternatives)
     return token_ids, rows

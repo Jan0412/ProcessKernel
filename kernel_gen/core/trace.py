@@ -68,6 +68,47 @@ class TokenTrace:
         return int(self.topk_lp.shape[1])
 
 
+def dedupe_rows(
+    topk_ids: np.ndarray, topk_lp: np.ndarray, k: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop each row's repeated ids, keep descending order, return width ``k``.
+
+    vLLM's sampler emits ``(num tokens) x (num_logprobs + 1)`` -- ``torch.cat`` of the
+    sampled token's own id onto the top-K indices -- and the engine appends that row
+    into :class:`FlatLogprobs` verbatim. Its own source says a duplicate is harmless
+    because "inserting duplicated data into a dictionary twice is the same as doing it
+    once", which is true of the legacy ``dict`` container and false of the flat one
+    :func:`kernel_gen.core.backend._topk` actually reads. So the sampled token arrives
+    twice whenever it ranked inside the top-K, and truncating to K without deduping
+    keeps a repeat and discards the real rank-K alternative (KGEN-25).
+
+    First occurrence wins: it sits at the token's true rank, which is what
+    ``sampled_rank`` already records, so deduping never moves it. Exact float ties can
+    sort the two copies apart, so the check is on ids, not on adjacency, and the sort
+    is stable to leave the surviving order untouched.
+    """
+    ids = np.asarray(topk_ids)
+    same = (ids[:, :, None] == ids[:, None, :]) & (ids[:, :, None] != PAD_ID)
+    keep = (ids != PAD_ID) & ~np.triu(same, 1).any(axis=1)
+    order = np.argsort(~keep, axis=1, kind="stable")
+    slot = np.arange(ids.shape[1])[None, :]
+    n_keep = keep.sum(axis=1)[:, None]
+
+    out_ids = np.where(slot < n_keep, np.take_along_axis(ids, order, 1), PAD_ID)
+    out_lp = np.where(
+        slot < n_keep,
+        np.take_along_axis(np.asarray(topk_lp, dtype=np.float32), order, 1),
+        -np.inf,
+    )
+    # Pad rather than narrow: a caller asking for K columns gets K, even from a backend
+    # that returned fewer alternatives than that -- including one that returned none.
+    if out_ids.shape[1] < k:
+        short = k - out_ids.shape[1]
+        out_ids = np.hstack([out_ids, np.full((len(ids), short), PAD_ID, dtype=out_ids.dtype)])
+        out_lp = np.hstack([out_lp, np.full((len(ids), short), -np.inf, dtype=out_lp.dtype)])
+    return out_ids[:, :k].astype(np.int32), out_lp[:, :k].astype(np.float16)
+
+
 def pack(
     token_ids: list[int],
     topk: list[list[tuple[int, float]]] | None,
@@ -77,45 +118,54 @@ def pack(
 ) -> TokenTrace:
     """Backend output -> a :class:`TokenTrace`, one segment, no seam handling.
 
-    ``topk[t]`` is the alternatives at step ``t`` as ``(token_id, logprob)``. Two
+    ``topk[t]`` is the alternatives at step ``t`` as ``(token_id, logprob)``. Three
     properties of vLLM's actual output are handled here rather than trusted:
 
-    **Order.** vLLM builds each position as ``{token_id: Logprob}`` with the *sampled*
-    token inserted first and the top-K after it, so when sampling took a runner-up --
-    routine at ``--think-temperature 1.0`` -- the first entry is NOT the argmax and a
-    dict preserves that insertion order even though the duplicate key is overwritten.
-    Rows are therefore sorted by logprob here, descending. Trusting the incoming order
-    would put the sampled token in the ``top1_lp`` column for exactly the tokens where
-    the distinction matters.
+    **Order.** vLLM prepends the *sampled* token to the top-K, so when sampling took a
+    runner-up -- routine at ``--think-temperature 1.0`` -- the first entry is NOT the
+    argmax. Rows are therefore sorted by logprob here, descending. Trusting the incoming
+    order would put the sampled token in the ``top1_lp`` column for exactly the tokens
+    where the distinction matters.
 
-    **Width.** The same construction yields K+1 entries whenever the sampled token
-    ranked outside the top-K. Rows are truncated to K *after* the sampled token's
-    logprob and rank have been read off, so the ragged case costs no information and
+    **Duplicates.** That same prepend repeats the sampled token whenever it ranked
+    inside the top-K, which is almost always. :func:`dedupe_rows` drops the repeat, so a
+    row of K columns holds K *distinct* alternatives.
+
+    **Width.** The row therefore arrives K+1 wide. It is deduped and truncated to K
+    *after* the sampled token's logprob and rank have been read off the full sorted row,
+    so a token sampled outside the top-K still records its true rank and logprob and
     nothing downstream has to reason about ragged rows.
 
     ``topk=None`` (a backend with no internals to give) still produces a valid trace --
-    the arrays are empty in the K dimension rather than absent, so callers never branch.
+    the arrays are PAD rather than absent, so callers never branch.
+
+    ``meta["trace_k"]`` records the K actually stored. Traces outlive the code that
+    wrote them, K-dependent scalars (``entropy``, ``deepconf_c``, ``tail_mass``) are not
+    comparable across different K, and a repaired corpus sits at a different K from a
+    natively-generated one -- so the file says which it is rather than leaving a reader
+    to infer it from an array shape that cannot distinguish the two.
     """
     n = len(token_ids)
     ids = np.asarray(token_ids, dtype=np.int32)
 
-    topk_ids = np.full((n, k), PAD_ID, dtype=np.int32)
-    topk_lp = np.full((n, k), -np.inf, dtype=np.float16)
+    rows = list(topk or [])[:n]  # a backend that returned more logprob rows than tokens
+    width = max((len(row) for row in rows), default=0)
+    staged_ids = np.full((n, width), PAD_ID, dtype=np.int32)
+    staged_lp = np.full((n, width), -np.inf, dtype=np.float32)
     sampled_lp = np.zeros(n, dtype=np.float32)
     sampled_rank = np.zeros(n, dtype=np.int16)
 
-    for t, row in enumerate(topk or []):
-        if t >= n:  # a backend that returned more logprob rows than tokens
-            break
+    for t, row in enumerate(rows):
         ordered = sorted(row, key=lambda entry: entry[1], reverse=True)
         for rank, (token_id, logprob) in enumerate(ordered, start=1):
             if token_id == ids[t]:
                 sampled_lp[t] = logprob
                 sampled_rank[t] = rank
                 break
-        head = ordered[:k]
-        topk_ids[t, : len(head)] = [i for i, _ in head]
-        topk_lp[t, : len(head)] = [lp for _, lp in head]
+        staged_ids[t, : len(ordered)] = [i for i, _ in ordered]
+        staged_lp[t, : len(ordered)] = [lp for _, lp in ordered]
+
+    topk_ids, topk_lp = dedupe_rows(staged_ids, staged_lp, k)
 
     return TokenTrace(
         token_ids=ids,
@@ -124,7 +174,7 @@ def pack(
         sampled_lp=sampled_lp,
         sampled_rank=sampled_rank,
         seg=np.full(n, seg, dtype=np.int8),
-        meta=dict(meta or {}),
+        meta={**(meta or {}), "trace_k": int(k)},
     )
 
 

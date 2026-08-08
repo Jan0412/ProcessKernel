@@ -114,11 +114,21 @@ def test_the_sampled_token_does_not_always_come_back_as_the_argmax():
         f"no token ranked outside the top-{k}, so truncation never dropped a sampled "
         f"entry and the ragged path is untested: {sorted(ranks)}"
     )
-    # A row holds K distinct alternatives -- never the sampled id twice at two logprobs,
-    # which is not a distribution any model could produce.
+    # The RAW row is K+1 wide and repeats the sampled token whenever it ranked inside the
+    # top-K, because that is what vLLM emits (KGEN-25). Asserting the raw row was already
+    # distinct is what this test used to do, and it encoded the dict-container premise
+    # that the flat container this repo opts into does not honour.
+    assert any(
+        len({token_id for token_id, _ in row}) < len(row) for row in out.topk
+    ), "the fixture no longer reproduces vLLM's duplicated sampled token"
     for row in out.topk:
-        ids = [token_id for token_id, _ in row]
-        assert len(ids) == len(set(ids)), f"duplicate id in a logprob row: {row}"
+        assert len(row) == k + 1, f"row is not K+1 wide: {row}"
+
+    # pack() is where the repeat is dropped, so the STORED row holds K distinct
+    # alternatives -- never the sampled id twice at two logprobs, which is not a
+    # distribution any model could produce.
+    for row in trace.topk_ids.tolist():
+        assert len(row) == len(set(row)) == k, f"duplicate id in a stored row: {row}"
 
 
 def test_a_sample_outside_the_top_k_keeps_its_logprob_past_truncation():
