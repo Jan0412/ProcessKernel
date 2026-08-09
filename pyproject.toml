@@ -43,7 +43,10 @@ filterwarnings = [
 # fails CI. NB: coverage wants dotted module names here, not paths -- a path silently
 # reports "module was never imported" and measures nothing.
 [tool.coverage.run]
-source = ["kernel_gen.core", "checker.core", "checker.submission", "reranker.src.prm"]
+source = [
+    "kernel_gen.core", "checker.core", "checker.submission",
+    "reranker.src.prm", "reranker.src.data.labels",
+]
 branch = true
 
 [tool.coverage.report]

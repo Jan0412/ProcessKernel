@@ -22,12 +22,11 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from collections import Counter
 
 from reranker.src.config import PROJECT_ROOT, RerankerConfig, _resolve, load_config
-from reranker.src.data.labels import compute_label
+from reranker.src.data.labels import compute_label, load_baseline_times
 
 
 def _add_kernelbench_to_path(kernelbench_dir: str) -> None:
@@ -39,38 +38,6 @@ def _add_kernelbench_to_path(kernelbench_dir: str) -> None:
 def _load_json(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
-
-
-def _load_baseline_times(path: str) -> dict[int, dict[int, dict[str, float]]]:
-    """Load the PyTorch-eager baseline runtimes as ``{level: {problem_id: {"mean", "min"}}}``.
-
-    Both the mean and the min wall-clock runtime are kept: the mean matches the
-    KernelBench ``fast_p`` convention, the min is the noise-robust statistic for
-    launch-bound micro-kernels. The KernelBench timing JSON is keyed by
-    ``"level1"`` ... and, within each level, by problem filename
-    (``"1_Square_matrix_multiplication_.py"``) whose integer prefix is the problem
-    id. Returns ``{}`` (and warns) if the file is missing, so ``speedup`` simply
-    becomes ``None`` everywhere.
-    """
-    if not os.path.isfile(path):
-        print(f"[WARN] baseline timing file not found: {path} — speedup will be None for all rows")
-        return {}
-    raw = _load_json(path)
-    out: dict[int, dict[int, dict[str, float]]] = {}
-    for level_key, problems in raw.items():
-        m = re.match(r"level(\d+)$", str(level_key))
-        if not m or not isinstance(problems, dict):
-            continue
-        per_problem: dict[int, dict[str, float]] = {}
-        for fname, stats in problems.items():
-            pm = re.match(r"(\d+)_", str(fname))
-            if pm and isinstance(stats, dict) and stats.get("mean") is not None:
-                entry = {"mean": float(stats["mean"])}
-                if stats.get("min") is not None:
-                    entry["min"] = float(stats["min"])
-                per_problem[int(pm.group(1))] = entry
-        out[int(m.group(1))] = per_problem
-    return out
 
 
 def _staged_kernel_path(run_dir: str, level: int, problem_id: int, sample_id: int) -> str:
@@ -96,7 +63,7 @@ def build_dataset(cfg: RerankerConfig) -> str:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     # Per-problem PyTorch baseline runtimes for the speedup grade (listwise).
-    baseline_times = _load_baseline_times(_resolve(data_cfg.baseline_timing_json))
+    baseline_times = load_baseline_times(_resolve(data_cfg.baseline_timing_json))
 
     # Cache KernelBench datasets per level (run_dirs may share a level).
     kb_datasets: dict[int, object] = {}
