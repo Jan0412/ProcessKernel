@@ -97,6 +97,15 @@ def test_exactly_one_golden_completion_fails_to_tokenize():
     }
 
 
+def test_a_nul_byte_is_a_drop_not_a_crash():
+    # The indented body is the point: with a pending DEDENT 3.12's C tokenizer raises
+    # SystemError, which is not a SyntaxError and escaped the guard. Flat code raises
+    # TokenError and never reproduced it. 0 NULs in 285,149 attempts, but a JSON
+    # escape carries one through json.loads untouched, so the class is reachable.
+    assert cut_points("```python\ndef f():\n    return 1\n\x00\n```\n") is None
+    assert cut_points("```python\nx = 1\n\x00\n```\n") is None
+
+
 def test_a_prefix_can_cut_where_the_whole_text_cannot():
     # The other half of the same fact: `None` is a verdict on the text seen so far, so a
     # completion whose tail is unparseable still cuts cleanly at every earlier prefix.
@@ -206,7 +215,9 @@ def test_an_unterminated_fence_still_yields_cuts():
 
 
 def test_code_outside_any_fence_is_prose_not_code():
-    # The chunker cuts what the fences say is code. An unfenced kernel is cut by line.
+    # PRM-1, known and not fixed: an unfenced kernel is cut by line, so a cut can land
+    # mid-statement. 0 of 285,149 real attempts lack a fence; gating the gaps instead
+    # drops 22.3% of them. This pins today's behaviour, not a desirable one.
     cuts = cut_points("import torch\nx = f(\n")
     assert all(c.kind == PROSE for c in cuts)
     assert cut_points("import torch\nx = f(\n") is not None  # no tokenize gate on prose

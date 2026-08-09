@@ -27,10 +27,12 @@ def cut_points(raw: str, *, prose_lines: int = 1, code_steps: int = 1) -> list[C
     if prose_lines < 1 or code_steps < 1:
         raise ValueError(f"chunk sizes must be >= 1, got {prose_lines=} {code_steps=}")
 
-    # Every span is tokenized as Python whatever its info tag: 13,784 `python` vs 6 `text`
-    # over 13,353 attempts, 0 drops -- the two-pass sampler injects the fence.
+    # Every span is tokenized as Python whatever its info tag. Over 285,149 real attempts:
+    # 292,253 `python`, 52 `text`, 2 `analysis`, 2 `c`, 1 `diff`; being tag-blind costs 5
+    # completions, so reading the tag is not worth the branch.
     spans = fence_spans(raw)
     regions = [(a, b, CODE) for a, b in spans]
+    # Outside a fence is prose even when it is code -- known, measured, PRM-1.
     regions += [(a, b, PROSE) for a, b in _outside(raw, spans)]
     regions.sort()
 
@@ -83,7 +85,9 @@ def _code_cuts(raw: str, a: int, b: int) -> list[tuple[int, str]] | None:
             # cut the full text lacks. Demand a real newline inside the span.
             if pos <= b and raw[pos - 1] == "\n":
                 out.append((pos, CODE))
-    except (SyntaxError, tokenize.TokenError, ValueError):
+    # SystemError: 3.12's C tokenizer meeting a NUL with a pending DEDENT fails out of the
+    # generator, not as a SyntaxError -- an indented body is enough, flat code is not.
+    except (SyntaxError, tokenize.TokenError, ValueError, SystemError):
         return None
     return out
 
