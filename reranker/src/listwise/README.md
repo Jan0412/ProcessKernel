@@ -64,8 +64,8 @@ and confirm coverage before spending GPU time. It is a two-step pipeline.
    A run **without** `eval_results.json` is silently skipped (with a `[WARN]`) and contributes nothing.
 2. **KernelBench problems** — `KernelBench/` under `data.kernelbench_dir` (for the reference-architecture sources).
 3. **Baseline timings** — the JSON at `data.baseline_timing_json` for the **same hardware** your runs were
-   timed on (default `../timing/A100/baseline_time_torch.json`). Without it, every correct kernel loses its
-   speedup and gets dropped, so the lists end up empty.
+   timed on (default `…/KernelBench/results/timing/H100/baseline_time_torch.json`). Without it, every
+   correct kernel loses its speedup and gets dropped, so the lists end up empty.
 
 **Step 1 — build the source dataset** (joins runs + reference sources + baseline speedup; drops
 non-compiling kernels because `negative_mode: compiled_wrong`):
@@ -157,7 +157,7 @@ that affects listwise training, grouped by section.
 | `kernelbench_dir` | `..` | Repo root holding `KernelBench/` (for reference-architecture sources). |
 | `dataset_jsonl` | `data/dataset_listwise.jsonl` | Dedicated source dataset so dropping compile-fails + adding `speedup` never clobbers the pointwise/pairwise `data/dataset.jsonl`. |
 | `negative_mode` | `compiled_wrong` | **Excludes non-compiling kernels entirely.** Compilation is a cheap deterministic post-generation check, so the reranker only ranks compiling candidates; the only negatives are compiled-but-wrong. |
-| `baseline_timing_json` | `../timing/A100/baseline_time_torch.json` | Per-problem PyTorch-eager baseline runtimes (resolved relative to `reranker/`). `build_dataset` joins these to compute `speedup = baseline / kernel_runtime` per correct kernel. **Use the JSON for the hardware your runs were timed on** (A100 here). |
+| `baseline_timing_json` | `…/KernelBench/results/timing/H100/baseline_time_torch.json` | Per-problem PyTorch-eager baseline runtimes. `build_dataset` joins these to compute `speedup = baseline / kernel_runtime` per correct kernel. **Use the JSON for the hardware your runs were timed on** — H100, and the same file the PRM build uses, so the two pipelines cannot grade against different GPUs. |
 
 #### `model:`
 
@@ -373,7 +373,7 @@ Reuses, unchanged, from `reranker/src`: the `SequenceEncoder` (encoding), the ba
 - **Speed signal needs ≥2 correct kernels per problem** to contribute fast-vs-slow ordering; on
   problems with a single correct kernel it only contributes correct-vs-wrong ordering.
 - **Baselines are hardware-specific.** Point `data.baseline_timing_json` at the timing JSON for the
-  GPU your runs were measured on (A100 here). Coverage is reported by `build_dataset`
+  GPU your runs were measured on (H100 here). Coverage is reported by `build_dataset`
   (`X/Y correct have a baseline`).
 - **A run with no `eval_results.json` is silently skipped** by `build_dataset` (with a `[WARN]`),
   so it contributes no candidates until its eval results are present.

@@ -26,8 +26,9 @@ data:
   # post-generation check, so the reranker only ever ranks compiling candidates.
   negative_mode: compiled_wrong
   # Per-problem PyTorch-eager baseline runtimes for the speedup grade (KernelBench
-  # fast_p style). Resolved relative to the project root (reranker/).
-  baseline_timing_json: /path/to/workdir/KernelBench/results/timing/A100/baseline_time_torch.json
+  # fast_p style). H100, the hardware the runs were timed on, and the same file the PRM
+  # build grades against -- the previous A100 path was also on a cluster we no longer use.
+  baseline_timing_json: /path/to/workdir/KernelBench/results/timing/H100/baseline_time_torch.json
 
 model:
   base_model: Qwen/Qwen3-Reranker-0.6B

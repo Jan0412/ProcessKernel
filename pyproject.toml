@@ -45,7 +45,7 @@ filterwarnings = [
 [tool.coverage.run]
 source = [
     "kernel_gen.core", "checker.core", "checker.submission",
-    "reranker.src.prm", "reranker.src.data.labels",
+    "reranker.src.prm", "reranker.src.data.labels", "reranker.src.config",
 ]
 branch = true
 

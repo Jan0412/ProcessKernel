@@ -1,0 +1,34 @@
+# PRM labeling build — prm_plan/PLAN.md §7. Only the `prm` section is read.
+#   python -m reranker.src.prm.build  --config reranker/configs/prm_config.yaml
+#   python -m reranker.src.prm.splits --config reranker/configs/prm_config.yaml
+#   python -m reranker.src.prm.stats  --config reranker/configs/prm_config.yaml
+#
+# List values must live here: config._coerce has no list case, so `prm.rounds=[0]` on the
+# CLI would arrive as the string "[0]". Scalars (num_workers, max_shards) override fine.
+prm:
+  run_dirs:
+    - /path/to/workdir/KernelBench/runs/DeepSeek-V4-Flash_kb6_lintloop_triton_v5_traced
+    - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kb6_lintloop_triton_v5_traced
+  rounds: [0, 1, 2]
+
+  # H100 because the runs report "NVIDIA H100 80GB HBM3" (16,478 level-6 problems, all with
+  # both `mean` and `min`). Not the repo-local timing/H100: that is a different measurement
+  # of the same hardware and disagrees on `mean` for 15,823 of 16,311 shared problems.
+  baseline_timing_json: /path/to/workdir/KernelBench/results/timing/H100/baseline_time_torch.json
+
+  label_mode: graded
+  speedup_stat: min
+  speedup_lo: 0.2
+  speedup_hi: 4.0
+  speed_quant: 0.1
+
+  prose_lines_per_chunk: 1
+  code_steps_per_chunk: 1
+  min_frac: 0.0
+
+  tokenizer: Qwen/Qwen3-Reranker-4B
+  max_length: 16384
+
+  out_dir: data/prm
+  num_workers: 8
+  max_shards: null
