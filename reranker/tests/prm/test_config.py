@@ -148,6 +148,13 @@ def test_run_dirs_must_hold_paths():
         ({"max_length": 0}, "max_length"),
         ({"num_workers": 0}, "num_workers"),
         ({"max_shards": 0}, "max_shards"),
+        ({"split_ratios": [0.85, 0.15]}, "split_ratios"),
+        ({"split_ratios": [0.5, 0.3, 0.3]}, "split_ratios"),
+        # Sums to 1 and has three entries, but n_train = round(1.5n) runs past the list
+        # and _split_ids then puts every problem in train, with no val and no test.
+        ({"split_ratios": [1.5, -0.5, 0.0]}, "split_ratios"),
+        ({"split_ratios": "abc"}, "split_ratios"),  # len 3, and sum() would raise TypeError
+        ({"split_ratios": [True, False, False]}, "split_ratios"),  # YAML [yes, no, no]
     ],
 )
 def test_a_knob_that_would_build_nothing_or_crash_raises(over, match):

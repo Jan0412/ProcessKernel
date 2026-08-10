@@ -202,6 +202,11 @@ class PRMConfig:
     tokenizer: str = "Qwen/Qwen3-Reranker-4B"
     max_length: int = 16384       # tokens over prompt + raw; over-length samples are dropped
 
+    # Own split knobs rather than data.split_*: a prm_config.yaml has no `data` section,
+    # so borrowing them would tie this build to a section it never otherwise reads.
+    split_ratios: list[float] = field(default_factory=lambda: [0.7, 0.15, 0.15])
+    split_seed: int = 42
+
     out_dir: str = "data/prm"
     num_workers: int = 8
     max_shards: Optional[int] = None  # smoke builds only: cap shards per run (None = all)
@@ -229,6 +234,22 @@ class PRMConfig:
             raise ValueError(f"prm.max_length must be >= 1, got {self.max_length}")
         if self.num_workers < 1:
             raise ValueError(f"prm.num_workers must be >= 1, got {self.num_workers}")
+        # Three, because _split_ids gives the remainder to test. Non-negative, or n_train
+        # runs past the end of the list and every problem silently lands in train.
+        ratios = self.split_ratios
+        if (
+            not isinstance(ratios, list)
+            or len(ratios) != 3
+            # bool is an int, and YAML reads `[yes, no, no]` as one -- same trap as rounds.
+            or not all(
+                isinstance(r, (int, float)) and not isinstance(r, bool) and r >= 0
+                for r in ratios
+            )
+            or abs(sum(ratios) - 1.0) > 1e-6
+        ):
+            raise ValueError(
+                f"prm.split_ratios must be three non-negative ratios summing to 1, got {ratios!r}"
+            )
         # int, not just >= 1: a float slices no list, and `prm.max_shards=1e3` is a float.
         if self.max_shards is not None and (
             not isinstance(self.max_shards, int) or self.max_shards < 1

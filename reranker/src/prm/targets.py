@@ -44,8 +44,10 @@ def graded_target(speedup: float, *, lo: float, hi: float, quant: float) -> floa
     return (1.0 + speed_p(speedup, lo, hi, quant)) / 2
 
 
-def _usable(t: float | None) -> bool:
+def usable(t: float | None) -> bool:
     """Present, finite and positive -- not missing, not the harness's -1.0 "never timed"."""
+    # Public because build.py asks it of the baseline side to tell `no_baseline` from
+    # `no_runtime`; a second copy of the predicate would let the two drift.
     return t is not None and math.isfinite(t) and t > 0
 
 
@@ -66,11 +68,11 @@ def speedups(
         return out
     for stat in (MEAN, MIN):
         base, kernel = (baseline or {}).get(stat), (ours or {}).get(stat)
-        if _usable(base) and _usable(kernel):
+        if usable(base) and usable(kernel):
             # The quotient is checked too: two finite inputs still divide to 0.0 or inf,
             # which speed_p raises on and grades 1.00 respectively.
             ratio = float(base) / float(kernel)
-            if _usable(ratio):
+            if usable(ratio):
                 out[stat] = ratio
     return out
 

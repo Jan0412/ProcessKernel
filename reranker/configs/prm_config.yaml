@@ -29,6 +29,10 @@ prm:
   tokenizer: Qwen/Qwen3-Reranker-4B
   max_length: 16384
 
+  # Joint over both runs: every DeepSeek problem id also appears in gpt-oss.
+  split_ratios: [0.7, 0.15, 0.15]
+  split_seed: 42
+
   out_dir: data/prm
   num_workers: 8
   max_shards: null
