@@ -28,6 +28,16 @@ def check_scale(lo: float, hi: float, quant: float) -> None:
         raise ValueError(f"need 0 <= speed_quant <= 1 (0 = off), got {quant=}")
 
 
+def check_knobs(mode: str, stat: str, lo: float, hi: float, quant: float) -> None:
+    """Every grading knob at once, so config.validate and target_for cannot disagree."""
+    if mode not in (GRADED, BINARY):
+        raise ValueError(f"label_mode must be {GRADED!r} or {BINARY!r}, got {mode!r}")
+    if stat not in (MEAN, MIN):
+        raise ValueError(f"speedup_stat must be {MEAN!r} or {MIN!r}, got {stat!r}")
+    if mode == GRADED:
+        check_scale(lo, hi, quant)
+
+
 def graded_target(speedup: float, *, lo: float, hi: float, quant: float) -> float:
     """Correct kernels only: ``lo`` -> 0.5, ``hi`` -> 1.0, on a ladder of ``quant``/2 steps."""
     check_scale(lo, hi, quant)
@@ -35,34 +45,33 @@ def graded_target(speedup: float, *, lo: float, hi: float, quant: float) -> floa
 
 
 def _usable(t: float | None) -> bool:
-    """A real measurement: not missing, not the harness's -1.0 "never timed", not corrupt.
-
-    Both sides finite and positive is what makes the quotient safe -- speed_p raises on a
-    ratio of 0.0 and grades inf as 1.00 and nan as 0.50.
-    """
+    """Present, finite and positive -- not missing, not the harness's -1.0 "never timed"."""
     return t is not None and math.isfinite(t) and t > 0
 
 
 def speedups(
     *,
     correct: bool,
-    runtime: float | None,
-    runtime_stats: dict | None,
+    ours: dict[str, float | None] | None,
     baseline: dict[str, float] | None,
 ) -> dict[str, float | None]:
     """Baseline over kernel runtime, mean/mean and min/min; ``None`` where a side is unusable.
 
-    Keyword-only: ``runtime_stats`` and ``baseline`` carry the same keys, so a transposed
-    call would invert every speedup in silence.
+    Both sides carry the same two keys so neither statistic can be taken from the other's
+    source (PRM-4); corpus.py owns the mapping from KernelBench's field names. Keyword-only
+    because a transposed call would then invert every speedup in silence.
     """
     out: dict[str, float | None] = {MEAN: None, MIN: None}
     if not correct:
         return out
-    ours = {MEAN: runtime, MIN: (runtime_stats or {}).get("min")}
     for stat in (MEAN, MIN):
-        base, kernel = (baseline or {}).get(stat), ours[stat]
+        base, kernel = (baseline or {}).get(stat), (ours or {}).get(stat)
         if _usable(base) and _usable(kernel):
-            out[stat] = float(base) / float(kernel)
+            # The quotient is checked too: two finite inputs still divide to 0.0 or inf,
+            # which speed_p raises on and grades 1.00 respectively.
+            ratio = float(base) / float(kernel)
+            if _usable(ratio):
+                out[stat] = ratio
     return out
 
 
@@ -70,8 +79,7 @@ def target_for(
     *,
     compiled: bool,
     correct: bool,
-    runtime: float | None,
-    runtime_stats: dict | None,
+    ours: dict[str, float | None] | None,
     baseline: dict[str, float] | None,
     mode: str,
     stat: str,
@@ -84,17 +92,10 @@ def target_for(
     Every knob is checked before any row is graded -- a bad one must not surface partway
     through a build. ``None`` is a drop the caller counts, never a substituted value.
     """
-    if mode not in (GRADED, BINARY):
-        raise ValueError(f"label_mode must be {GRADED!r} or {BINARY!r}, got {mode!r}")
-    if stat not in (MEAN, MIN):
-        raise ValueError(f"speedup_stat must be {MEAN!r} or {MIN!r}, got {stat!r}")
-    if mode == GRADED:
-        check_scale(lo, hi, quant)
+    check_knobs(mode, stat, lo, hi, quant)
 
     label = compute_label(compiled=compiled, correct=correct).label
-    speed = speedups(
-        correct=bool(label), runtime=runtime, runtime_stats=runtime_stats, baseline=baseline
-    )
+    speed = speedups(correct=bool(label), ours=ours, baseline=baseline)
 
     if mode == BINARY:
         value = float(label)

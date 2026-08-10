@@ -27,8 +27,7 @@ def grade(speedup: float = 1.0, **over):
     kw = dict(
         compiled=True,
         correct=True,
-        runtime=1.0,
-        runtime_stats={"min": 1.0},
+        ours={MEAN: 1.0, MIN: 1.0},
         baseline={"mean": speedup, "min": speedup},
         mode=GRADED,
         stat=MEAN,
@@ -115,7 +114,7 @@ def test_binary_mode_needs_no_baseline_at_all():
 
 
 def test_speedup_stat_switches_which_ratio_is_graded():
-    kw = dict(baseline={"mean": 1.0, "min": 4.0}, runtime=1.0, runtime_stats={"min": 1.0})
+    kw = dict(baseline={"mean": 1.0, "min": 4.0}, ours={MEAN: 1.0, MIN: 1.0})
     assert grade(stat=MEAN, **kw).value == pytest.approx(0.75)
     assert grade(stat=MIN, **kw).value == pytest.approx(1.00)
 
@@ -186,9 +185,17 @@ def test_a_correct_kernel_whose_baseline_lacks_the_chosen_stat_is_dropped():
 
 
 def test_a_correct_kernel_with_no_runtime_for_the_chosen_stat_is_dropped():
-    assert grade(stat=MIN, runtime_stats={}) is None
-    assert grade(stat=MIN, runtime_stats=None) is None
-    assert grade(stat=MEAN, runtime=None) is None
+    assert grade(stat=MIN, ours={MEAN: 1.0}) is None
+    assert grade(stat=MIN, ours=None) is None
+    assert grade(stat=MEAN, ours={MIN: 1.0}) is None
+
+
+def test_each_stat_reads_its_own_key_on_both_sides():
+    # PRM-4: our side used to take the mean from a scalar `runtime` and the min from
+    # `runtime_stats["min"]`, so a caller holding both statistics under one roof lost the
+    # mean row to a counter that reads `no_baseline`. Both sides now carry the same keys.
+    assert grade(stat=MEAN, ours={MEAN: 1.0}).value == pytest.approx(0.75)
+    assert grade(stat=MIN, ours={MIN: 1.0}).value == pytest.approx(0.75)
 
 
 def test_a_wrong_kernel_survives_a_missing_baseline():
@@ -197,26 +204,29 @@ def test_a_wrong_kernel_survives_a_missing_baseline():
 
 
 INF = float("inf")
+TINY, HUGE = 5e-324, 1e300  # finite and positive, but TINY/HUGE is 0.0 and HUGE/TINY is inf
 
 
 @pytest.mark.parametrize(
-    ("base", "ours", "expected", "was"),
+    ("base", "kernel", "expected", "was"),
     [
         (1.0, INF, None, "crash: speed_p took log2 of 0.0 -> ValueError math domain error"),
         (INF, 1.0, None, "graded 1.00 -- garbage scored a perfect kernel"),
         (INF, INF, None, "graded 0.50 -- inf/inf is nan, and speed_p clamps nan to p=0"),
+        (TINY, HUGE, None, "crash: both sides finite, and the quotient still underflowed to 0.0"),
+        (HUGE, TINY, None, "graded 1.00 -- both sides finite, and the quotient still overflowed"),
         (2.0, 1.0, 0.90, "graded 0.90 -- an ordinary row, and it must not move"),
     ],
-    ids=["ratio_zero", "ratio_inf", "ratio_nan", "ordinary"],
+    ids=["ratio_zero", "ratio_inf", "ratio_nan", "underflow", "overflow", "ordinary"],
 )
-def test_a_ratio_that_is_not_an_ordinary_number_is_a_drop_not_a_grade(base, ours, expected, was):
-    # Every row here passes the `base > 0 and kernel > 0` guard on the *inputs*; only the
-    # quotient separates them, which is why the check has to be on the ratio itself.
+def test_a_ratio_that_is_not_an_ordinary_number_is_a_drop_not_a_grade(base, kernel, expected, was):
+    # Guarding the two inputs is not enough: finite over finite is not always finite, so the
+    # quotient is held to the same rule. Unreachable at millisecond runtimes, but the failure
+    # is a mid-build crash one way and a silent perfect score the other.
     t = target_for(
         compiled=True,
         correct=True,
-        runtime=ours,
-        runtime_stats={"min": ours},
+        ours={MEAN: kernel, MIN: kernel},
         baseline={"mean": base, "min": base},
         mode=GRADED,
         stat=MEAN,
@@ -234,13 +244,13 @@ def test_a_ratio_that_is_not_an_ordinary_number_is_a_drop_not_a_grade(base, ours
 
 
 def test_both_speedups_are_reported_for_a_correct_kernel():
-    t = grade(baseline={"mean": 2.0, "min": 8.0}, runtime=1.0, runtime_stats={"min": 2.0})
+    t = grade(baseline={"mean": 2.0, "min": 8.0}, ours={MEAN: 1.0, MIN: 2.0})
     assert (t.speedup, t.speedup_min) == (2.0, 4.0)
     assert t.label == 1
 
 
 def test_a_wrong_kernel_reports_no_speedup_even_with_a_runtime():
-    t = grade(correct=False, runtime=1.0)
+    t = grade(correct=False, ours={MEAN: 1.0, MIN: 1.0})
     assert (t.speedup, t.speedup_min, t.label) == (None, None, 0)
 
 
@@ -248,11 +258,10 @@ def test_a_kernel_that_did_not_compile_is_labelled_zero():
     assert grade(compiled=False, correct=False).label == 0
 
 
-def ratio(correct=True, runtime=1.0, runtime_stats=None, baseline=None):
+def ratio(correct=True, ours=None, baseline=None):
     return speedups(
         correct=correct,
-        runtime=runtime,
-        runtime_stats={"min": 1.0} if runtime_stats is None else runtime_stats,
+        ours={MEAN: 1.0, MIN: 1.0} if ours is None else ours,
         baseline={"mean": 1.0, "min": 1.0} if baseline is None else baseline,
     )
 
@@ -262,7 +271,9 @@ NEITHER = {MEAN: None, MIN: None}
 
 @pytest.mark.parametrize("bad", [0.0, -1.0])
 def test_a_non_positive_runtime_or_baseline_yields_no_speedup(bad):
-    assert ratio(runtime=bad, runtime_stats={"min": bad}) == NEITHER
+    # -1.0 is the harness's "never timed" sentinel and reaches the grader on 2 correct
+    # kernels; without this guard `baseline / -1.0` is negative and speed_p raises on log2.
+    assert ratio(ours={MEAN: bad, MIN: bad}) == NEITHER
     assert ratio(baseline={"mean": bad, "min": bad}) == NEITHER
 
 
@@ -271,12 +282,21 @@ def test_speedups_of_a_wrong_kernel_are_none_whatever_the_runtimes():
 
 
 def test_neither_stat_survives_an_ungradeable_ratio():
-    assert ratio(runtime=INF, runtime_stats={"min": INF}) == NEITHER  # 1.0 / inf -> 0.0
+    assert ratio(ours={MEAN: INF, MIN: INF}) == NEITHER  # 1.0 / inf -> 0.0
     assert ratio(baseline={"mean": INF, "min": INF}) == NEITHER  # inf / 1.0 -> inf
+    # Both sides pass _usable here; only the quotient is out of range.
+    assert ratio(ours={MEAN: HUGE, MIN: HUGE}, baseline={"mean": TINY, "min": TINY}) == NEITHER
+    assert ratio(ours={MEAN: TINY, MIN: TINY}, baseline={"mean": HUGE, "min": HUGE}) == NEITHER
+
+
+def test_a_missing_side_is_no_speedup_rather_than_a_crash():
+    assert ratio(ours={}) == NEITHER
+    assert ratio(baseline={}) == NEITHER
+    assert speedups(correct=True, ours=None, baseline=None) == NEITHER
 
 
 def test_integer_runtimes_from_json_still_divide_as_floats():
-    assert ratio(runtime=2, runtime_stats={"min": 2}, baseline={"mean": 1, "min": 3}) == {
+    assert ratio(ours={MEAN: 2, MIN: 2}, baseline={"mean": 1, "min": 3}) == {
         MEAN: 0.5,
         MIN: 1.5,
     }
