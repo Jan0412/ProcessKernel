@@ -27,7 +27,10 @@ prm:
   min_frac: 0.0
 
   tokenizer: Qwen/Qwen3-Reranker-4B
-  max_length: 16384
+  # The build cap, not the trainer's: it decides which attempts exist at all, so lowering it
+  # later is a filter over stored rows while raising it is a full rebuild. 32768 is inside
+  # both rerankers' native 40960 range; 16384 would drop 0.16%, all gpt-oss rounds 1-2.
+  max_length: 32768
 
   # Joint over both runs: every DeepSeek problem id also appears in gpt-oss.
   split_ratios: [0.7, 0.15, 0.15]

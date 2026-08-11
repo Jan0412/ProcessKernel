@@ -19,7 +19,7 @@ prm:
   min_frac: 0.0
 
   tokenizer: Qwen/Qwen3-Reranker-4B
-  max_length: 16384
+  max_length: 32768
 
   split_ratios: [0.7, 0.15, 0.15]
   split_seed: 42

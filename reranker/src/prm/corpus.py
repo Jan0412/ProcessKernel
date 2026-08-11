@@ -100,12 +100,12 @@ def units(
                 attempts = os.path.join(
                     run_dir, shard, "traces", f"round_{rnd}", "attempts.jsonl"
                 )
-                verdicts = os.path.join(
+                eval_file = os.path.join(
                     run_dir, shard, "rounds", f"round_{rnd}", "eval_results.json"
                 )
                 if not os.path.isfile(attempts):
                     skipped.append((run_name, shard, rnd, NO_ATTEMPTS))
-                elif not os.path.isfile(verdicts):
+                elif not os.path.isfile(eval_file):
                     skipped.append((run_name, shard, rnd, NO_EVAL))
                 else:
                     found.append(
@@ -115,7 +115,7 @@ def units(
                             shard=shard,
                             round=rnd,
                             attempts_path=attempts,
-                            eval_path=verdicts,
+                            eval_path=eval_file,
                         )
                     )
     return found, skipped
@@ -123,13 +123,13 @@ def units(
 
 def iter_labeled(unit: Unit, counts: Counter) -> Iterator[Labeled]:
     """One ``Labeled`` per attempt that has a verdict; the rest counted into ``counts``."""
-    verdicts = _verdicts(unit.eval_path)
+    joined = verdicts(unit.eval_path)
     with open(unit.attempts_path) as f:
         for lineno, line in enumerate(f, 1):
             if not line.strip():
                 continue
             rec = _loads(line, unit.attempts_path, lineno)
-            row = _row(unit, rec, verdicts, lineno)
+            row = _row(unit, rec, joined, lineno)
             if row is None:
                 # An unfinished eval rewrites a complete file with fewer entries, not a
                 # broken one, so it lands here rather than in a parse error. Counted out
@@ -140,12 +140,12 @@ def iter_labeled(unit: Unit, counts: Counter) -> Iterator[Labeled]:
 
 
 def _row(
-    unit: Unit, rec: dict, verdicts: dict[tuple[int, int], dict], lineno: int
+    unit: Unit, rec: dict, joined: dict[tuple[int, int], dict], lineno: int
 ) -> Labeled | None:
     """One row, or ``None`` for an attempt with no verdict; every field read named by line."""
     try:
         key = (int(rec["problem_id"]), int(rec["sample_id"]))
-        verdict = verdicts.get(key)
+        verdict = joined.get(key)
         if verdict is None:
             return None
         stats = verdict.get("runtime_stats") or {}
@@ -168,7 +168,7 @@ def _row(
         raise ValueError(f"{unit.attempts_path}:{lineno}: {e} -- {_CORRUPT}") from e
 
 
-def _verdicts(path: str) -> dict[tuple[int, int], dict]:
+def verdicts(path: str) -> dict[tuple[int, int], dict]:
     """``eval_results.json`` as ``{(problem_id, sample_id): entry}`` -- the join key."""
     raw = _load_json(path)
     out: dict[tuple[int, int], dict] = {}

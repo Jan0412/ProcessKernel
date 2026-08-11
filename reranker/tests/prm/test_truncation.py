@@ -22,8 +22,9 @@ from reranker.tests.prm.runfixture import (
     verdict,
 )
 
-# gpt-oss: the two-pass sampler injects the opening fence and the model runs to EOS, so 99%
-# of that run ends mid-fence with nothing wrong. 7,514 of them are correct kernels.
+# A completion ending mid-fence with nothing wrong. Measured 2026-08-11 it is rare (0.11% of
+# DeepSeek, 0.08% of gpt-oss); the plan's 99%-of-gpt-oss is a pre-v5 figure that does not
+# reproduce. Guarded regardless: the fence is a formatting property, not a finish reason.
 UNTERMINATED = "## Plan\nfuse the reduction\n\n```python\nimport triton\nx = 1\n"
 TERMINATED = UNTERMINATED + "```\n"
 
@@ -128,9 +129,9 @@ def test_the_verdict_is_the_same_whatever_the_text_does_with_its_fence(tmp_path,
 
 
 def test_an_unterminated_fence_that_finished_on_its_own_is_kept(tmp_path):
-    # The regression guard. This shape is 99% of gpt-oss; a future "detect truncation from
-    # the fence" refactor flags 38,612 attempts and destroys 7,575 correct kernels, and it
-    # must fail here rather than in production.
+    # The regression guard: a future "detect truncation from the fence" refactor must fail
+    # here rather than in production. Kept even though the shape turned out rare in v5 --
+    # the two properties are independent, so frequency is not what makes the confusion wrong.
     unit = one_unit(tmp_path, [attempt(1, 0, raw=UNTERMINATED)], {"1": [verdict(0)]})
     rows = list(iter_labeled(unit, Counter()))
     assert [(r.truncation, r.correct) for r in rows] == [(OK, True)]
