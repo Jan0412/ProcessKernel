@@ -48,10 +48,18 @@ export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 # Off, not merely unset: each of the 32 forked workers builds a tokenizer, and HF's Rust
 # parallelism deadlocks across fork unless it is disabled before the first one is made.
 export TOKENIZERS_PARALLELISM=false
-# The home cache, like train_listwise_slurm.sh -- the Qwen3-Reranker checkpoints are only
-# there, not in the scratch cache holding the generation models.
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+# The scratch cache: the Qwen3-Reranker checkpoints are only there, not in the other scratch
+# cache (/path/to/hf), which holds the generation models alone.
+export HF_HOME="${HF_HOME:-/path/to/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+# Offline plus a wrong cache surfaces inside every one of the 32 workers as
+# LocalEntryNotFoundError wrapped in an OSError about internet connectivity -- it reads like
+# a network fault rather than a bad path, and it killed six listwise jobs on 2026-08-12.
+# Testing for the `hub` directory is not enough, which is why this looks past it: the old
+# default $HOME/.cache/huggingface was recreated empty after the cache moved to scratch and
+# holds hub/version.txt and nothing else, so a directory test passes and the lookup still fails.
+ls -d "$HF_HOME"/hub/models--* >/dev/null 2>&1 || {
+    echo "[FATAL] no models under $HF_HOME/hub (cache moved?)" >&2; exit 1; }
 
 # .venv, not .venv-cu129: the tests and the smoke build ran here. A different transformers
 # pins a different tokenizer, which would move n_raw_tokens and so which rows hit max_length.
