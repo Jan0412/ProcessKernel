@@ -27,6 +27,10 @@ PARTS, MANIFEST, META = "parts", "manifest.json", ".meta"
 PROMPTS = "system_prompts.json"
 # Named, because stats.py gates on its absence to tell a pre-§8 part from a corrupt one.
 ROW_SHA1 = "system_prompt_sha1"
+# What _row writes, versioned and compared on resume the way baseline_sha1 is. Bump it with
+# any change to the row schema and parts from either side of the bump refuse to share an
+# out_dir -- without anyone having to hand-write a probe for whichever field is new.
+SCHEMA_VERSION = 1
 
 TRUNCATED = "truncated"
 NO_FINISH_REASON = "no_finish_reason"
@@ -65,9 +69,10 @@ class Built:
     """What one worker hands back: its part, and the record published beside it."""
 
     part: str
-    # {"counts", "dropped", "system_prompts"} -- `dropped` maps a reason to its stems, so a
-    # retokenize can redo just those attempts (§7); `system_prompts` is sha1 -> text for the
-    # rows in this part, and _side_table subscripts it. Also written to the part's `.meta`.
+    # {"schema_version", "counts", "dropped", "system_prompts"} -- `dropped` maps a reason to
+    # its stems, so a retokenize can redo just those attempts (§7); `system_prompts` is
+    # sha1 -> text for the rows in this part, and _side_table subscripts it; the version is
+    # what _check_schema compares. Also written to the part's `.meta`, from this dict.
     record: dict
 
 
@@ -119,7 +124,12 @@ def build_unit(
     fired = {r: s for r, s in dropped.items() if s}
     counts[ROWS] = len(offsets)
     counts.update({r: len(s) for r, s in fired.items()})
-    record = {"counts": dict(counts), "dropped": fired, "system_prompts": prompts}
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "counts": dict(counts),
+        "dropped": fired,
+        "system_prompts": prompts,
+    }
 
     write_atomic(path + ".idx", "".join(f"{o}\n" for o in offsets))
     # Beside the part, not gathered in the parent: a build killed at its walltime has
@@ -312,6 +322,7 @@ def _manifest(prm, baseline, baseline_sha1, units, skipped, built) -> dict:
     dirty = _git("status", "--porcelain")
     return {
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "schema_version": SCHEMA_VERSION,
         "git_sha": _git("rev-parse", "HEAD"),
         "git_dirty": None if dirty is None else bool(dirty),
         "config": dataclasses.asdict(prm),
@@ -329,15 +340,21 @@ def _manifest(prm, baseline, baseline_sha1, units, skipped, built) -> dict:
 
 
 def _check_schema(units: dict[str, dict], out_dir: str) -> None:
-    """_check_resume compares knobs, and the row schema is not one; this is what sees it."""
+    """_check_resume compares knobs, and the row schema is not one; this is what sees it.
+
+    A version, not a probe for whichever field is newest: a probe only ever sees the one
+    change it was written for, so the part built between that change and the next passes
+    it, gets merged, and the out_dir holds two row schemas with nothing left to notice.
+    """
     # Off the parts' own .meta, not the manifest, so a part that landed after the last
     # stamp is checked too -- and before the pool, so nothing new is written first.
-    stale = [n for n in sorted(units) if "system_prompts" not in units[n]]
+    stale = [n for n in sorted(units) if units[n].get("schema_version") != SCHEMA_VERSION]
     if stale:
         raise ValueError(
-            f"{out_dir} holds {len(stale)} parts from before the system prompt was recorded "
-            f"({stale[0]} is one): their rows have no system_prompt_sha1 and no table can "
-            "give them one -- build into a new out_dir, or delete this one"
+            f"{out_dir} holds {len(stale)} parts written at row schema "
+            f"{units[stale[0]].get('schema_version')} rather than {SCHEMA_VERSION} "
+            f"({stale[0]} is one): their rows do not carry what this build writes -- "
+            "build into a new out_dir, or delete this one"
         )
 
 

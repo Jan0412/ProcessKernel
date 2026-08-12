@@ -387,16 +387,40 @@ def test_resuming_after_the_baseline_file_was_remeasured_refuses(tmp_path, chars
 def test_resuming_a_dataset_built_before_the_system_prompt_was_recorded_refuses(tmp_path, chars):
     # The resume guard compares config knobs, and the row schema is not one of them, so
     # this is the only thing standing between a v1 dataset built before PLAN_v2 §8 and one
-    # out_dir holding rows with a system_prompt_sha1 beside rows without.
+    # out_dir holding rows with a system_prompt_sha1 beside rows without. A part from then
+    # carries neither the field nor a version, which is exactly what the guard reads.
     cfg = prm_config(tmp_path, [a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})])
     build.run_build(cfg)
     meta = os.path.join(cfg.prm.out_dir, build.PARTS, "runA__shard_00__round0.jsonl" + build.META)
     record = read_json(meta)
-    del record["system_prompts"]
+    del record["system_prompts"], record["schema_version"]
     with open(meta, "w") as f:
         json.dump(record, f)
-    with pytest.raises(ValueError, match="system prompt"):
+    with pytest.raises(ValueError, match="row schema"):
         build.run_build(cfg)
+
+
+def test_resuming_a_dataset_whose_parts_carry_another_row_schema_refuses(tmp_path, chars):
+    # A probe for one named field can only ever see the change it was written for: the part
+    # built between that change and the next one passes it, gets merged, and the out_dir
+    # holds two row schemas with nothing left to notice. Comparing a version is what makes
+    # the *next* change refuse itself, the way _NOT_ROW_KNOBS makes the next knob do.
+    cfg = prm_config(tmp_path, [a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})])
+    build.run_build(cfg)
+    meta = os.path.join(cfg.prm.out_dir, build.PARTS, "runA__shard_00__round0.jsonl" + build.META)
+    record = read_json(meta)
+    record["schema_version"] = build.SCHEMA_VERSION + 1
+    with open(meta, "w") as f:
+        json.dump(record, f)
+    with pytest.raises(ValueError, match="row schema"):
+        build.run_build(cfg)
+
+
+def test_the_manifest_records_the_row_schema_its_parts_were_written_at(tmp_path, chars):
+    # Self-describing, so a reader of the dataset never has to infer the schema from which
+    # fields happen to be on a row.
+    manifest, _ = built(tmp_path, [attempt(raw=PROSE)], {"0": [verdict()]})
+    assert manifest["schema_version"] == build.SCHEMA_VERSION
 
 
 def test_resuming_with_no_manifest_to_compare_against_refuses(tmp_path, chars):
