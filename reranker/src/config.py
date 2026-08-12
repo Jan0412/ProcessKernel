@@ -290,8 +290,10 @@ class PRMRolloutConfig:
     """
 
     # --- inputs ---------------------------------------------------------------------
-    parts_glob: str = "data/prm/parts/*.jsonl"
-    splits_json: str = "data/prm/splits.json"
+    # prm_v2, not prm: the older build predates §8 and its rows carry no system_prompt_sha1,
+    # so job A reads it happily and job B has nothing to resolve a prompt from.
+    parts_glob: str = "data/prm_v2/parts/*.jsonl"
+    splits_json: str = "data/prm_v2/splits.json"
     baseline_timing_json: str = BASELINE_TIMING_JSON
     # {run_name: short tag}. Also the run *filter*: one parts dir holds every run v1 built,
     # and a campaign takes one of them. The tag is in `list_key`, so two runs sharing one

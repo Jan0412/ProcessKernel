@@ -32,6 +32,19 @@ def written_keys(name: str) -> set[str]:
         return set(yaml.safe_load(f)["prm_rollout"])
 
 
+def test_the_default_corpus_is_one_job_b_can_actually_read():
+    # data/prm predates PLAN_v2 §8: its rows carry no system_prompt_sha1 and there is no
+    # system_prompts.json beside them. Job A reads neither and succeeds; job B needs both and
+    # dies a job later. The two knobs also have to name ONE build -- prefixes.py raises when
+    # a problem has no split, and mismatched defaults are exactly how that happens.
+    default = PRMRolloutConfig()
+    assert default.parts_glob == "data/prm_v2/parts/*.jsonl"
+    assert default.splits_json == "data/prm_v2/splits.json"
+    assert os.path.dirname(os.path.dirname(default.parts_glob)) == os.path.dirname(
+        default.splits_json
+    )
+
+
 def test_the_section_hangs_off_the_root_config_and_the_defaults_validate():
     assert isinstance(RerankerConfig().prm_rollout, PRMRolloutConfig)
     rollout().validate()
