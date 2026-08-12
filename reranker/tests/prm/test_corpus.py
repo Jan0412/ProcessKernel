@@ -242,6 +242,14 @@ def test_the_prompt_and_completion_are_copied_verbatim(tmp_path):
     assert (rows[0].prompt, rows[0].raw) == ("P!", raw)
 
 
+def test_the_system_prompt_is_carried_too(tmp_path):
+    # `prompt` is only the user turn. v2 regenerates from a prefix through
+    # backend.render_chat(system, user), so the other half has to survive the join.
+    unit = one_unit(tmp_path, [attempt(1, 0, system_prompt="SYS!")], {"1": [verdict(0)]})
+    rows, _ = labeled(unit)
+    assert rows[0].system_prompt == "SYS!"
+
+
 # --- the live-corpus rule: half-written JSON is corruption, not a skip (PLAN §13) -----
 
 
@@ -295,7 +303,9 @@ def test_a_malformed_eval_entry_names_the_file_rather_than_raising_a_bare_python
     assert "eval_results.json" in str(caught.value)
 
 
-@pytest.mark.parametrize("name", ["problem_id", "sample_id", "stem", "level", "prompt", "raw"])
+@pytest.mark.parametrize(
+    "name", ["problem_id", "sample_id", "stem", "level", "system_prompt", "prompt", "raw"]
+)
 def test_an_attempt_record_missing_a_field_names_the_file_and_line(tmp_path, name):
     # The attempts side owes the same attribution as the eval side: a bare KeyError out of
     # a pool worker names neither the file nor the record it came from.

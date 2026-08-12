@@ -23,8 +23,10 @@ from reranker.src.prm.build import (
     CUTS,
     MANIFEST,
     PARTS,
+    PROMPTS,
     REASONS,
     ROW_KNOBS,
+    ROW_SHA1,
     ROWS,
     part_name,
     write_atomic,
@@ -68,6 +70,7 @@ class Scan:
     problems: set = field(default_factory=set)
     siblings: dict = field(default_factory=lambda: defaultdict(list))
     off_scale: list = field(default_factory=list)
+    prompt_shas: set = field(default_factory=set)
 
 
 def scan_parts(parts_dir: str) -> Scan:
@@ -78,7 +81,18 @@ def scan_parts(parts_dir: str) -> Scan:
     for part in parts:
         with open(part) as f:
             for line in f:
-                _tally(json.loads(line), scan)
+                row = json.loads(line)
+                # Named here, where the part is: _tally holds only the row, so the bare
+                # KeyError out of it attributes nothing -- the one thing corpus.py makes a
+                # rule of. build.py refuses this dataset too (_check_schema), but stats is
+                # also run standalone against an out_dir, and then this is the only gate.
+                if ROW_SHA1 not in row:
+                    raise ValueError(
+                        f"{part} holds rows from before the system prompt was recorded: no "
+                        f"{ROW_SHA1}, and no table can give them one -- build into a new "
+                        "out_dir, or delete this one"
+                    )
+                _tally(row, scan)
     return scan
 
 
@@ -101,6 +115,7 @@ def _tally(row: dict, s: Scan) -> None:
         group["correct"] += correct
         group["unterminated"] += open_fence
     s.problems.add((row["level"], row["problem_id"]))
+    s.prompt_shas.add(row[ROW_SHA1])
     # Siblings differ only in sample_id, and one shard holds every sample of its problems.
     s.siblings[(row["run_name"], row["level"], row["problem_id"], row["round"])].append(
         row["raw"][:SIBLING_CAP]
@@ -226,6 +241,9 @@ def report(cfg: RerankerConfig) -> dict:
     keys = sorted(f"{lvl}:{pid}" for lvl, pid in scan.problems)
     missing = [k for k in keys if k not in splits]
 
+    table = _read_json(os.path.join(out_dir, PROMPTS), default={})
+    unresolved = sorted(scan.prompt_shas - set(table))
+
     out = {
         "out_dir": out_dir,
         "created": manifest.get("created"),
@@ -280,6 +298,11 @@ def report(cfg: RerankerConfig) -> dict:
             },
         },
         "siblings": sibling_prefixes(scan.siblings),
+        "system_prompts": {
+            "table": len(table),
+            "on_rows": len(scan.prompt_shas),
+            "unresolved": len(unresolved),
+        },
         "splits": {
             "problems": len(scan.problems),
             "assigned": dict(Counter(splits.values())) if splits else {},
@@ -352,6 +375,14 @@ def report(cfg: RerankerConfig) -> dict:
         f"{unjoined} attempts have no eval entry"
         + (" -- evaluation was still in flight; this build is incomplete" if unjoined else ""),
     )
+    # Every other counter reconciles without the table, so nothing else here would notice a
+    # dataset whose rows cannot be turned back into a conversation (PLAN_v2 §8).
+    check(
+        "every system prompt resolves",
+        not unresolved,
+        f"{len(unresolved)} of {len(scan.prompt_shas)} shas absent from {PROMPTS}"
+        + (f", e.g. {unresolved[0][:12]}" if unresolved else ""),
+    )
     check(
         "every problem has a split",
         bool(splits) and not missing,
@@ -420,6 +451,12 @@ def render(out: dict) -> str:
             f"   >{SIBLING_OVER}: {s['over_200']} ({s['over_200_pct']:.2f}%)"
         )
     lines.append(f"splits   {sp['problems']:,} problems   {sp['assigned']}")
+
+    sysp = out["system_prompts"]
+    lines.append(
+        f"system prompts   {sysp['table']} in table   {sysp['on_rows']} on rows"
+        f"   {sysp['unresolved']} unresolved"
+    )
 
     lines += ["", "checks", "-" * 72]
     for ck in out["checks"]:

@@ -28,6 +28,7 @@ def attempt(problem_id=0, sample_id=0, *, level=6, rnd=0, raw="x = 1\n", trace=S
         "problem_id": problem_id,
         "sample_id": sample_id,
         "round": rnd,
+        "system_prompt": "SYSTEM",
         "prompt": "PROMPT",
         "raw": raw,
         "trace": trace,

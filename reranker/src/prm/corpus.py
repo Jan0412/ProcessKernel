@@ -44,6 +44,8 @@ class Labeled:
     level: int
     problem_id: int
     sample_id: int
+    # The conversation in order: v2 rebuilds the exchange as render_chat(system, prompt) + raw.
+    system_prompt: str
     prompt: str
     raw: str
     compiled: bool
@@ -156,6 +158,7 @@ def _row(
             level=int(rec["level"]),
             problem_id=key[0],
             sample_id=key[1],
+            system_prompt=rec["system_prompt"],
             prompt=rec["prompt"],
             raw=rec["raw"],
             compiled=bool(verdict.get("compiled", False)),

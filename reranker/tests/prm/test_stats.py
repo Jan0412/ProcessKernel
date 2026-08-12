@@ -320,6 +320,77 @@ def test_rows_disagreeing_with_the_manifest_are_caught(tmp_path, monkeypatch):
     assert failed(out) >= {"rows on disk match the manifest", "cuts on disk match the manifest"}
 
 
+def test_a_dataset_whose_system_prompt_table_is_missing_is_caught(tmp_path, monkeypatch):
+    # PLAN_v2 §8 makes the sha1 on a row the only route back to the system half of the
+    # conversation. Without the table every other counter still reconciles, so this is the
+    # one gate standing between a build with no table and job A.
+    cfg = build_parts(tmp_path, monkeypatch, {"runA": [wrong(0), wrong(1)]})
+    os.remove(os.path.join(cfg.prm.out_dir, build.PROMPTS))
+    out = run_report(cfg)
+    assert "every system prompt resolves" in failed(out)
+    assert out["system_prompts"] == {"table": 0, "on_rows": 1, "unresolved": 1}
+
+
+def test_a_system_prompt_table_missing_one_of_the_shas_on_disk_is_caught(tmp_path, monkeypatch):
+    # A table that resolves *something* is not enough: two source runs need not have been
+    # prompted alike, and a build that merged a stale table would resolve only one of them.
+    cfg = build_parts(
+        tmp_path,
+        monkeypatch,
+        {"runA": [wrong(0)], "runB": [(attempt(problem_id=1, raw=PROSE, system_prompt="OTHER"),
+                                       verdict(correctness=False))]},
+    )
+    table = os.path.join(cfg.prm.out_dir, build.PROMPTS)
+    with open(table) as f:
+        kept = json.load(f)
+    del kept[build._text_sha1("OTHER")]
+    with open(table, "w") as f:
+        json.dump(kept, f)
+    out = run_report(cfg)
+    assert "every system prompt resolves" in failed(out)
+    assert out["system_prompts"] == {"table": 1, "on_rows": 2, "unresolved": 1}
+
+
+def test_a_dataset_whose_every_sha_resolves_passes_the_gate(tmp_path, monkeypatch):
+    cfg = build_parts(tmp_path, monkeypatch, {"runA": [wrong(0), right(1)]})
+    out = run_report(cfg)
+    assert "every system prompt resolves" not in failed(out)
+    assert out["system_prompts"] == {"table": 1, "on_rows": 1, "unresolved": 0}
+
+
+def test_a_part_from_before_the_system_prompt_was_recorded_names_itself(tmp_path, monkeypatch):
+    # build.py refuses this dataset by name (_check_schema), but stats.py is run standalone
+    # against an out_dir and would otherwise die inside _tally on a bare KeyError naming
+    # neither the field nor the part -- the one attribution corpus.py makes a rule of.
+    cfg = build_parts(tmp_path, monkeypatch, {"runA": [wrong(0), wrong(1)]})
+    part = _first_part(cfg)
+    rows = [json.loads(line) for line in part.read_text().splitlines()]
+    for row in rows:
+        del row["system_prompt_sha1"]
+    part.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    with pytest.raises(ValueError) as caught:
+        stats.report(cfg)
+    assert part.name in str(caught.value)
+    assert "system_prompt_sha1" in str(caught.value)
+
+
+def test_the_rendered_report_carries_the_system_prompt_counts(tmp_path, monkeypatch):
+    # Every other measured block has a rendered line. Without one the operator sees the
+    # PASS/FAIL verdict but none of the counts behind it, and has to open stats.json.
+    cfg = build_parts(
+        tmp_path,
+        monkeypatch,
+        {"runA": [wrong(0)], "runB": [(attempt(problem_id=1, raw=PROSE, system_prompt="OTHER"),
+                                       verdict(correctness=False))]},
+    )
+    out = run_report(cfg)
+    assert out["system_prompts"] == {"table": 2, "on_rows": 2, "unresolved": 0}
+
+    line = next(ln for ln in stats.render(out).splitlines() if ln.startswith("system prompts"))
+    assert "2 in table" in line and "2 on rows" in line and "0 unresolved" in line
+
+
 def test_a_config_whose_row_knobs_moved_since_the_build_is_caught(tmp_path, monkeypatch):
     cfg = build_parts(tmp_path, monkeypatch, {"runA": [wrong(0)]})
     splits.build_splits(cfg)

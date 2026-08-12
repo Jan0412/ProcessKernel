@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import subprocess
@@ -74,6 +75,15 @@ def rows_of(parts_dir, name):
         return [json.loads(line) for line in f]
 
 
+def side_table(parts_dir):
+    return read_json(os.path.join(os.path.dirname(parts_dir), build.PROMPTS))
+
+
+def sha1_of(text):
+    """Spelled out here rather than borrowed from build.py, so the digest is checked too."""
+    return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 # --- the row -------------------------------------------------------------------------
 
 
@@ -113,6 +123,67 @@ def test_a_wrong_kernel_grades_zero_without_needing_a_baseline(tmp_path, chars):
     )
     (row,) = rows_of(parts, "runA__shard_00__round0.jsonl")
     assert (row["target"], row["label"], row["speedup"]) == (0.0, 0, None)
+
+
+# --- the system prompt side table (PLAN_v2 §8) ----------------------------------------
+
+
+def test_a_row_names_its_system_prompt_by_sha1_and_the_side_table_resolves_it(tmp_path, chars):
+    # v2 regenerates from a prefix through render_chat(system, prompt), so the system half
+    # has to be in the dataset. A side table rather than a per-row copy: the string is
+    # near-constant across a run, and inlining it would add ~150 MB to a 1.5 GB dataset.
+    _, parts = built(tmp_path, [attempt(raw=PROSE)], {"0": [verdict()]})
+    (row,) = rows_of(parts, "runA__shard_00__round0.jsonl")
+    assert row["system_prompt_sha1"] == sha1_of("SYSTEM")
+    assert side_table(parts) == {sha1_of("SYSTEM"): "SYSTEM"}
+
+
+def test_two_system_prompts_in_one_corpus_each_keep_their_own_entry(tmp_path, chars):
+    # The dataset joins two source runs, which were not necessarily prompted alike. One
+    # "the" system prompt would hand v2 the wrong half of one run's conversation.
+    runs = [
+        a_run(tmp_path, "runA", [attempt(raw=PROSE, system_prompt="ALPHA")], {"0": [verdict()]}),
+        a_run(tmp_path, "runB", [attempt(raw=PROSE, system_prompt="BETA")], {"0": [verdict()]}),
+    ]
+    cfg = prm_config(tmp_path, runs)
+    build.run_build(cfg)
+    parts = os.path.join(cfg.prm.out_dir, build.PARTS)
+    table = side_table(parts)
+    assert table == {sha1_of("ALPHA"): "ALPHA", sha1_of("BETA"): "BETA"}
+    rows = [rows_of(parts, f"run{c}__shard_00__round0.jsonl")[0] for c in "AB"]
+    assert [table[r["system_prompt_sha1"]] for r in rows] == ["ALPHA", "BETA"]
+
+
+def test_the_side_table_is_rebuilt_from_the_parts_rather_than_from_this_run(tmp_path, chars):
+    # Same rule as the counters: a build killed at its walltime has published parts and
+    # never reached the parent's write, so a resume that rebuilds nothing must still
+    # produce the full table -- not just the entries this invocation happened to see.
+    cfg = prm_config(tmp_path, [a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})])
+    build.run_build(cfg)
+    os.remove(os.path.join(cfg.prm.out_dir, build.PROMPTS))
+    manifest = read_json(build.run_build(cfg))
+    assert manifest["units_built"] == 0
+    assert side_table(os.path.join(cfg.prm.out_dir, build.PARTS)) == {sha1_of("SYSTEM"): "SYSTEM"}
+
+
+def test_a_lone_surrogate_in_the_system_prompt_is_hashed_rather_than_fatal(tmp_path, chars):
+    # The same failure the completion's surrogate guards against: a plain .encode() raises
+    # inside a worker and takes the whole pool with it, over a string nothing rejected.
+    sysp = "you write kernels \ud800\n"
+    _, parts = built(tmp_path, [attempt(raw=PROSE, system_prompt=sysp)], {"0": [verdict()]})
+    (row,) = rows_of(parts, "runA__shard_00__round0.jsonl")
+    assert side_table(parts) == {row["system_prompt_sha1"]: sysp}
+
+
+def test_a_dropped_attempt_leaves_no_entry_behind_in_the_side_table(tmp_path, chars):
+    # The table exists to resolve the shas the parts hold; an entry no row names is dead
+    # weight that also makes "every sha resolves" pass for the wrong reason.
+    attempts = [
+        attempt(problem_id=1, raw=PROSE, trace=LENGTH, system_prompt="DROPPED"),
+        attempt(problem_id=2, raw=PROSE),
+    ]
+    _, parts = built(tmp_path, attempts, {"1": [verdict()], "2": [verdict(correctness=False)]})
+    assert side_table(parts) == {sha1_of("SYSTEM"): "SYSTEM"}
 
 
 # --- part names and the pool ----------------------------------------------------------
@@ -291,6 +362,18 @@ def test_resuming_with_a_knob_that_changes_a_row_refuses(tmp_path, chars, over, 
         build.run_build(prm_config(tmp_path, [run], **over))
 
 
+def test_an_out_dir_holding_parts_is_checked_even_when_every_unit_is_new(tmp_path, chars):
+    # The guard ran only when a part was actually reused, so replacing run_dirs wholesale
+    # walked straight past it: every found unit is new, nothing is "reused", and the old
+    # parts are still swept into the manifest, the counters and the side table under knobs
+    # they were not built with. What is on disk decides, not what this invocation skipped.
+    one = a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})
+    build.run_build(prm_config(tmp_path, [one]))
+    two = a_run(tmp_path, "runB", [attempt(raw=PROSE)], {"0": [verdict()]})
+    with pytest.raises(ValueError, match="label_mode"):
+        build.run_build(prm_config(tmp_path, [two], label_mode="binary"))
+
+
 def test_resuming_after_the_baseline_file_was_remeasured_refuses(tmp_path, chars):
     run = a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})
     build.run_build(prm_config(tmp_path, [run]))
@@ -298,6 +381,21 @@ def test_resuming_after_the_baseline_file_was_remeasured_refuses(tmp_path, chars
     # Same path, different numbers -- every target moves, and only the sha1 sees it.
     baseline_json(tmp_path, problems=((0, 9.0, 9.0),))
     with pytest.raises(ValueError, match="baseline_sha1"):
+        build.run_build(cfg)
+
+
+def test_resuming_a_dataset_built_before_the_system_prompt_was_recorded_refuses(tmp_path, chars):
+    # The resume guard compares config knobs, and the row schema is not one of them, so
+    # this is the only thing standing between a v1 dataset built before PLAN_v2 §8 and one
+    # out_dir holding rows with a system_prompt_sha1 beside rows without.
+    cfg = prm_config(tmp_path, [a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})])
+    build.run_build(cfg)
+    meta = os.path.join(cfg.prm.out_dir, build.PARTS, "runA__shard_00__round0.jsonl" + build.META)
+    record = read_json(meta)
+    del record["system_prompts"]
+    with open(meta, "w") as f:
+        json.dump(record, f)
+    with pytest.raises(ValueError, match="system prompt"):
         build.run_build(cfg)
 
 

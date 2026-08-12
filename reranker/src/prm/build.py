@@ -23,6 +23,10 @@ from reranker.src.prm import corpus, targets
 from reranker.src.prm.chunks import cut_points
 
 PARTS, MANIFEST, META = "parts", "manifest.json", ".meta"
+# sha1 -> system prompt, for the shas the rows carry instead of the text (PLAN_v2 §8).
+PROMPTS = "system_prompts.json"
+# Named, because stats.py gates on its absence to tell a pre-§8 part from a corrupt one.
+ROW_SHA1 = "system_prompt_sha1"
 
 TRUNCATED = "truncated"
 NO_FINISH_REASON = "no_finish_reason"
@@ -61,8 +65,9 @@ class Built:
     """What one worker hands back: its part, and the record published beside it."""
 
     part: str
-    # {"counts", "dropped"} -- `dropped` maps a reason to its stems, so a retokenize can
-    # redo just those attempts (§7). Also written to the part's `.meta`, from this dict.
+    # {"counts", "dropped", "system_prompts"} -- `dropped` maps a reason to its stems, so a
+    # retokenize can redo just those attempts (§7); `system_prompts` is sha1 -> text for the
+    # rows in this part, and _side_table subscripts it. Also written to the part's `.meta`.
     record: dict
 
 
@@ -89,6 +94,7 @@ def build_unit(
 ) -> Built:
     """Write one unit's part, ``.idx`` and ``.meta``, counting every attempt that did not make it."""
     dropped: dict[str, list[str]] = {r: [] for r in REASONS}
+    prompts: dict[str, str] = {}
     counts = Counter()
     path = os.path.join(parts_dir, part_name(unit))
     offsets: list[int] = []
@@ -98,7 +104,7 @@ def build_unit(
     # run_build's "the part exists, skip it" would then treat as finished.
     with open(path + ".tmp", "wb") as f:
         for labeled in corpus.iter_labeled(unit, counts):
-            row = _row(labeled, prm, baselines, count, dropped)
+            row = _row(labeled, prm, baselines, count, dropped, prompts)
             if row is None:
                 continue
             # ensure_ascii spelled out because it is load-bearing, not a default: it is how
@@ -113,7 +119,7 @@ def build_unit(
     fired = {r: s for r, s in dropped.items() if s}
     counts[ROWS] = len(offsets)
     counts.update({r: len(s) for r, s in fired.items()})
-    record = {"counts": dict(counts), "dropped": fired}
+    record = {"counts": dict(counts), "dropped": fired, "system_prompts": prompts}
 
     write_atomic(path + ".idx", "".join(f"{o}\n" for o in offsets))
     # Beside the part, not gathered in the parent: a build killed at its walltime has
@@ -130,6 +136,7 @@ def _row(
     baselines: dict,
     count: Callable[[str], int],
     dropped: dict[str, list[str]],
+    prompts: dict[str, str],
 ) -> dict | None:
     """One output row, or ``None`` with the attempt's stem recorded under its drop reason."""
 
@@ -179,6 +186,11 @@ def _row(
     if not kept:
         return drop(NO_CUTS)
 
+    # Registered here rather than per attempt, so the table resolves the shas the part
+    # holds and nothing else -- a dropped attempt leaves no entry no row names.
+    sha = _text_sha1(labeled.system_prompt)
+    prompts[sha] = labeled.system_prompt
+
     return {
         "run_name": labeled.unit.run_name,
         "shard": labeled.unit.shard,
@@ -187,6 +199,7 @@ def _row(
         "problem_id": labeled.problem_id,
         "sample_id": labeled.sample_id,
         "stem": labeled.stem,
+        ROW_SHA1: sha,
         "prompt": labeled.prompt,
         "raw": labeled.raw,
         "cuts": [c.char for c in kept],
@@ -250,8 +263,11 @@ def run_build(cfg: RerankerConfig) -> str:
 
     baseline = _resolve(prm.baseline_timing_json)
     baseline_sha1 = _sha1(baseline)
-    if len(todo) < len(found):
-        _check_resume(_load_manifest(out_dir), prm, baseline_sha1, out_dir, len(found) - len(todo))
+    # Off the parts on disk, not off `found` minus `todo`: replacing run_dirs outright
+    # leaves every found unit new, and the old parts are merged in all the same.
+    held = glob.glob(os.path.join(parts_dir, "*.jsonl"))
+    if held:
+        _check_resume(_load_manifest(out_dir), prm, baseline_sha1, out_dir, len(held))
     os.makedirs(parts_dir, exist_ok=True)
 
     def stamp(built: int) -> dict:
@@ -260,9 +276,14 @@ def run_build(cfg: RerankerConfig) -> str:
     path = os.path.join(out_dir, MANIFEST)
     # Stamped before the pool as well as after it: a build killed at its walltime leaves
     # parts behind, and the next run's _check_resume needs a config to compare them to.
-    write_atomic(path, json.dumps(stamp(0), indent=2))
+    before = stamp(0)
+    _check_schema(before["units"], out_dir)
+    write_atomic(path, json.dumps(before, indent=2))
     _map(todo, prm, parts_dir, load_baseline_times(baseline))
     manifest = stamp(len(todo))
+    # Derived from the parts, so a resume rewrites it. A build killed before this point
+    # leaves shas resolving nowhere -- and fails stats.py's row and part gates until rerun.
+    write_atomic(os.path.join(out_dir, PROMPTS), json.dumps(_side_table(manifest["units"])))
     write_atomic(path, json.dumps(manifest, indent=2))
 
     counts = manifest["counts"]
@@ -305,6 +326,27 @@ def _manifest(prm, baseline, baseline_sha1, units, skipped, built) -> dict:
         "dropped_stems": {r: v for r, v in dropped.items() if v},
         "units": {n: units[n] for n in sorted(units)},
     }
+
+
+def _check_schema(units: dict[str, dict], out_dir: str) -> None:
+    """_check_resume compares knobs, and the row schema is not one; this is what sees it."""
+    # Off the parts' own .meta, not the manifest, so a part that landed after the last
+    # stamp is checked too -- and before the pool, so nothing new is written first.
+    stale = [n for n in sorted(units) if "system_prompts" not in units[n]]
+    if stale:
+        raise ValueError(
+            f"{out_dir} holds {len(stale)} parts from before the system prompt was recorded "
+            f"({stale[0]} is one): their rows have no system_prompt_sha1 and no table can "
+            "give them one -- build into a new out_dir, or delete this one"
+        )
+
+
+def _side_table(units: dict[str, dict]) -> dict[str, str]:
+    """Every part's system prompts in one map; sorted, so two identical builds agree."""
+    out: dict[str, str] = {}
+    for name in sorted(units):
+        out.update(units[name]["system_prompts"])
+    return {sha: out[sha] for sha in sorted(out)}
 
 
 def _unit_records(parts_dir: str) -> dict[str, dict]:
@@ -352,6 +394,12 @@ def write_atomic(path: str, text: str) -> None:
     with open(path + ".tmp", "w") as f:
         f.write(text)
     os.replace(path + ".tmp", path)
+
+
+def _text_sha1(text: str) -> str:
+    """surrogatepass for the reason ensure_ascii is spelled out above: a lone surrogate
+    read back from attempts.jsonl must not abort the pool over one string."""
+    return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _sha1(path: str) -> str:
