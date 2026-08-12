@@ -271,6 +271,162 @@ class PRMConfig:
             raise ValueError(f"prm.baseline_timing_json is not a file: {baseline}")
 
 
+# The two prefix sources and the three train-set selection modes (PLAN_v2 §6). Here rather
+# than in prm/rollout/prefixes.py because `validate()` gates on them and this module must stay a
+# leaf: prefixes.py imports config, so config importing prefixes would close the cycle.
+CUT, BEAM = "cut", "beam"
+SOURCES = (CUT, BEAM)
+RANDOM, ENTROPY, PRM_SPREAD = "random", "entropy", "prm_spread"
+SELECTIONS = (RANDOM, ENTROPY, PRM_SPREAD)
+
+
+@dataclass
+class PRMRolloutConfig:
+    """The v2 rollout campaign (``reranker.src.prm.rollout.*``); see prm_plan/PLAN_v2.md §7.
+
+    v1 measures a prefix by inheriting its completion's final label. This measures it: cut a
+    prefix, generate ``K`` continuations, evaluate each, and let ``V̂`` be what comes back.
+    Reads v1's parts and splits; writes its own ``out_dir``.
+    """
+
+    # --- inputs ---------------------------------------------------------------------
+    parts_glob: str = "data/prm/parts/*.jsonl"
+    splits_json: str = "data/prm/splits.json"
+    baseline_timing_json: str = BASELINE_TIMING_JSON
+    # {run_name: short tag}. Also the run *filter*: one parts dir holds every run v1 built,
+    # and a campaign takes one of them. The tag is in `list_key`, so two runs sharing one
+    # would merge their lists and break N2.
+    run_tags: dict[str, str] = field(default_factory=dict)
+
+    # --- prefix selection -----------------------------------------------------------
+    source: str = CUT                  # cut | beam  — beam is stage 2, not built (§11)
+    rounds: list[int] = field(default_factory=lambda: [0, 1, 2])
+    depths_per_group: int = 4          # how many cut depths per (run, level, problem, round)
+    min_rel_depth: float = 0.1         # below it every prefix of a problem shares the base rate
+    max_rel_depth: float = 0.9         # above it the outcome is decided and nothing is learnable
+    min_list_size: int = 2             # a list of one has no pair; drop it before it is paid for
+    max_list_size: int = 8             # the ceiling: 25-sample groups are ~5x the §9 eval budget
+    train_selection: str = RANDOM      # random | entropy | prm_spread — only random is built (§6)
+    prm_v1_checkpoint: Optional[str] = None   # required only by prm_spread
+    select_seed: int = 42
+    # val_selection is NOT a knob -- N3 fixes it to random in prefixes.py itself.
+
+    # --- rollouts -------------------------------------------------------------------
+    K: int = 5
+    min_rollouts: int = 3              # below this many surviving rollouts, V̂ is not measured
+    temperature: float = 0.6
+    think_temperature: float = 1.0
+    max_new_tokens: int = 16384
+    gen_model: str = "openai/gpt-oss-120b"    # must match the source run's model
+    max_num_seqs: int = 64
+    max_model_len: int = 40960
+
+    # --- eval -----------------------------------------------------------------------
+    eval_runs_dir: str = "/path/to/workdir/KernelBench/runs"
+    eval_run_name: str = "prm_rollout_v1"     # shard dirs: {eval_run_name}_s00 ...
+    eval_shards: int = 4               # sized so each eval job finishes inside its wall clock
+    num_correct_trials: int = 5
+    num_perf_trials: int = 100
+    eval_timeout: int = 300
+    dedup_by_code_sha1: bool = True
+
+    # --- targets (same knobs and same functions as v1) -------------------------------
+    label_mode: str = "graded"
+    speedup_stat: str = "min"
+    speedup_lo: float = 0.2
+    speedup_hi: float = 4.0
+    speed_quant: float = 0.1
+
+    # --- scoring (rank_eval only; no training settings live here) --------------------
+    base_model: str = "Qwen/Qwen3-Reranker-4B"
+    max_length: int = 16384
+    depth_buckets: int = 4             # how many rel_depth bands the reports slice into
+
+    out_dir: str = "data/prm_rollout"
+    num_workers: int = 8
+
+    def validate(self) -> None:
+        """Fail before a campaign starts rather than partway through one.
+
+        Everything here is cheap and local. The knobs that can only be checked against the
+        corpus -- that a tagged run has rows, that a problem has a split -- raise in
+        `prefixes.py`, where the corpus is.
+        """
+        # `_coerce` has no list case, so `prm_rollout.rounds=[0]` from the CLI arrives as
+        # the *string* "[0]" and would iterate as characters. List values belong in a file.
+        if not isinstance(self.rounds, list) or not self.rounds:
+            raise ValueError(f"prm_rollout.rounds must be a non-empty list, got {self.rounds!r}")
+        # bool is an int, and YAML reads `[yes]` as one -- the same trap PRMConfig hits.
+        if not all(isinstance(r, int) and not isinstance(r, bool) for r in self.rounds):
+            raise ValueError(f"prm_rollout.rounds must be a list of ints, got {self.rounds!r}")
+
+        tags = self.run_tags
+        if not isinstance(tags, dict) or not tags:
+            raise ValueError(
+                f"prm_rollout.run_tags must name at least one run, got {tags!r} -- it is "
+                "the run filter as well as the tag, so an empty one builds nothing"
+            )
+        if not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in tags.items()):
+            raise ValueError(f"prm_rollout.run_tags must map run name -> tag, both non-empty "
+                             f"strings, got {tags!r}")
+        # The tag opens `list_key`, so two runs under one tag put samples from different
+        # generations into the same list -- N2, and nothing downstream could see it.
+        if len(set(tags.values())) != len(tags):
+            raise ValueError(f"prm_rollout.run_tags must be unique per run, got {tags!r}")
+
+        # Two, not one: a list of one candidate contains no pair, so it trains nothing while
+        # costing K evals. The ceiling is what keeps a 25-sample group inside the budget.
+        if self.min_list_size < 2:
+            raise ValueError(f"prm_rollout.min_list_size must be >= 2, got {self.min_list_size}")
+        if self.max_list_size < self.min_list_size:
+            raise ValueError(
+                f"prm_rollout.max_list_size ({self.max_list_size}) is below min_list_size "
+                f"({self.min_list_size}): every list would be capped under the floor and dropped"
+            )
+        # Strict at both ends: rel_depth is cut_index/n_cuts_total, so it reaches (n-1)/n and
+        # never 1.0, and a window of zero width admits no cut at all.
+        if not 0 <= self.min_rel_depth < self.max_rel_depth < 1:
+            raise ValueError(
+                "prm_rollout needs 0 <= min_rel_depth < max_rel_depth < 1, got "
+                f"{self.min_rel_depth} .. {self.max_rel_depth}"
+            )
+        for name in (
+            "depths_per_group", "K", "min_rollouts", "max_new_tokens", "max_num_seqs",
+            "max_model_len", "eval_shards", "num_correct_trials", "num_perf_trials",
+            "eval_timeout", "max_length", "depth_buckets", "num_workers",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"prm_rollout.{name} must be >= 1, got {getattr(self, name)}")
+        if self.min_rollouts > self.K:
+            raise ValueError(
+                f"prm_rollout.min_rollouts ({self.min_rollouts}) exceeds K ({self.K}): no "
+                "prefix could ever clear it and every list would be dropped after being paid for"
+            )
+
+        if self.source not in SOURCES:
+            raise ValueError(f"prm_rollout.source must be one of {SOURCES}, got {self.source!r}")
+        if self.train_selection not in SELECTIONS:
+            raise ValueError(
+                f"prm_rollout.train_selection must be one of {SELECTIONS}, "
+                f"got {self.train_selection!r}"
+            )
+        if self.train_selection == PRM_SPREAD and not self.prm_v1_checkpoint:
+            raise ValueError(
+                "prm_rollout.prm_v1_checkpoint is required when train_selection is "
+                f"{PRM_SPREAD}: there is nothing to score the candidates with"
+            )
+
+        # The same gate v1 uses, imported at call time so this module stays a leaf.
+        from reranker.src.prm.targets import check_knobs
+
+        check_knobs(
+            self.label_mode, self.speedup_stat, self.speedup_lo, self.speedup_hi, self.speed_quant
+        )
+        baseline = _resolve(self.baseline_timing_json)
+        if not os.path.isfile(baseline):
+            raise ValueError(f"prm_rollout.baseline_timing_json is not a file: {baseline}")
+
+
 @dataclass
 class MLflowConfig:
     db_file: str = "mlflow.db"
@@ -291,6 +447,7 @@ class RerankerConfig:
     pairwise: PairwiseConfig = field(default_factory=PairwiseConfig)
     listwise: ListwiseConfig = field(default_factory=ListwiseConfig)
     prm: PRMConfig = field(default_factory=PRMConfig)
+    prm_rollout: PRMRolloutConfig = field(default_factory=PRMRolloutConfig)
 
 
 def _resolve(path: str) -> str:

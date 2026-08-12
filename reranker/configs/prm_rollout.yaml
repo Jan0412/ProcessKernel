@@ -1,0 +1,77 @@
+# PRM rollout campaign — prm_plan/PLAN_v2.md §7. Only the `prm_rollout` section is read.
+#   python -m reranker.src.prm.rollout.prefixes --config reranker/configs/prm_rollout.yaml
+#
+# List and dict values must live here: config._coerce has no list case, so
+# `prm_rollout.rounds=[0]` on the CLI would arrive as the string "[0]". Scalars override fine.
+prm_rollout:
+  # v1's output, read and never rewritten. prm_v2, not prm: the original build predates
+  # PLAN_v2 §8, so its rows carry no system_prompt_sha1 and job B cannot rebuild the
+  # prompt from them. Rebuilt 2026-08-12 (job 2446926); same 284,356 rows, byte-identical
+  # splits.json, 13/13 on stats.py. The splits especially: recomputing them here
+  # would put a problem in v1's train and v2's val (PLAN_v2 §4, N3).
+  parts_glob: data/prm_v2/parts/*.jsonl
+  splits_json: data/prm_v2/splits.json
+
+  # H100 because the runs report "NVIDIA H100 80GB HBM3" -- the same file v1 grades against,
+  # named once so the two pipelines cannot divide by two different baselines.
+  baseline_timing_json: /path/to/workdir/KernelBench/results/timing/H100/baseline_time_torch.json
+
+  # The run filter as well as the tag: one parts dir holds every run v1 built, and a
+  # campaign takes one of them. The tag opens `list_key`, so it must be short and stable.
+  # This is the level-6 gpt-oss run, the one whose v1 parts exist today; swap in the
+  # level-2 run's name once its own v1 build has landed.
+  run_tags:
+    gpt-oss-120b_kb6_lintloop_triton_v5_traced: go-l6
+
+  source: cut                # beam is stage 2 and not built (§11)
+  rounds: [0, 1, 2]
+  # 4 cuts per (run, level, problem, round) group. This and `run_tags` are the budget
+  # levers: the corpus holds 85,184 groups, so every +1 here is another ~85k lists.
+  depths_per_group: 4
+  # Trimmed at both ends on purpose: near 0 every prefix of a problem shares the base rate
+  # and nothing is learnable, near 1 the outcome is decided and nothing is decided by the cut.
+  min_rel_depth: 0.1
+  max_rel_depth: 0.9
+  min_list_size: 2
+  # The ceiling (added 2026-08-12, §6). §12 sized the source run at 4 samples per problem,
+  # so lists averaged 3.2 items and no cap was needed; a 25-sample run is ~5x the eval
+  # budget uncapped. PROVISIONAL: set the real value from the evals/GPU-h the source-run
+  # eval reports. Subsampling is random and seeded off select_seed in BOTH splits.
+  max_list_size: 8
+  # random for the first campaign; entropy and prm_spread are DEFERRED, not built (§6,
+  # decided 2026-08-12). Both names still validate, so nothing is foreclosed.
+  train_selection: random
+  prm_v1_checkpoint: null
+  select_seed: 42
+  # val_selection is NOT a knob -- N3 fixes it to random inside prefixes.py.
+
+  K: 5
+  min_rollouts: 3
+  temperature: 0.6
+  think_temperature: 1.0
+  max_new_tokens: 16384
+  gen_model: openai/gpt-oss-120b       # must match the run behind `run_tags`
+  max_num_seqs: 64
+  max_model_len: 40960
+
+  eval_runs_dir: /path/to/workdir/KernelBench/runs
+  eval_run_name: prm_rollout_l6_v1
+  eval_shards: 4
+  num_correct_trials: 5
+  num_perf_trials: 100
+  eval_timeout: 300
+  dedup_by_code_sha1: true
+
+  # The same knobs and the same functions v1 grades with (reranker.src.prm.targets).
+  label_mode: graded
+  speedup_stat: min
+  speedup_lo: 0.2
+  speedup_hi: 4.0
+  speed_quant: 0.1
+
+  base_model: Qwen/Qwen3-Reranker-4B
+  max_length: 16384
+  depth_buckets: 4
+
+  out_dir: data/prm_rollout
+  num_workers: 8
