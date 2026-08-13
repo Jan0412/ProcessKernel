@@ -115,6 +115,15 @@ def test_a_lone_surrogate_in_the_completion_is_written_rather_than_fatal(tmp_pat
     assert row["raw"] == raw
 
 
+def test_write_atomic_writes_a_lone_surrogate_rather_than_aborting(tmp_path):
+    # Every other caller hands this ensure_ascii JSON, which cannot carry one; stage.py hands
+    # it a kernel body sliced out of `raw`, where the test above establishes one survives.
+    path = str(tmp_path / "kernel.py")
+    build.write_atomic(path, "x = 'a\ud800b'\n")
+    with open(path, encoding="utf-8", errors="surrogatepass") as f:
+        assert f.read() == "x = 'a\ud800b'\n"
+
+
 def test_a_wrong_kernel_grades_zero_without_needing_a_baseline(tmp_path, chars):
     _, parts = built(
         tmp_path,

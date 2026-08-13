@@ -407,8 +407,12 @@ def _check_resume(was: dict, prm: PRMConfig, baseline_sha1: str, out_dir: str, n
 
 
 def write_atomic(path: str, text: str) -> None:
-    """Rename into place, so a reader never sees a partly written file. Shared with splits."""
-    with open(path + ".tmp", "w") as f:
+    """Rename into place, so a reader never sees a partly written file. Shared with splits.
+
+    surrogatepass for the reason ensure_ascii is spelled out above: most callers hand this
+    ASCII JSON, but stage.py hands it a kernel body sliced out of `raw`.
+    """
+    with open(path + ".tmp", "w", encoding="utf-8", errors="surrogatepass") as f:
         f.write(text)
     os.replace(path + ".tmp", path)
 
