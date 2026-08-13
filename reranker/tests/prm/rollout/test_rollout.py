@@ -8,16 +8,18 @@ ids run through the stop string, and a stop that fires mid-batch.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from collections import Counter
 
 import pytest
+import yaml
 
 from kernel_gen.core.backend import FAKE_CHARS_PER_TOKEN, Backend, FakeBackend
-from reranker.src.config import PRMRolloutConfig
-from reranker.src.prm import build
-from reranker.src.prm.rollout import prefixes, rollout
+from reranker.src.config import PRMRolloutConfig, RerankerConfig
+from reranker.src.prm import build, corpus
+from reranker.src.prm.rollout import prefixes, rollout, stage
 
 RUN, TAG, SHARD = "a_run", "ar", "shard_00"
 SYS, USER = "SYSTEM PROMPT", "USER PROMPT"
@@ -197,6 +199,122 @@ def test_load_prompts_anchors_a_relative_glob_the_way_the_rest_of_the_config_doe
     with pytest.raises(FileNotFoundError):
         rollout.load_prompts("data/prm_v2/parts/*.jsonl")
     assert seen == ["data/prm_v2/parts/*.jsonl"]
+
+
+# --- the run a campaign claims to continue ----------------------------------------------
+
+
+def write_source_run(tmp_path, run_name=RUN, shards=(SHARD,), **over):
+    """A generation run dir as lintloop.sh leaves it: one config per shard, sampler and all."""
+    body = {
+        "model": "openai/gpt-oss-120b",
+        "temperature": 0.6,
+        "think_temperature": 1.0,
+        "max_new_tokens": 16384,
+    }
+    body.update(over)
+    run_dir = tmp_path / "runs" / run_name
+    for shard in shards:
+        (run_dir / shard).mkdir(parents=True)
+        (run_dir / shard / rollout.GEN_CONFIG).write_text(yaml.safe_dump(body))
+    return str(run_dir)
+
+
+def write_v1_manifest(tmp_path, run_dirs):
+    """v1's manifest, whose ``config.run_dirs`` is the only pointer back to the source run."""
+    (tmp_path / build.MANIFEST).write_text(json.dumps({"config": {"run_dirs": list(run_dirs)}}))
+
+
+def gen_cfg(tmp_path, **over):
+    part = os.path.join(str(tmp_path), build.PARTS, "*.jsonl")
+    return cfg(parts_glob=part, max_new_tokens=16384, **over)
+
+
+def test_check_gen_model_returns_the_model_each_source_shard_was_written_by(tmp_path):
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, shards=(SHARD, "shard_01"))])
+    got = rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD), (RUN, "shard_01")])
+    assert got == {f"{RUN}/{SHARD}": "openai/gpt-oss-120b",
+                   f"{RUN}/shard_01": "openai/gpt-oss-120b"}
+
+
+def test_a_gen_model_that_did_not_write_the_prefixes_is_refused(tmp_path):
+    # Three of the four candidate runs are DeepSeek and `gen_model` defaults to gpt-oss, so
+    # switching run_tags and forgetting it sizes every budget with the wrong tokenizer and
+    # measures V-hat under a model that never wrote the prefix -- invisibly, in both halves.
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, model="deepseek-ai/DeepSeek-V4")])
+    with pytest.raises(ValueError, match="deepseek-ai/DeepSeek-V4"):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+
+
+def test_a_sampler_knob_that_differs_from_the_source_run_is_refused(tmp_path):
+    # THINK_TEMP=0 runs are single-pass with no plan at all; continuing one of its prefixes
+    # at think_temperature 1.0 samples a regime the completion was never generated in.
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, think_temperature=0.0)])
+    with pytest.raises(ValueError, match="think_temperature"):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+
+
+def test_the_budget_cap_is_checked_against_the_source_run_too(tmp_path):
+    # max_new_tokens is the ruler `budget` subtracts from: a cap larger than the source run's
+    # hands a rollout more room than the completion it continues ever had.
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, max_new_tokens=8192)])
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+
+
+def test_a_run_v1s_manifest_does_not_name_is_refused(tmp_path):
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, run_name="other_run")])
+    with pytest.raises(ValueError, match=RUN):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+
+
+def test_a_shard_whose_generation_config_is_gone_is_refused(tmp_path):
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, shards=(SHARD,))])
+    with pytest.raises(FileNotFoundError, match="shard_09"):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, "shard_09")])
+
+
+# --- the unit: what one part holds, and what one call is handed -------------------------
+
+
+def test_a_units_name_is_the_v1_part_it_resolves_its_texts_from():
+    # Job B looks a unit's texts up by this name, so it has to be build.part_name's -- both
+    # source runs contain a shard_00, which is why the run name is in it at all.
+    p = prefix()
+    unit = corpus.Unit(RUN, "/runs/a_run", SHARD, 0, "attempts.jsonl", "eval.json")
+    assert rollout.unit_name(p) + ".jsonl" == build.part_name(unit)
+
+
+def test_units_group_prefixes_by_run_shard_and_round():
+    # A part is one (run, shard, round) and so is a rollout part: mixing two rounds into one
+    # would write a part that stage.py globs under a name naming only one of them.
+    ps = [
+        prefix(prefix_id="a", round=0),
+        prefix(prefix_id="b", round=1),
+        prefix(prefix_id="c", round=0),
+        prefix(prefix_id="d", shard="shard_01", round=0),
+    ]
+    got = rollout.units(ps)
+    assert list(got) == [
+        f"{RUN}__{SHARD}__round0",
+        f"{RUN}__{SHARD}__round1",
+        f"{RUN}__shard_01__round0",
+    ]
+    assert [p.prefix_id for p in got[f"{RUN}__{SHARD}__round0"]] == ["a", "c"]
+
+
+def test_a_unit_is_handed_to_generate_in_batches_that_lose_nothing():
+    # Measured: one real unit is 14,005 prefixes -> 70,025 rollouts in a single call, ~770 MB
+    # of pass-2 prompts held at once with nothing written until it all returns.
+    ps = [prefix(prefix_id=str(i)) for i in range(7)]
+    got = list(rollout.batches(ps, 3))
+    assert [len(b) for b in got] == [3, 3, 1]
+    assert [p.prefix_id for b in got for p in b] == [str(i) for i in range(7)]
+
+
+def test_a_batch_size_of_zero_or_less_is_refused_rather_than_looping_forever():
+    with pytest.raises(ValueError, match="prefixes_per_batch"):
+        list(rollout.batches([prefix()], 0))
 
 
 # --- the token budget -------------------------------------------------------------------
@@ -616,6 +734,223 @@ def test_no_prefixes_is_no_calls():
     backend = Recorder()
     assert rollout.generate(backend, [], {}, cfg(), len) == []
     assert backend.calls == []
+
+
+# --- job B: the driver that turns prefixes.jsonl into one part per unit ------------------
+
+
+def a_unit(n=1, **over):
+    """``n`` prefixes of one unit, with the v1 rows job B resolves their texts through."""
+    ps = [prefix(prefix_id=f"p{i}", sample_id=i, **over) for i in range(n)]
+    return ps, [part_row(sid=p.sample_id) for p in ps]
+
+
+def campaign(tmp_path, ps, rows, **over):
+    """A campaign on disk: v1's parts and manifest, the source run, and job A's output."""
+    for p in ps:
+        # Restated rather than read off unit_name: this is the convention job B has to find
+        # its texts by, and a fixture built from the code under test would follow it anywhere.
+        name = f"{p.run_name}__{p.shard}__round{p.round}.jsonl"
+        mine = [r for r in rows if (r["run_name"], r["shard"], r["round"]) == (p.run_name, p.shard, p.round)]
+        write_part(tmp_path, mine, name=name)
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, shards=sorted({p.shard for p in ps}))])
+    out = tmp_path / "campaign"
+    out.mkdir(exist_ok=True)
+    (out / prefixes.PREFIXES).write_text(
+        "".join(json.dumps(dataclasses.asdict(p)) + "\n" for p in ps)
+    )
+    return RerankerConfig(prm_rollout=gen_cfg(tmp_path, out_dir=str(out), **over))
+
+
+def parts_of(conf):
+    """The parts themselves; each also has a .meta beside it, which stage.py globs past."""
+    out_dir = conf.prm_rollout.out_dir
+    return sorted(
+        n for n in os.listdir(os.path.join(out_dir, stage.ROLLOUTS)) if n.endswith(".jsonl.gz")
+    )
+
+
+def test_the_driver_writes_one_part_per_unit_holding_K_rollouts_for_every_prefix(tmp_path):
+    ps, rows = a_unit(2)
+    ps.append(prefix(prefix_id="q0", sample_id=0, round=1))
+    rows.append(part_row(sid=0, round=1))
+    conf = campaign(tmp_path, ps, rows)
+    manifest = rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+
+    assert parts_of(conf) == ["a_run__shard_00__round0.jsonl.gz", "a_run__shard_00__round1.jsonl.gz"]
+    got = stage.read_rollouts(stage.unit_path(conf.prm_rollout.out_dir, "a_run__shard_00__round0"))
+    assert [r.rollout_id for r in got] == ["p0__j00", "p0__j01", "p1__j00", "p1__j01"]
+    assert manifest["prefixes"] == 3 and manifest["rollouts"] == 6
+
+
+def test_a_unit_whose_part_is_already_there_is_not_generated_again(tmp_path):
+    # §12's rerun row: a second invocation re-runs no completed unit -- 0 new rollouts, and
+    # not because the kernels dedup (they are sampled at temperature 0.6 and never repeat),
+    # but because a part that exists means a unit that finished.
+    ps, rows = a_unit(2)
+    conf = campaign(tmp_path, ps, rows)
+    rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    before = open(stage.unit_path(conf.prm_rollout.out_dir, "a_run__shard_00__round0"), "rb").read()
+
+    second = Recorder()
+    manifest = rollout.run_rollouts(conf, backend=second, count=len)
+    assert second.calls == []
+    assert manifest["units_generated"] == 0 and manifest["units_reused"] == 1
+    assert open(stage.unit_path(conf.prm_rollout.out_dir, "a_run__shard_00__round0"), "rb").read() == before
+
+
+def test_a_unit_is_handed_to_generate_in_batches_and_not_all_at_once(tmp_path, monkeypatch):
+    # Measured on a real unit: 14,005 prefixes -> 70,025 rollouts in one call, ~770 MB of
+    # prompts held with nothing written until every one of them returns.
+    seen = []
+    real = rollout.generate
+    monkeypatch.setattr(
+        rollout, "generate", lambda b, ps, *a, **k: seen.append(len(ps)) or real(b, ps, *a, **k)
+    )
+    ps, rows = a_unit(3)
+    conf = campaign(tmp_path, ps, rows, prefixes_per_batch=2)
+    rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    assert seen == [2, 1]
+    part = stage.unit_path(conf.prm_rollout.out_dir, "a_run__shard_00__round0")
+    assert len(stage.read_rollouts(part)) == 6
+
+
+def test_a_gen_model_that_did_not_write_the_prefixes_stops_the_job_before_it_samples(tmp_path):
+    # The check has to fire here and not in stage.py: by staging time the rollouts have been
+    # sampled under the wrong tokenizer already, and the GPU hours are spent.
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows, gen_model="deepseek-ai/DeepSeek-V4-Flash")
+    backend = Recorder()
+    with pytest.raises(ValueError, match="DeepSeek-V4-Flash"):
+        rollout.run_rollouts(conf, backend=backend, count=len)
+    assert backend.calls == []
+    assert not os.path.isdir(os.path.join(conf.prm_rollout.out_dir, stage.ROLLOUTS))
+
+
+def test_a_unit_with_no_v1_part_to_read_its_texts_from_names_it(tmp_path):
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows)
+    os.remove(os.path.join(str(tmp_path), build.PARTS, "a_run__shard_00__round0.jsonl"))
+    with pytest.raises(FileNotFoundError, match="a_run__shard_00__round0"):
+        rollout.run_rollouts(conf, backend=FakeBackend(), count=len)
+
+
+def test_the_manifest_carries_the_counters_and_the_models_that_wrote_the_prefixes(tmp_path):
+    # prose_cut_past_seam is "counted, not silent" only once something writes it down, and a
+    # campaign's V-hat is only interpretable against the model that produced its prefixes.
+    ps, rows = a_unit(1, cut_kind="prose", cut_char=len(RAW))   # past the seam: fence in the text
+    conf = campaign(tmp_path, ps, rows)
+    manifest = rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    assert manifest["counts"]["prose_cut_past_seam"] == 1
+    assert manifest["gen_models"] == {"a_run/shard_00": "openai/gpt-oss-120b"}
+    assert manifest["config"]["gen_model"] == "openai/gpt-oss-120b"
+    assert manifest["units"]["a_run__shard_00__round0"]["rollouts"] == 2
+
+
+def test_a_resumed_campaign_still_reports_the_counters_of_the_units_it_skipped(tmp_path):
+    # The manifest is rewritten every invocation, so counters held only in memory would be
+    # lost the moment a campaign is resumed -- and a resumed campaign is the normal case.
+    ps, rows = a_unit(1, cut_kind="prose", cut_char=len(RAW))
+    conf = campaign(tmp_path, ps, rows)
+    first = rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    again = rollout.run_rollouts(conf, backend=Recorder(), count=len)
+    assert again["counts"] == first["counts"]
+    assert again["rollouts"] == first["rollouts"] and again["units"] == first["units"]
+
+
+def test_a_reused_unit_is_refused_when_the_sampler_behind_it_has_moved(tmp_path):
+    # A unit is reused on its part's name alone. Resume after a wall-clock kill with an edited
+    # temperature and the campaign holds rollouts from two regimes, under one manifest that
+    # claims the second for all of them. v1's build.py refuses the same way.
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows)
+    rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+
+    conf.prm_rollout.temperature = 0.9
+    with pytest.raises(ValueError, match="temperature"):
+        rollout.run_rollouts(conf, backend=Recorder(), count=len)
+
+
+def test_a_reused_unit_survives_a_knob_that_changes_no_rollout(tmp_path):
+    # The guard has to stay narrow, or an operator raising the batch size after an OOM is told
+    # to throw the campaign away -- and starts deleting manifests instead.
+    ps, rows = a_unit(2)
+    conf = campaign(tmp_path, ps, rows)
+    rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+
+    conf.prm_rollout.prefixes_per_batch = 1
+    conf.prm_rollout.num_workers = 4
+    assert rollout.run_rollouts(conf, backend=Recorder(), count=len)["units_reused"] == 1
+
+
+def test_the_driver_sizes_its_budgets_with_the_generation_models_tokenizer(tmp_path, monkeypatch):
+    # base_model is the reranker's and bounds max_length; reaching for it here would size
+    # every rollout's budget under a model that never writes one.
+    asked = []
+    monkeypatch.setattr(build, "token_counter", lambda name: asked.append(name) or len)
+    ps, rows = a_unit(1)
+    rollout.run_rollouts(campaign(tmp_path, ps, rows), backend=FakeBackend())
+    assert asked == ["openai/gpt-oss-120b"]
+
+
+def test_the_manifest_lands_beside_the_rollouts_it_describes(tmp_path):
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows)
+    rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    path = os.path.join(conf.prm_rollout.out_dir, rollout.ROLLOUT_MANIFEST)
+    assert json.load(open(path))["rollouts"] == 2
+
+
+# --- prefix caching: the assumption the K-rollouts-per-prefix economics rest on ----------
+
+
+class Cached(FakeBackend):
+    """A backend shaped like vLLM's, down to where the cache setting is actually readable."""
+
+    def __init__(self, on: bool):
+        super().__init__(default="import torch\n")
+        self.llm = type("LLM", (), {})()
+        self.llm.llm_engine = type("Engine", (), {})()
+        self.llm.llm_engine.vllm_config = type("Config", (), {})()
+        self.llm.llm_engine.vllm_config.cache_config = type("Cache", (), {})()
+        self.llm.llm_engine.vllm_config.cache_config.enable_prefix_caching = on
+
+
+def test_prefix_caching_is_read_back_off_the_engine_rather_than_assumed():
+    assert rollout.prefix_caching(Cached(True)) is True
+    assert rollout.prefix_caching(Cached(False)) is False
+
+
+def test_a_backend_that_cannot_be_asked_reports_nothing_rather_than_claiming_it_is_on():
+    # FakeBackend has no engine; a driver test must not be told the cache is enabled.
+    assert rollout.prefix_caching(FakeBackend()) is None
+
+
+def test_the_manifest_records_whether_the_prefill_cache_was_actually_on(tmp_path):
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows)
+    assert rollout.run_rollouts(conf, backend=FakeBackend(), count=len)["prefix_caching"] is None
+
+
+def test_a_resumed_campaign_still_reports_the_cache_the_rollouts_were_sampled_under(tmp_path):
+    # A resume generates nothing and so has no engine to ask, and the manifest is rewritten
+    # every invocation -- so the record has to live with the unit, not with the run.
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows)
+    assert rollout.run_rollouts(conf, backend=Cached(True), count=len)["prefix_caching"] is True
+    again = rollout.run_rollouts(conf, backend=Recorder(), count=len)
+    assert again["units_generated"] == 0 and again["prefix_caching"] is True
+
+
+def test_a_run_with_prefix_caching_off_stops_rather_than_paying_K_times_for_one_prefill(tmp_path):
+    # The K prompts of a prefix are byte-identical for exactly this reason; without the cache
+    # the campaign silently costs K prefills per prefix instead of one.
+    ps, rows = a_unit(1)
+    conf = campaign(tmp_path, ps, rows)
+    off = Cached(False)
+    off.render_chat = FakeBackend().render_chat
+    with pytest.raises(ValueError, match="prefix caching"):
+        rollout.run_rollouts(conf, backend=off, count=len)
 
 
 def test_the_budget_counter_is_built_from_the_generation_model(monkeypatch):

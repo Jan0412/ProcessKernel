@@ -178,6 +178,8 @@ def test_a_ceiling_below_the_floor_raises():
         ({"max_length": 0}, "max_length"),
         ({"num_workers": 0}, "num_workers"),
         ({"max_new_tokens": 0}, "max_new_tokens"),
+        # Job B's slice of a unit: at 0 the driver would hand generate() nothing, forever.
+        ({"prefixes_per_batch": 0}, "prefixes_per_batch"),
     ],
 )
 def test_a_knob_that_would_build_nothing_or_crash_raises(over, match):
@@ -233,3 +235,4 @@ def test_a_baseline_file_that_is_not_there_raises():
 def test_the_permissive_ends_of_those_ranges_are_legal():
     rollout(min_rel_depth=0.0, max_rel_depth=0.999, min_list_size=2, max_list_size=2).validate()
     rollout(depths_per_group=1, K=1, min_rollouts=1, num_workers=1, eval_shards=1).validate()
+    rollout(prefixes_per_batch=1).validate()

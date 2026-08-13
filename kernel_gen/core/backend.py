@@ -205,6 +205,11 @@ class VLLMBackend(Backend):
             # here and recorded into each trace's meta so a future flip is detectable in
             # data that has already been written.
             logprobs_mode="raw_logprobs",
+            # Also vLLM's V1 default, and also stated rather than inherited. The PRM rollout
+            # campaign samples K continuations from one byte-identical prompt, so its cost
+            # rests on this collapsing their shared prefill; job B reads it back off the
+            # engine and refuses to start if it is off.
+            enable_prefix_caching=True,
             # Caps SamplingParams.logprobs. vLLM's default is also 20; stated so that
             # raising --trace-topk past it fails at startup rather than per request.
             max_logprobs=max_logprobs,

@@ -322,6 +322,10 @@ class PRMRolloutConfig:
     gen_model: str = "openai/gpt-oss-120b"    # must match the source run's model
     max_num_seqs: int = 64
     max_model_len: int = 40960
+    # How much of a unit job B hands one generate() call. A unit is not a batch: measured,
+    # one is 14,005 prefixes -> 70,025 rollouts, ~770 MB of prompt strings held with nothing
+    # written until they all return. Only memory and checkpointing, never what is sampled.
+    prefixes_per_batch: int = 256
 
     # --- eval -----------------------------------------------------------------------
     eval_runs_dir: str = "/path/to/workdir/KernelBench/runs"
@@ -394,8 +398,8 @@ class PRMRolloutConfig:
             )
         for name in (
             "depths_per_group", "K", "min_rollouts", "max_new_tokens", "max_num_seqs",
-            "max_model_len", "eval_shards", "num_correct_trials", "num_perf_trials",
-            "eval_timeout", "max_length", "depth_buckets", "num_workers",
+            "max_model_len", "prefixes_per_batch", "eval_shards", "num_correct_trials",
+            "num_perf_trials", "eval_timeout", "max_length", "depth_buckets", "num_workers",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"prm_rollout.{name} must be >= 1, got {getattr(self, name)}")

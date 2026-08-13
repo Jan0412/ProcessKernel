@@ -6,6 +6,7 @@ dedup spans prefixes, and neither is decidable from a single unit's rows.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import glob
 import gzip
@@ -177,17 +178,32 @@ def plan_shards(staged, cfg) -> list[Shard]:
     ]
 
 
-def write_rollouts(rollouts, path: str) -> str:
-    """One unit's rows, gzipped, renamed into place. Returns the path.
+@contextlib.contextmanager
+def open_part(path: str):
+    """The unit's part, open for writing and renamed into place only on a clean exit.
 
     Rename and not a plain write, for §9's reason: a part that exists means a unit that
-    finished, so a job killed mid-write must leave nothing a rerun would skip over.
+    finished, so a job killed part-way through one must leave nothing a rerun would skip
+    over. A context manager because job B writes a unit in batches -- it cannot hold one in
+    memory (14,005 prefixes measured on a real unit) and must not publish it until the last
+    batch is back.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with gzip.open(path + ".tmp", "wt") as f:
-        for r in rollouts:
-            f.write(json.dumps(dataclasses.asdict(r)) + "\n")
+        yield f
     os.replace(path + ".tmp", path)
+
+
+def dump_rollouts(rollouts, f) -> None:
+    """Append rows to an open part. One row per line, the shape `read_rollouts` parses."""
+    for r in rollouts:
+        f.write(json.dumps(dataclasses.asdict(r)) + "\n")
+
+
+def write_rollouts(rollouts, path: str) -> str:
+    """One unit's rows, gzipped, renamed into place. Returns the path."""
+    with open_part(path) as f:
+        dump_rollouts(rollouts, f)
     return path
 
 

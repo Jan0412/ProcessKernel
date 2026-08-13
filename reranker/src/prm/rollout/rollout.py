@@ -2,31 +2,62 @@
 
 v1 asks what a completion ended up being worth. This asks what a *prefix* is worth, by
 continuing it K times from the exact context the sampler held and evaluating what comes
-back. Nothing here writes a file -- stage.py owns the rollout rows, because `staged_as` is
-its to assign and the map job D reads is a projection of them.
+back.
+
+`generate` itself is pure -- it is handed a list of prefixes and returns rows. The driver
+below writes each unit's part (through stage.py's writer, so both jobs name and open it one
+way), its `.meta` and the manifest; `staged_as` stays stage.py's to assign, because the map
+job D reads is a projection of it.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import glob
 import json
 import os
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import yaml
+
 from kernel_gen.core.sampling import CODE_FENCE
 from kernel_gen.core.text import extract_code_block
-from reranker.src.config import _resolve
+from reranker.src.config import _resolve, load_config
 from reranker.src.prm import build, corpus
 from reranker.src.prm.chunks import CODE, PROSE
+from reranker.src.prm.rollout import prefixes
 
-# §6 wants a unit's rollouts in one call, and it wants max_tokens sized per prefix. The
-# Backend takes one max_tokens per call, so the two cannot both hold exactly; bucketing the
-# budget this coarsely keeps the call count in single digits (measured 7 buckets over a real
-# shard, against 4,700 prefixes) while a call still takes its bucket's *minimum*, so no
-# prompt is ever given more than its own prefix left it. A member loses at most this many
-# tokens off a budget measured at 9,855-16,249 on that shard.
+# §6 wants max_tokens sized per prefix, and the Backend takes one max_tokens per call, so the
+# two meet only through a bucket. Bucketing this coarsely keeps the calls per *batch* in
+# single digits (measured 7 buckets over a real shard) while a call still takes its bucket's
+# *minimum*, so no prompt is ever given more than its own prefix left it. A member loses at
+# most this many tokens off a budget measured at 9,855-16,249 on that shard. How much of a
+# unit reaches one call is `batches`, below -- a unit is not a batch.
 BUDGET_QUANTUM = 1024
+
+
+ROLLOUT_MANIFEST = "rollout_manifest.json"   # job B's, beside job A's manifest.json
+# What a rollout is sampled from and under, and so what a reused unit has to agree with. Not
+# the whole config, deliberately: the batching, eval and grading knobs move without changing a
+# single row, and a guard that refused those would be one operators route around by deleting
+# the manifest. v1's build.py draws the same line with ROW_KNOBS.
+SAMPLE_KNOBS = ("gen_model", "K", "temperature", "think_temperature", "max_new_tokens",
+                "parts_glob")
+UNIT_META = ".meta"                      # one unit's counters, beside its part
+GEN_CONFIG = "generation_config.yaml"    # what lintloop.sh leaves in every shard dir
+# The regime a rollout has to be sampled in, as {config attribute: generation_config key}.
+# `gen_model` is the one that actually drifts -- three of the four candidate runs are
+# DeepSeek and the default is gpt-oss -- but the other three cost nothing to check and a
+# future run may move them.
+SAMPLER = {
+    "gen_model": "model",
+    "temperature": "temperature",
+    "think_temperature": "think_temperature",
+    "max_new_tokens": "max_new_tokens",
+}
 
 
 @dataclass(frozen=True)
@@ -51,6 +82,41 @@ def source_key(x) -> tuple:
     return (get("run_name"), get("shard"), get("round"), get("stem"))
 
 
+def unit_name(prefix) -> str:
+    """The ``(run, shard, round)`` this prefix belongs to, spelled as v1 spells its parts.
+
+    Job B resolves a unit's texts by looking this name up among the v1 parts, so it is
+    `build.part_name` without the suffix rather than a second convention beside it.
+    """
+    return f"{prefix.run_name}__{prefix.shard}__round{prefix.round}"
+
+
+def units(prefix_rows) -> dict[str, list]:
+    """``unit name -> its prefixes``, in the order job A wrote them.
+
+    One part per unit, as in v1: it is the resume granularity, and the texts a unit needs
+    are exactly the ones its v1 part holds -- so a unit is also all a worker has to load.
+    """
+    out: dict[str, list] = {}
+    for p in prefix_rows:
+        out.setdefault(unit_name(p), []).append(p)
+    return out
+
+
+def batches(prefixes, size: int):
+    """``size`` prefixes at a time: what one ``generate`` call is handed.
+
+    A unit is not a batch. Measured on a real one, 14,005 prefixes came to 70,025 rollouts in
+    a single call -- ~770 MB of pass-2 prompt strings plus every Completion held at once, and
+    nothing written until all of it returns. The K siblings of a prefix stay together, which
+    is what lets vLLM's prefix cache collapse their shared prefill.
+    """
+    if size < 1:
+        raise ValueError(f"prm_rollout.prefixes_per_batch must be >= 1, got {size!r}")
+    for i in range(0, len(prefixes), size):
+        yield prefixes[i : i + size]
+
+
 def load_prompts(parts_glob: str) -> dict[str, str]:
     """v1's ``system_prompt_sha1`` -> text side table, which sits beside the parts dir."""
     return json.loads(_read(os.path.join(_v1_dir(_resolve(parts_glob)), build.PROMPTS)))
@@ -71,6 +137,55 @@ def load_sources(part_path: str, prompts: dict[str, str]) -> dict[tuple, Source]
                     "nowhere; rerun reranker.src.prm.build over this out_dir"
                 )
             out[source_key(row)] = Source(prompts[sha], row["prompt"], row["raw"])
+    return out
+
+
+def source_run_dirs(cfg) -> dict[str, str]:
+    """``run_name -> run dir``, off v1's manifest: the only pointer back to the source run.
+
+    v1 froze the texts, not the settings they were sampled under, so the run dir is where
+    the regime a prefix came from is still recorded.
+    """
+    path = os.path.join(_v1_dir(_resolve(cfg.parts_glob)), build.MANIFEST)
+    run_dirs = json.loads(_read(path))["config"]["run_dirs"]
+    # v1's corpus.units refuses colliding basenames, so this cannot silently drop a run.
+    return {os.path.basename(os.path.normpath(d)): d for d in run_dirs}
+
+
+def check_gen_model(cfg, shards) -> dict[str, str]:
+    """The campaign's sampler settings against the run each shard was generated with.
+
+    Before generation, not after: by staging time the rollouts have already been sampled,
+    and a `gen_model` naming another model has by then tokenized every budget with the wrong
+    tokenizer and measured V-hat under a model that never wrote the prefix. Neither shows up
+    in the output -- the rollouts look exactly as valid as correct ones.
+    """
+    dirs = source_run_dirs(cfg)
+    out = {}
+    for run_name, shard in shards:
+        if run_name not in dirs:
+            raise ValueError(
+                f"{run_name} is not among the runs v1 built ({sorted(dirs)}), so the model "
+                "that wrote its prefixes cannot be checked -- point parts_glob at the build "
+                "job A read"
+            )
+        path = os.path.join(dirs[run_name], shard, GEN_CONFIG)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"no {path}: {run_name}/{shard} carries prefixes but the run dir holding the "
+                "settings they were sampled under is gone. Restore it, or the campaign "
+                "cannot show it continues them in the regime they came from"
+            )
+        source = yaml.safe_load(_read(path))
+        for attr, key in SAMPLER.items():
+            want, got = getattr(cfg, attr), source.get(key)
+            if want != got:
+                raise ValueError(
+                    f"prm_rollout.{attr} is {want!r}, but {run_name}/{shard} was generated "
+                    f"with {key}={got!r} ({path}). A rollout has to continue its prefix in "
+                    "the regime that wrote it, and nothing downstream can see that it did not"
+                )
+        out[f"{run_name}/{shard}"] = source["model"]
     return out
 
 
@@ -325,6 +440,188 @@ def _trace(job: _Job) -> dict:
     }
 
 
+# --- job B: prefixes.jsonl -> one part per unit ------------------------------------------
+
+
+def prefix_caching(backend) -> bool | None:
+    """Whether vLLM's prefill cache is on, read off the engine. ``None`` if unaskable.
+
+    Not assumed: the K prompts of a prefix are byte-identical so that this cache collapses
+    their shared prefill, and without it the campaign quietly pays K prefills per prefix.
+    """
+    try:
+        return bool(backend.llm.llm_engine.vllm_config.cache_config.enable_prefix_caching)
+    except AttributeError:
+        return None
+
+
+def run_rollouts(cfg, backend=None, count=None) -> dict:
+    """Every unit's prefixes -> ``K`` continuations each; returns the manifest it wrote.
+
+    Resume is by part and never by content: `code_sha1` hashes text sampled at temperature
+    0.6, so a re-run unit produces different kernels and a full set of new evals. A unit whose
+    part is already there is therefore skipped outright (§9).
+    """
+    # Deferred: stage.py imports this module, so importing it at the top would be a cycle.
+    from reranker.src.prm.rollout import stage
+
+    conf = cfg.prm_rollout
+    conf.validate()
+    out_dir = _resolve(conf.out_dir)
+    rows = stage.read_prefixes(os.path.join(out_dir, prefixes.PREFIXES))
+    # Before anything is sampled, and over every unit rather than only the ones left to do:
+    # it is provenance as much as a check, and a resumed campaign records it too.
+    models = check_gen_model(conf, sorted({(p.run_name, p.shard) for p in rows}))
+    by_unit = units(rows)
+    todo = {
+        unit: ps
+        for unit, ps in by_unit.items()
+        if not os.path.exists(stage.unit_path(out_dir, unit))
+    }
+    if len(todo) < len(by_unit):
+        _check_resume(conf, out_dir)
+
+    caching = None
+    if todo:
+        backend = _backend(conf) if backend is None else backend
+        caching = prefix_caching(backend)
+        if caching is False:
+            raise ValueError(
+                "vLLM prefix caching is off: the K rollouts of a prefix share one prompt "
+                "precisely so their prefill is computed once, and this campaign would pay "
+                f"for {conf.K} of them per prefix instead"
+            )
+        count = gen_counter(conf) if count is None else count
+        prompts = load_prompts(conf.parts_glob)
+        by_name = {os.path.basename(p): p for p in glob.glob(_resolve(conf.parts_glob))}
+        for unit, ps in todo.items():
+            part = by_name.get(f"{unit}.jsonl")
+            if part is None:
+                raise FileNotFoundError(
+                    f"{unit} has prefixes but no v1 part under {conf.parts_glob} to read "
+                    "their texts from -- job A and job B are reading different builds"
+                )
+            _run_unit(
+                backend, unit, ps, load_sources(part, prompts), conf, count, out_dir, caching
+            )
+
+    manifest = _job_b_manifest(conf, _metas(out_dir), models, len(todo))
+    build.write_atomic(os.path.join(out_dir, ROLLOUT_MANIFEST), json.dumps(manifest, indent=2))
+    return manifest
+
+
+def _check_resume(conf, out_dir: str) -> None:
+    """A finished unit is reused on its part's name alone, so the sampler must not have moved.
+
+    Without this a job killed on its wall clock and resubmitted after a `temperature` edit
+    keeps its finished units and stamps the new settings over all of them -- two regimes in
+    one campaign, and a manifest that names only the second.
+    """
+    path = os.path.join(out_dir, ROLLOUT_MANIFEST)
+    was = json.loads(_read(path)).get("config", {}) if os.path.isfile(path) else {}
+    moved = {k: (was.get(k), getattr(conf, k)) for k in SAMPLE_KNOBS if was.get(k) != getattr(conf, k)}
+    if moved:
+        raise ValueError(
+            f"{out_dir} already holds units generated with {moved} (was, now) -- they would be "
+            "reused as they are and this run's settings recorded for them. Generate into a new "
+            "out_dir, or delete the parts these knobs no longer describe"
+        )
+
+
+def _run_unit(backend, unit, ps, sources: dict, conf, count, out_dir: str, caching) -> None:
+    """One unit, batch by batch, published only when the last batch is back."""
+    from reranker.src.prm.rollout import stage
+
+    counts: Counter = Counter()
+    started = time.time()
+    path = stage.unit_path(out_dir, unit)
+    with stage.open_part(path) as f:
+        for batch in batches(ps, conf.prefixes_per_batch):
+            stage.dump_rollouts(generate(backend, batch, sources, conf, count, counts), f)
+        # Inside the context, so the counters are on disk before the part is renamed into
+        # place: the manifest is rebuilt from them, and a resumed run has no other memory.
+        build.write_atomic(
+            path + UNIT_META,
+            json.dumps(
+                {
+                    "seconds": round(time.time() - started, 1),
+                    "counts": dict(counts),
+                    # With the unit and not with the run: a resume has no engine to ask, and
+                    # the manifest it rewrites would otherwise forget what this one sampled under.
+                    "prefix_caching": caching,
+                }
+            ),
+        )
+    print(f"  {unit}: {counts['rollouts']} rollouts from {counts['prefixes']} prefixes")
+
+
+def _metas(out_dir: str) -> dict[str, dict]:
+    """Each finished unit's counters, keyed by unit -- this campaign's and every earlier one's."""
+    from reranker.src.prm.rollout import stage
+
+    out = {}
+    for part in sorted(glob.glob(os.path.join(out_dir, stage.ROLLOUTS, "*.jsonl.gz"))):
+        unit = os.path.basename(part)[: -len(".jsonl.gz")]
+        meta = part + UNIT_META
+        out[unit] = json.loads(_read(meta)) if os.path.isfile(meta) else {"counts": {}}
+    return out
+
+
+def _job_b_manifest(conf, metas: dict, models: dict, generated: int) -> dict:
+    counts: Counter = Counter()
+    for meta in metas.values():
+        counts.update(meta["counts"])
+    # True only if every unit says so; unknown as soon as one could not be asked. False cannot
+    # appear -- run_rollouts refuses to start on it.
+    seen = [meta.get("prefix_caching") for meta in metas.values()]
+    caching = None if not seen or None in seen else all(seen)
+    dirty = build._git("status", "--porcelain")
+    return {
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "git_sha": build._git("rev-parse", "HEAD"),
+        "git_dirty": None if dirty is None else bool(dirty),
+        "config": dataclasses.asdict(conf),
+        # Which model actually wrote the prefixes: V̂ is only interpretable against it.
+        "gen_models": models,
+        # §6: verified rather than assumed, and recorded so a later run can be compared.
+        "prefix_caching": caching,
+        "units": {
+            unit: {
+                "prefixes": meta["counts"].get("prefixes", 0),
+                "rollouts": meta["counts"].get("rollouts", 0),
+                "seconds": meta.get("seconds"),
+                "prefix_caching": meta.get("prefix_caching"),
+            }
+            for unit, meta in metas.items()
+        },
+        "units_generated": generated,
+        "units_reused": len(metas) - generated,
+        "prefixes": counts["prefixes"],
+        "rollouts": counts["rollouts"],
+        # prose_cut_past_seam and prefix_no_budget among them: "counted, not silent" only
+        # holds once something writes them down.
+        "counts": dict(sorted(counts.items())),
+    }
+
+
+def _backend(conf):
+    """vLLM with the source run's own model kwargs -- the regime the prefixes came from."""
+    from kernel_gen.core.backend import VLLMBackend
+
+    return VLLMBackend(
+        conf.gen_model, max_model_len=conf.max_model_len, max_num_seqs=conf.max_num_seqs
+    )
+
+
+def main(argv=None) -> None:
+    manifest = run_rollouts(load_config(None if argv is None else list(argv)))
+    print(
+        f"Rollouts: {manifest['rollouts']} from {manifest['prefixes']} prefixes over "
+        f"{manifest['units_generated']} units ({manifest['units_reused']} already done)"
+    )
+    print(f"  prefix_caching {manifest['prefix_caching']}   counts {manifest['counts']}")
+
+
 def _v1_dir(parts_glob: str) -> str:
     return os.path.dirname(os.path.dirname(parts_glob))
 
@@ -332,3 +629,7 @@ def _v1_dir(parts_glob: str) -> str:
 def _read(path: str) -> str:
     with open(path) as f:
         return f.read()
+
+
+if __name__ == "__main__":
+    main()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import glob
 import json
+import os
 
 import pytest
 import yaml
@@ -306,6 +307,28 @@ def test_rollout_rows_survive_the_round_trip_through_the_gzipped_part(tmp_path):
     path = str(tmp_path / "u.jsonl.gz")
     stage.write_rollouts(rows, path)
     assert stage.read_rollouts(path) == rows
+
+
+def test_a_part_written_in_several_batches_reads_back_as_one_unit(tmp_path):
+    # Job B slices a unit into batches and appends each as it returns, rather than holding a
+    # whole unit's rollouts in memory until the last one lands.
+    rows = assigned({1: 4})
+    path = str(tmp_path / "u.jsonl.gz")
+    with stage.open_part(path) as f:
+        stage.dump_rollouts(rows[:2], f)
+        stage.dump_rollouts(rows[2:], f)
+    assert stage.read_rollouts(path) == rows
+
+
+def test_a_unit_that_died_mid_generation_leaves_no_part_a_rerun_would_skip(tmp_path):
+    # The whole of §9's idempotence: a rerun is free because a *finished* unit is skipped, and
+    # a unit interrupted after two batches of ten must not look finished.
+    path = str(tmp_path / "u.jsonl.gz")
+    with pytest.raises(RuntimeError):
+        with stage.open_part(path) as f:
+            stage.dump_rollouts(assigned({1: 1}), f)
+            raise RuntimeError("the GPU went away")
+    assert not os.path.exists(path)
 
 
 def test_the_part_is_written_by_rename_and_leaves_no_half_file_behind(tmp_path):
