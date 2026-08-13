@@ -145,6 +145,8 @@ def test_a_cut_outside_raw_is_refused_rather_than_clamped():
         rollout.prefix_text(prefix(cut_char=len(RAW) + 1), source())
     with pytest.raises(ValueError, match="cut_char"):
         rollout.prefix_text(prefix(cut_char=-20), source())
+    with pytest.raises(ValueError, match="cut_char"):
+        rollout.prefix_text(prefix(cut_char=-1), source())  # raw[:-1] drops one character
     rollout.prefix_text(prefix(cut_char=len(RAW)), source())  # the ends themselves are fine
     rollout.prefix_text(prefix(cut_char=0), source())
 
