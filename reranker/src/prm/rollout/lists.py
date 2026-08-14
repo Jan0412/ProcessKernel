@@ -208,6 +208,17 @@ def read_values(path: str) -> list:
         return [values.Value(**json.loads(line)) for line in f]
 
 
+def read_lists(path: str) -> list[ListRow]:
+    """``lists_{split}.jsonl`` -> rows, items rebuilt as `Item` rather than dicts.
+
+    Here beside the writer rather than in a reader: job E and the stats report both read this
+    file back, and neither should own the shape the other parses it into.
+    """
+    with open(path) as f:
+        rows = [json.loads(line) for line in f]
+    return [ListRow(**{**r, "items": [Item(**i) for i in r["items"]]}) for r in rows]
+
+
 def main(argv=None) -> None:
     manifest = build_lists(load_config(None if argv is None else list(argv)))
     fired = {r: n for r, n in manifest["dropped"].items() if n}

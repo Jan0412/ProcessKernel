@@ -109,6 +109,30 @@ def in_window(prefix: Prefix, cfg: PRMRolloutConfig) -> bool:
     return cfg.min_rel_depth <= prefix.rel_depth <= cfg.max_rel_depth
 
 
+def bucket_edges(cfg) -> list[float]:
+    """``depth_buckets`` equal-width bands over the campaign's own depth window.
+
+    Rounded, because these are also the labels the report prints and a band opening at
+    0.30000000000000004 is noise; the shift is below 1e-6 and cannot move a list.
+
+    Here rather than in rank_eval.py or stats.py because both slice by these bands and §6
+    requires them to be the same bands -- and because this module already owns the window
+    they cut up. rank_eval imports it, which costs stats.py no torch.
+    """
+    span = (cfg.max_rel_depth - cfg.min_rel_depth) / cfg.depth_buckets
+    return [round(cfg.min_rel_depth + i * span, 6) for i in range(cfg.depth_buckets + 1)]
+
+
+def bucket_of(rel_depth: float, edges: list[float]) -> int:
+    """Which band a depth falls in -- half-open, except the top band, which is closed.
+
+    Clamped at both ends so *every* item is assigned. A depth outside the window means the
+    report's knobs have moved since job A enumerated, which the callers count rather than
+    absorb: an unassigned item would be a metric silently computed over a subset.
+    """
+    return min(max(bisect.bisect_right(edges, rel_depth) - 1, 0), len(edges) - 2)
+
+
 def depth_indices(group: list[dict], cfg: PRMRolloutConfig, rng: random.Random) -> list[int]:
     """The cut depths this group is cut at -- one shared ``k`` per list, so N4 holds.
 
@@ -452,12 +476,13 @@ def depth_histogram(out: Iterable[Prefix], cfg: PRMRolloutConfig) -> dict[str, i
     prefixes have tiny true gaps and maximal estimator noise, deep ones the reverse, and a
     single averaged metric hides both.
     """
-    lo, hi, n = cfg.min_rel_depth, cfg.max_rel_depth, cfg.depth_buckets
-    edges = [lo + (hi - lo) * i / n for i in range(n + 1)]
+    edges = bucket_edges(cfg)
     hist: Counter = Counter()
     for p in out:
-        hist[min(n - 1, max(0, int((p.rel_depth - lo) / (hi - lo) * n)))] += 1
-    return {f"{edges[i]:.2f}-{edges[i + 1]:.2f}": hist[i] for i in range(n)}
+        hist[bucket_of(p.rel_depth, edges)] += 1
+    return {
+        f"{edges[i]:.2f}-{edges[i + 1]:.2f}": hist[i] for i in range(cfg.depth_buckets)
+    }
 
 
 def main(argv: Iterable[str] | None = None) -> None:

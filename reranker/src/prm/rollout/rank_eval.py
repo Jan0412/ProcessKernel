@@ -15,7 +15,6 @@ true gaps and maximal estimator noise, deep ones the reverse, and one mean hides
 from __future__ import annotations
 
 import argparse
-import bisect
 import dataclasses
 import glob
 import json
@@ -35,7 +34,11 @@ from reranker.src.dataset import pad_sequences
 from reranker.src.listwise.trainer import _graded_ndcg
 from reranker.src.prm.build import write_atomic
 from reranker.src.prm.rollout import encoding, lists, prefixes, rollout, stage
-from reranker.src.prm.rollout.prefixes import VAL
+# Re-exported, not redefined: stats.py slices by the same bands and reads the same files, and
+# must not import torch to do either -- so the bands live in prefixes.py, which already owns
+# the depth window, and the reader beside the writer in lists.py (§6).
+from reranker.src.prm.rollout.lists import read_lists
+from reranker.src.prm.rollout.prefixes import VAL, bucket_edges, bucket_of
 
 REPORT = "rank_eval_report.json"
 
@@ -47,26 +50,6 @@ class ListResult:
     ndcg: float
     pairs_correct: int
     pairs_total: int
-
-
-def bucket_edges(cfg) -> list[float]:
-    """``depth_buckets`` equal-width bands over the campaign's own depth window.
-
-    Rounded, because these are also the labels the report prints and a band opening at
-    0.30000000000000004 is noise; the shift is below 1e-6 and cannot move a list.
-    """
-    span = (cfg.max_rel_depth - cfg.min_rel_depth) / cfg.depth_buckets
-    return [round(cfg.min_rel_depth + i * span, 6) for i in range(cfg.depth_buckets + 1)]
-
-
-def bucket_of(rel_depth: float, edges: list[float]) -> int:
-    """Which band a list falls in -- half-open, except the top band, which is closed.
-
-    Clamped at both ends so *every* list is assigned. A depth outside the window means the
-    report's knobs have moved since job A enumerated, which `report` counts rather than
-    absorbs: an unassigned list would be a metric silently computed over a subset.
-    """
-    return min(max(bisect.bisect_right(edges, rel_depth) - 1, 0), len(edges) - 2)
 
 
 def list_metrics(scores: list[float], rels: list[float]) -> ListResult:
@@ -160,15 +143,6 @@ def _ndcg(results: list[ListResult]) -> float | None:
 
 
 # --- the pass: val lists + a checkpoint -> the ranking report -----------------------------
-
-
-def read_lists(path: str) -> list[lists.ListRow]:
-    """``lists_{split}.jsonl`` -> rows, items rebuilt as `lists.Item` rather than dicts."""
-    with open(path) as f:
-        rows = [json.loads(line) for line in f]
-    return [
-        lists.ListRow(**{**r, "items": [lists.Item(**i) for i in r["items"]]}) for r in rows
-    ]
 
 
 def sources_for(rollout_cfg, prefix_rows) -> dict[str, rollout.Source]:
