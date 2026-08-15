@@ -53,6 +53,56 @@ def test_an_override_is_coerced_to_the_type_it_looks_like(tmp_path, override, ex
     assert getattr(getattr(cfg, section), leaf) == expected
 
 
+def based(tmp_path, base_text: str, text: str) -> str:
+    (tmp_path / "base.yaml").write_text(base_text)
+    return written(tmp_path, "_base: base.yaml\n" + text)
+
+
+def test_a_base_supplies_what_the_config_leaves_out(tmp_path):
+    cfg = load_config(["--config", based(tmp_path, "train:\n  epochs: 9\n", "train:\n  lr: 0.5\n")])
+    assert (cfg.train.epochs, cfg.train.lr) == (9, 0.5)
+
+
+def test_a_config_wins_over_its_base_key_by_key(tmp_path):
+    text = "train:\n  epochs: 1\n"
+    cfg = load_config(["--config", based(tmp_path, "train:\n  epochs: 9\n  seed: 7\n", text)])
+    assert (cfg.train.epochs, cfg.train.seed) == (1, 7)
+
+
+def test_a_list_replaces_rather_than_extends_the_base_one(tmp_path):
+    # run_dirs is the reason: a single-run variant must not inherit the other run.
+    base = "data:\n  run_dirs: [a, b]\n"
+    cfg = load_config(["--config", based(tmp_path, base, "data:\n  run_dirs: [c]\n")])
+    assert cfg.data.run_dirs == ["c"]
+
+
+def test_a_base_is_resolved_next_to_the_file_that_names_it(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "base.yaml").write_text("train:\n  epochs: 9\n")
+    leaf = tmp_path / "sub" / "leaf.yaml"
+    leaf.write_text("_base: base.yaml\n")
+    assert load_config(["--config", str(leaf)]).train.epochs == 9
+
+
+def test_a_base_may_itself_have_a_base(tmp_path):
+    (tmp_path / "a.yaml").write_text("train:\n  epochs: 9\n  seed: 7\n")
+    (tmp_path / "b.yaml").write_text("_base: a.yaml\ntrain:\n  seed: 8\n")
+    cfg = load_config(["--config", based(tmp_path, "_base: b.yaml\n", "train:\n  lr: 0.5\n")])
+    assert (cfg.train.epochs, cfg.train.seed, cfg.train.lr) == (9, 8, 0.5)
+
+
+def test_a_base_cycle_raises_instead_of_recursing_forever(tmp_path):
+    (tmp_path / "a.yaml").write_text("_base: c.yaml\n")
+    (tmp_path / "c.yaml").write_text("_base: a.yaml\n")
+    with pytest.raises(ValueError, match="_base cycle"):
+        load_config(["--config", str(tmp_path / "a.yaml")])
+
+
+def test_an_override_beats_the_base_and_the_config(tmp_path):
+    path = based(tmp_path, "train:\n  epochs: 9\n", "train:\n  epochs: 1\n")
+    assert load_config(["--config", path, "train.epochs=3"]).train.epochs == 3
+
+
 def test_an_override_of_a_key_that_does_not_exist_raises(tmp_path):
     with pytest.raises(KeyError, match="train.epocs"):
         load_config(["--config", written(tmp_path, ""), "train.epocs=1"])
