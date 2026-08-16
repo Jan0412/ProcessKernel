@@ -13,13 +13,14 @@ from kernel_gen.core.text import extract_code_block
 from reranker.src.config import _resolve, load_config
 from reranker.src.encoding import SequenceEncoder
 from reranker.src.prm import build
-from reranker.src.prm.rollout import prefixes as prefixes_mod, stage
+from reranker.src.prm.rollout import prefixes as prefixes_mod, rollout as rollout_mod, stage
 
 # A directory, not a single file, despite the name: one part per job-B unit plus
 # `_anchors.jsonl`, so a killed job resumes by skipping whatever already landed. Task 4
 # and Task 6 glob os.path.join(out_dir, ORM_SCORES, "*.jsonl") to read every part.
 ORM_SCORES = "orm_scores.jsonl"
 ANCHORS_UNIT = "_anchors"
+SCORE_META = ".meta"   # sidecar beside a score part -- mirrors rollout.py's UNIT_META
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,31 +132,53 @@ def _kernelbench_dir(cfg) -> str:
     return os.path.join(_resolve(cfg.data.kernelbench_dir), "KernelBench")
 
 
-# Set once in main() from the checkpoint's model.safetensors; score_items reads it as a
-# global so its own signature stays (items, scorer, encoder, kb_dir, batch_size).
-_CKPT_SHA: str | None = None
+def score_items(items, scorer, encoder, kb_dir, batch_size, ckpt_sha: str) -> Iterator[OrmScore]:
+    """Dedup by (level, problem_id, code_sha1) -- code_sha1 ALONE is not a safe key:
+    extract_code_block returns "" for any rollout with no code fence, so every empty body
+    in the campaign would collide onto one sha and inherit whichever problem's reference
+    happened to be scored first. stage.py's own staging dedup keys on this same triple for
+    the identical reason. One forward pass per unique (level, problem_id, code_sha1);
+    every item still gets its own output row.
 
-
-def score_items(items, scorer, encoder, kb_dir, batch_size) -> Iterator[OrmScore]:
-    """Dedup by code_sha1, encode with the ORM's own format, one forward pass per kernel."""
+    `ckpt_sha` is required, not defaulted: a caller that forgets it gets a TypeError at
+    the call site, not a silent `orm_checkpoint_sha: null` on 1.1M written rows.
+    """
     items = list(items)
-    first: dict[str, Item] = {}
+    first: dict[tuple, Item] = {}
     for it in items:
-        first.setdefault(it.code_sha1, it)
+        first.setdefault((it.level, it.problem_id, it.code_sha1), it)
     uniq = list(first.values())
-    scores: dict[str, float] = {}
+    scores: dict[tuple, float] = {}
     for i in range(0, len(uniq), batch_size):
         chunk = uniq[i:i + batch_size]
         encoded = [encoder.encode(_ref_src(kb_dir, c.level, c.problem_id), c.code) for c in chunk]
         for c, e, s in zip(chunk, encoded, scorer(encoded)):
-            scores[c.code_sha1] = s
-            first[c.code_sha1] = dataclasses.replace(c, n_code_tokens=len(e))
+            key = (c.level, c.problem_id, c.code_sha1)
+            scores[key] = s
+            first[key] = dataclasses.replace(c, n_code_tokens=len(e))
     for it in items:
+        key = (it.level, it.problem_id, it.code_sha1)
         yield OrmScore(it.kind, it.id, it.level, it.problem_id, it.code_sha1,
-                       scores[it.code_sha1], _CKPT_SHA, first[it.code_sha1].n_code_tokens)
+                       scores[key], ckpt_sha, first[key].n_code_tokens)
 
 
 # --- the one part that needs a GPU --------------------------------------------------------
+
+
+def _pad_right(encoded: list[list[int]], pad_id: int) -> tuple[list[list[int]], list[list[int]]]:
+    """Right-padded ids and attention mask.
+
+    Matches how the checkpoint was trained (dataset.py's `pad_sequences`, used by
+    `RerankerCollator`) and is batch-invariant: measured on 96 real anchors under 3
+    reshuffled batchings, right-padding scored bit-identically (max|delta| 0.0) while
+    left-padding drifted up to 0.293 logit. The seq-cls head pools the last non-pad token
+    either way (HF locates it off `input_ids != pad_token_id`), so this side is the one
+    that has to match training, and training was right-padded.
+    """
+    n = max(len(x) for x in encoded)
+    ids = [list(x) + [pad_id] * (n - len(x)) for x in encoded]
+    att = [[1] * len(x) + [0] * (n - len(x)) for x in encoded]
+    return ids, att
 
 
 def load_scorer(cfg):
@@ -176,13 +199,11 @@ def load_scorer(cfg):
     pad = tok.pad_token_id or 0
 
     def scorer(encoded):
-        # Left-padded: the seq-cls head scores the last non-pad token, so right-padding
-        # would read a pad token there and score garbage (verified against the checkpoint).
-        n = max(len(x) for x in encoded)
-        ids = torch.tensor([[pad] * (n - len(x)) + list(x) for x in encoded]).cuda()
-        att = torch.tensor([[0] * (n - len(x)) + [1] * len(x) for x in encoded]).cuda()
+        ids, att = _pad_right(encoded, pad)
         with torch.no_grad():
-            return model(input_ids=ids, attention_mask=att).logits[:, 0].float().cpu().tolist()
+            return model(
+                input_ids=torch.tensor(ids).cuda(), attention_mask=torch.tensor(att).cuda()
+            ).logits[:, 0].float().cpu().tolist()
 
     return scorer, SequenceEncoder(tok, cfg.orm_max_length, cfg.orm_reserve_ref_tokens)
 
@@ -191,48 +212,103 @@ def load_scorer(cfg):
 
 
 def rollout_units(out_dir: str) -> list[str]:
-    """Job-B units that have landed on disk, sorted -- the array-task index space here.
+    """The campaign's full unit index space, off prefixes.jsonl -- stable no matter how many
+    job-B units have actually landed at call time.
 
-    Off disk, not off prefixes.jsonl: job B can still be producing units while this job
-    runs, and a unit not yet generated has nothing to score.
+    Not a glob of disk: job B is still producing units while this job runs, a QoS cap runs
+    a big array in waves, and a later wave's glob would see a longer, re-sorted list and
+    index onto different units than an earlier wave did (duplicated GPU work, missed
+    units). Mirrors rollout.py's own `unit_names()`, which draws its index space from the
+    same file for the same reason.
     """
-    parts = sorted(glob.glob(os.path.join(out_dir, stage.ROLLOUTS, "*.jsonl.gz")))
-    return [os.path.basename(p)[: -len(".jsonl.gz")] for p in parts]
+    prefix_rows = stage.read_prefixes(os.path.join(out_dir, prefixes_mod.PREFIXES))
+    return sorted(rollout_mod.units(prefix_rows))
+
+
+def _unit_ready(out_dir: str, unit: str) -> bool:
+    """Has job B actually landed this unit's part yet? Checked by exact final path, so a
+    mid-write `.tmp.<host>.<pid>` file (stage.open_part) is never mistaken for a landed one.
+    """
+    return os.path.isfile(stage.unit_path(out_dir, unit))
 
 
 def unit_score_path(out_dir: str, unit: str) -> str:
     return os.path.join(out_dir, ORM_SCORES, f"{unit}.jsonl")
 
 
-def _write_scores(path: str, scores) -> None:
+def _is_fresh(out_path: str, source_sha1: str) -> bool:
+    """Has this part already been scored from exactly this source? False on any doubt:
+    missing part, missing sidecar, zero rows, or a source_sha1 that no longer matches.
+    """
+    meta_path = out_path + SCORE_META
+    if not os.path.isfile(out_path) or not os.path.isfile(meta_path):
+        return False
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return meta.get("rows", 0) > 0 and meta.get("source_sha1") == source_sha1
+
+
+def _write_scores(path: str, scores, source_sha1: str) -> bool:
+    """The part plus its resume sidecar. Writes nothing and returns False if `scores` is
+    empty: an empty part would satisfy a bare `os.path.exists` forever, sealing resume on
+    a misconfigured run_tags/anchor_rounds with Task 4 fitting a curve on nothing.
+    """
+    rows = list(scores)
+    if not rows:
+        return False
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    build.write_atomic(path, "".join(json.dumps(dataclasses.asdict(s)) + "\n" for s in scores))
+    build.write_atomic(path, "".join(json.dumps(dataclasses.asdict(s)) + "\n" for s in rows))
+    build.write_atomic(
+        path + SCORE_META, json.dumps({"rows": len(rows), "source_sha1": source_sha1})
+    )
+    return True
 
 
-def score_unit(conf, unit: str, scorer, encoder, kb: str) -> str:
-    """This unit's rollouts -> its part under ORM_SCORES. Skips if already scored (resume)."""
+def score_unit(conf, unit: str, scorer, encoder, kb: str, ckpt_sha: str) -> str | None:
+    """This unit's rollouts -> its part under ORM_SCORES.
+
+    Resumed off the job-B unit's own `.meta` sidecar content, not bare existence of the
+    score part: a regenerated unit samples fresh at T=0.6 (rollout.py) and gets a new
+    sidecar, so its old score would otherwise reference rollout_ids that no longer exist.
+    Returns None (writes nothing) if the unit has no rollouts to score.
+    """
     out_dir = _resolve(conf.out_dir)
     out_path = unit_score_path(out_dir, unit)
-    if os.path.exists(out_path):
+    unit_meta = stage.unit_path(out_dir, unit) + rollout_mod.UNIT_META
+    if not os.path.isfile(unit_meta):
+        raise FileNotFoundError(
+            f"{unit} has a rollout part but no {rollout_mod.UNIT_META} sidecar -- job B "
+            "always writes one when a unit finishes cleanly (stage.open_part)"
+        )
+    source_sha1 = build._sha1(unit_meta)
+    if _is_fresh(out_path, source_sha1):
         return out_path
     prefix_rows = stage.read_prefixes(os.path.join(out_dir, prefixes_mod.PREFIXES))
     where = stage.homes(prefix_rows)
     rows = (dataclasses.asdict(r) for r in stage.read_rollouts(stage.unit_path(out_dir, unit)))
     items = iter_rollout_items_from_rows(rows, where)
-    scores = score_items(items, scorer, encoder, kb, conf.orm_batch_size)
-    _write_scores(out_path, scores)
-    return out_path
+    scores = score_items(items, scorer, encoder, kb, conf.orm_batch_size, ckpt_sha)
+    return out_path if _write_scores(out_path, scores, source_sha1) else None
 
 
-def score_anchors(cfg, scorer, encoder, kb: str) -> str | None:
-    """Every anchor -> its own part under ORM_SCORES. None if anchors are off or already done."""
+def score_anchors(cfg, scorer, encoder, kb: str, ckpt_sha: str) -> str | None:
+    """Every anchor -> its own part under ORM_SCORES.
+
+    Resumed off a hash of (run_tags, anchor_rounds), not bare existence: changing either
+    knob changes which v1 rows are anchors, so the old part must not be silently reused.
+    Returns None if anchors are off, or if the current selection scores zero rows.
+    """
     conf = cfg.prm_rollout
-    out_path = unit_score_path(_resolve(conf.out_dir), ANCHORS_UNIT)
-    if not conf.use_anchors or os.path.exists(out_path):
+    if not conf.use_anchors:
         return None
-    scores = score_items(iter_anchor_items(cfg), scorer, encoder, kb, conf.orm_batch_size)
-    _write_scores(out_path, scores)
-    return out_path
+    out_path = unit_score_path(_resolve(conf.out_dir), ANCHORS_UNIT)
+    source_sha1 = build._text_sha1(json.dumps(
+        {"run_tags": conf.run_tags, "anchor_rounds": sorted(conf.anchor_rounds)}, sort_keys=True
+    ))
+    if _is_fresh(out_path, source_sha1):
+        return out_path
+    scores = score_items(iter_anchor_items(cfg), scorer, encoder, kb, conf.orm_batch_size, ckpt_sha)
+    return out_path if _write_scores(out_path, scores, source_sha1) else None
 
 
 def main(argv=None) -> None:
@@ -255,29 +331,33 @@ def main(argv=None) -> None:
             f"{conf.label_source!r}"
         )
 
-    global _CKPT_SHA
-    _CKPT_SHA = build._sha1(os.path.join(conf.orm_checkpoint, "model.safetensors"))
+    ckpt_sha = build._sha1(os.path.join(conf.orm_checkpoint, "model.safetensors"))
     scorer, encoder = load_scorer(conf)
     kb = _kernelbench_dir(cfg)
     out_dir = _resolve(conf.out_dir)
 
     if anchors_only:
-        path = score_anchors(cfg, scorer, encoder, kb)
-        print(f"anchors -> {path or 'already scored'}")
+        path = score_anchors(cfg, scorer, encoder, kb, ckpt_sha)
+        print(f"anchors -> {path or 'empty, not written'}")
         return
 
     units = rollout_units(out_dir)
     task = os.environ.get("SLURM_ARRAY_TASK_ID")
     if task is None:
         for u in units:
-            score_unit(conf, u, scorer, encoder, kb)
+            if _unit_ready(out_dir, u):
+                score_unit(conf, u, scorer, encoder, kb, ckpt_sha)
         return
     idx = int(task)
     if idx >= len(units):
-        print(f"task {task}: only {len(units)} rollout units, nothing to do")
+        print(f"task {task}: only {len(units)} campaign units, nothing to do")
         return
-    path = score_unit(conf, units[idx], scorer, encoder, kb)
-    print(f"task {task}: unit {units[idx]} -> {path}")
+    unit = units[idx]
+    if not _unit_ready(out_dir, unit):
+        print(f"task {task}: unit {unit} has no rollout part yet, nothing to do")
+        return
+    path = score_unit(conf, unit, scorer, encoder, kb, ckpt_sha)
+    print(f"task {task}: unit {unit} -> {path or 'empty, not written'}")
 
 
 if __name__ == "__main__":
