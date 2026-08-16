@@ -276,10 +276,11 @@ def score_unit(conf, unit: str, scorer, encoder, kb: str, ckpt_sha: str) -> str 
     out_path = unit_score_path(out_dir, unit)
     unit_meta = stage.unit_path(out_dir, unit) + rollout_mod.UNIT_META
     if not os.path.isfile(unit_meta):
-        raise FileNotFoundError(
-            f"{unit} has a rollout part but no {rollout_mod.UNIT_META} sidecar -- job B "
-            "always writes one when a unit finishes cleanly (stage.open_part)"
-        )
+        # Degrades rather than raising, mirroring rollout.py's own _metas(): a landed part
+        # with no sidecar (job B always writes one, so this means something else copied a
+        # part in without it) must not take down the whole array task over one unit.
+        print(f"{unit}: no {rollout_mod.UNIT_META} sidecar, skipping (cannot verify freshness)")
+        return None
     source_sha1 = build._sha1(unit_meta)
     if _is_fresh(out_path, source_sha1):
         return out_path
@@ -330,34 +331,46 @@ def main(argv=None) -> None:
             f"orm_score scores against an ORM only under label_source=imputed, got "
             f"{conf.label_source!r}"
         )
+    out_dir = _resolve(conf.out_dir)
+
+    # Readiness is decided BEFORE the model ever loads. Job B is still landing units, the
+    # QoS caps this account at 16 GPUs across every job, and a task with nothing to do must
+    # not spend one of them loading the ORM only to immediately exit.
+    unit, units = None, None
+    if not anchors_only:
+        units = rollout_units(out_dir)
+        task = os.environ.get("SLURM_ARRAY_TASK_ID")
+        if task is not None:
+            idx = int(task)
+            if idx >= len(units):
+                print(f"task {task}: only {len(units)} campaign units, nothing to do")
+                return
+            unit = units[idx]
+            if not _unit_ready(out_dir, unit):
+                print(f"task {task}: unit {unit} has no rollout part yet, nothing to do")
+                return
+        elif not any(_unit_ready(out_dir, u) for u in units):
+            print("no rollout units are ready yet, nothing to do")
+            return
 
     ckpt_sha = build._sha1(os.path.join(conf.orm_checkpoint, "model.safetensors"))
     scorer, encoder = load_scorer(conf)
     kb = _kernelbench_dir(cfg)
-    out_dir = _resolve(conf.out_dir)
 
     if anchors_only:
         path = score_anchors(cfg, scorer, encoder, kb, ckpt_sha)
         print(f"anchors -> {path or 'empty, not written'}")
         return
 
-    units = rollout_units(out_dir)
-    task = os.environ.get("SLURM_ARRAY_TASK_ID")
-    if task is None:
-        for u in units:
-            if _unit_ready(out_dir, u):
-                score_unit(conf, u, scorer, encoder, kb, ckpt_sha)
+    if unit is not None:
+        path = score_unit(conf, unit, scorer, encoder, kb, ckpt_sha)
+        print(f"task {os.environ['SLURM_ARRAY_TASK_ID']}: unit {unit} -> "
+              f"{path or 'empty, not written'}")
         return
-    idx = int(task)
-    if idx >= len(units):
-        print(f"task {task}: only {len(units)} campaign units, nothing to do")
-        return
-    unit = units[idx]
-    if not _unit_ready(out_dir, unit):
-        print(f"task {task}: unit {unit} has no rollout part yet, nothing to do")
-        return
-    path = score_unit(conf, unit, scorer, encoder, kb, ckpt_sha)
-    print(f"task {task}: unit {unit} -> {path or 'empty, not written'}")
+
+    for u in units:
+        if _unit_ready(out_dir, u):
+            score_unit(conf, u, scorer, encoder, kb, ckpt_sha)
 
 
 if __name__ == "__main__":

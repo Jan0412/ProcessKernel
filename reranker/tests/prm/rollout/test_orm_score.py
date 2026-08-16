@@ -255,10 +255,15 @@ def test_array_index_space_is_stable_as_job_b_lands_more_units(tmp_path):
     assert after == before   # same index space -- unaffected by what has landed since
 
 
+def _ids_in(path) -> set:
+    with open(path) as f:
+        return {json.loads(line)["id"] for line in f}
+
+
 def test_resume_is_a_noop_and_regeneration_forces_rescore(tmp_path):
     """Finding 4: a second score_unit call does no new scoring; a job-B unit regenerated
     (new .meta sidecar, T=0.6 makes new kernels -- rollout.py) IS re-scored, not silently
-    reused."""
+    reused -- and the part's CONTENTS actually change, not just the call count."""
     out_dir = str(tmp_path)
     p = _prefix(prefix_id="p1", run_name="a", shard="shard_00", round=0, problem_id=37)
     _write_prefix_file(out_dir, [p])
@@ -273,15 +278,49 @@ def test_resume_is_a_noop_and_regeneration_forces_rescore(tmp_path):
 
     path1 = orm_score.score_unit(conf, unit, scorer, _enc(), kb, "ckpt")
     assert scorer.calls == 1
+    assert _ids_in(path1) == {"p1__j00"}
     path2 = orm_score.score_unit(conf, unit, scorer, _enc(), kb, "ckpt")
     assert path2 == path1 and scorer.calls == 1   # no-op: resumed, not rescored
 
-    # Job B regenerates the unit: a new kernel, a new sidecar.
-    stage.write_rollouts([_roll("p1__j00", "p1", code="V2", sha="v2sha")], part)
+    # Job B regenerates the unit: a DIFFERENT set of rollouts (new sample at j01 too), new
+    # sidecar. Not just new code under the old id -- the part's rollout ids themselves change.
+    stage.write_rollouts(
+        [_roll("p1__j00", "p1", code="V2", sha="v2sha"),
+         _roll("p1__j01", "p1", code="V3", sha="v3sha")],
+        part,
+    )
     build.write_atomic(part + rollout_mod.UNIT_META, json.dumps({"seconds": 2}))
 
-    orm_score.score_unit(conf, unit, scorer, _enc(), kb, "ckpt")
-    assert scorer.calls == 2   # rescored, not skipped
+    path3 = orm_score.score_unit(conf, unit, scorer, _enc(), kb, "ckpt")
+    assert scorer.calls == 3   # rescored (1 from before + 2 newly-encoded items), not skipped
+    assert _ids_in(path3) == {"p1__j00", "p1__j01"}   # the part's contents actually replaced
+
+
+def test_unit_ready_is_true_once_the_final_part_has_landed(tmp_path):
+    """The True branch of _unit_ready, not just the False one: an _unit_ready that always
+    returns False would pass every other test here while silently scoring nothing."""
+    out_dir = str(tmp_path)
+    p = _prefix(prefix_id="p1", run_name="a", shard="shard_00", round=0)
+    unit = rollout_mod.unit_name(p)
+    assert orm_score._unit_ready(out_dir, unit) is False   # nothing written yet
+
+    stage.write_rollouts([_roll("p1__j00", "p1")], stage.unit_path(out_dir, unit))
+    assert orm_score._unit_ready(out_dir, unit) is True
+
+
+def test_missing_unit_meta_sidecar_is_skipped_not_fatal(tmp_path):
+    """Minor 3: a landed part with no .meta sidecar must not take down the whole array
+    task -- rollout.py's own _metas() tolerates exactly this the same way."""
+    out_dir = str(tmp_path)
+    p = _prefix(prefix_id="p1", run_name="a", shard="shard_00", round=0)
+    _write_prefix_file(out_dir, [p])
+    unit = rollout_mod.unit_name(p)
+    stage.write_rollouts([_roll("p1__j00", "p1")], stage.unit_path(out_dir, unit))
+    # no .meta sidecar written
+
+    conf = _rollout_conf(out_dir)
+    result = orm_score.score_unit(conf, unit, StubScorer(), _enc(), _kb(tmp_path), "ckpt")
+    assert result is None
 
 
 def test_empty_anchors_part_does_not_seal_resume(tmp_path):
@@ -338,3 +377,80 @@ def test_score_anchors_reruns_when_run_tags_change(tmp_path):
     cfg.prm_rollout.run_tags = {"run2": "tag"}   # different selection, same part path
     orm_score.score_anchors(cfg, scorer, _enc(), _kb(tmp_path), "ckpt")
     assert scorer.calls == 2   # rescored, not skipped as "already done"
+
+
+def test_score_anchors_is_a_noop_when_config_is_unchanged(tmp_path):
+    """The other half of finding 4/review-round-2: an UNCHANGED run_tags/anchor_rounds
+    must be a no-op on the second call, not just a changed one forcing a rescore."""
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
+    (parts_dir / "part.jsonl").write_text(json.dumps(
+        {"run_name": "run", "shard": "shard_00", "round": 0, "level": 6, "problem_id": 37,
+         "sample_id": 0, "stem": "s0", "raw": "```python\nA\n```"}) + "\n")
+
+    cfg = RerankerConfig()
+    cfg.prm_rollout.out_dir = str(tmp_path)
+    cfg.prm_rollout.parts_glob = str(parts_dir / "*.jsonl")
+    cfg.prm_rollout.run_tags = {"run": "tag"}
+    cfg.prm_rollout.anchor_rounds = [0]
+    cfg.prm_rollout.use_anchors = True
+
+    scorer = StubScorer()
+    path1 = orm_score.score_anchors(cfg, scorer, _enc(), _kb(tmp_path), "ckpt")
+    assert scorer.calls == 1
+
+    path2 = orm_score.score_anchors(cfg, scorer, _enc(), _kb(tmp_path), "ckpt")
+    assert path2 == path1
+    assert scorer.calls == 1   # unchanged config -- no-op, not rescored
+
+
+# --- main(): the array-task GPU-load ordering, end to end --------------------------------
+
+
+def test_main_selects_unit_writes_its_part_and_skips_gpu_when_not_ready(tmp_path, monkeypatch):
+    """Important 1/2: main() must pick the right unit for SLURM_ARRAY_TASK_ID, actually
+    write that unit's part -- and, for a task whose unit has not landed, must return
+    without ever calling load_scorer (no GPU load for nothing to do)."""
+    out_dir = str(tmp_path)
+    p1 = _prefix(prefix_id="p1", run_name="a", shard="shard_00", round=0, problem_id=37)
+    p2 = _prefix(prefix_id="p2", run_name="b", shard="shard_00", round=0, problem_id=37)
+    _write_prefix_file(out_dir, [p1, p2])
+    units_sorted = sorted([rollout_mod.unit_name(p1), rollout_mod.unit_name(p2)])
+    landed_prefix = p1 if rollout_mod.unit_name(p1) == units_sorted[0] else p2
+    landed, missing = units_sorted[0], units_sorted[1]
+
+    part = stage.unit_path(out_dir, landed)
+    stage.write_rollouts([_roll(f"{landed_prefix.prefix_id}__j00", landed_prefix.prefix_id)], part)
+    build.write_atomic(part + rollout_mod.UNIT_META, json.dumps({"seconds": 1}))
+
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "model.safetensors").write_bytes(b"fake-checkpoint-bytes")
+
+    conf = _rollout_conf(
+        out_dir, run_tags={"a": "ar", "b": "br"}, orm_checkpoint=str(ckpt_dir),
+        label_source="imputed", baseline_timing_json=__file__,
+    )
+    cfg = RerankerConfig(prm_rollout=conf)
+
+    monkeypatch.setattr(orm_score, "load_config", lambda argv: cfg)
+    monkeypatch.setattr(orm_score, "_kernelbench_dir", lambda cfg: _kb(tmp_path))
+    calls = {"n": 0}
+
+    def fake_load_scorer(c):
+        calls["n"] += 1
+        return StubScorer(), _enc()
+
+    monkeypatch.setattr(orm_score, "load_scorer", fake_load_scorer)
+
+    # Task index -> the LANDED unit: scores it, loads the (fake) model once.
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", str(units_sorted.index(landed)))
+    orm_score.main([])
+    assert calls["n"] == 1
+    assert os.path.exists(orm_score.unit_score_path(out_dir, landed))
+    assert _ids_in(orm_score.unit_score_path(out_dir, landed)) == {f"{landed_prefix.prefix_id}__j00"}
+
+    # Task index -> the unit that has NOT landed: must exit without loading the model again.
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", str(units_sorted.index(missing)))
+    orm_score.main([])
+    assert calls["n"] == 1   # unchanged -- the second call never touched the GPU
