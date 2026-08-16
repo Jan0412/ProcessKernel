@@ -1,0 +1,65 @@
+# PRM rollout campaign over the gpt-oss KernelBench **level 1** run — prm_plan/PLAN_v2.md §7.
+#   python -m reranker.src.prm.rollout.prefixes --config reranker/configs/prm_rollout_l1.yaml
+#   CONFIG=reranker/configs/prm_rollout_l1.yaml sbatch scripts/prm_rollout.sh
+#   python -m reranker.src.prm.rollout.stage --config reranker/configs/prm_rollout_l1.yaml
+#   OUT_DIR=$PWD/reranker/data/prm_rollout_l1 \
+#       sbatch --array=0-$(($(scripts/prm_eval.sh --shards) - 1)) scripts/prm_eval.sh
+#
+# Reads the level-1 v1 build (reranker/configs/prm_l1.yaml), never the level-6 one: the
+# splits a campaign is cut under have to be the ones its own corpus was split with.
+prm_rollout:
+  parts_glob: data/prm_l1/parts/*.jsonl
+  splits_json: data/prm_l1/splits.json
+  baseline_timing_json: /path/to/workdir/KernelBench/results/timing/H100/baseline_time_torch.json
+
+  run_tags:
+    gpt-oss-120b_level1_lintloop_triton_v5_traced: go-l1
+
+  source: cut
+  rounds: [0, 1, 2]
+  depths_per_group: 4
+  min_rel_depth: 0.1
+  max_rel_depth: 0.9
+  min_list_size: 2
+  # 25 samples per problem in this run, so the cap is what actually bounds the budget: at 8
+  # it binds on 502 of 760 lists and the eval comes to ~89 GPU-h. 4 keeps every list and
+  # halves that.
+  max_list_size: 4
+  train_selection: random
+  prm_v1_checkpoint: null
+  select_seed: 42
+
+  K: 5
+  min_rollouts: 3
+  temperature: 0.6
+  think_temperature: 1.0
+  max_new_tokens: 16384
+  gen_model: openai/gpt-oss-120b
+  max_num_seqs: 64
+  max_model_len: 40960
+  prefixes_per_batch: 256
+
+  eval_runs_dir: /path/to/workdir/KernelBench/runs
+  eval_run_name: prm_rollout_l1
+  # 8, not 4: the total eval time is the same either way (the rectangle is set by the
+  # busiest problem, not the partition), but each task then finishes in ~7 h rather than ~22,
+  # with the wall clock at 24.
+  eval_shards: 8
+  num_correct_trials: 5
+  num_perf_trials: 100
+  eval_timeout: 300
+  dedup_by_code_sha1: true
+
+  label_mode: graded
+  speedup_stat: min
+  speedup_lo: 0.2
+  speedup_hi: 4.0
+  # Matches prm_l1.yaml: v1's labels and v2's V-hat have to sit on one relevance scale.
+  speed_quant: 0.0
+
+  base_model: Qwen/Qwen3-Reranker-4B
+  max_length: 16384
+  depth_buckets: 4
+
+  out_dir: data/prm_rollout_l1
+  num_workers: 8
