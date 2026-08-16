@@ -236,3 +236,41 @@ def test_the_permissive_ends_of_those_ranges_are_legal():
     rollout(min_rel_depth=0.0, max_rel_depth=0.999, min_list_size=2, max_list_size=2).validate()
     rollout(depths_per_group=1, K=1, min_rollouts=1, num_workers=1, eval_shards=1).validate()
     rollout(prefixes_per_batch=1).validate()
+
+
+# --- v3: ORM-imputed labelling -------------------------------------------------------
+
+
+def _cfg(**kw):
+    c = PRMRolloutConfig()
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def test_v3_defaults_match_the_orm_checkpoint():
+    c = PRMRolloutConfig()
+    assert c.label_source == "measured"          # v2 behaviour is the default
+    assert c.orm_max_length == 6144              # listwise_base.yaml, not PLAN_v3's 4096
+    assert c.orm_reserve_ref_tokens == 1024
+    assert c.calib_speed_quant == 0.0            # what the ORM trained under
+    assert c.curve_bins == 40 and c.curve_iters == 3
+    assert c.offset_kappa == "auto" and c.offset_clamp == 4.0
+    assert c.use_anchors is True
+    assert c.anchor_rounds == [0]
+
+
+def test_imputed_requires_a_checkpoint():
+    with pytest.raises(ValueError, match="orm_checkpoint"):
+        _cfg(label_source="imputed", orm_checkpoint=None).validate()
+
+
+def test_label_source_is_closed():
+    with pytest.raises(ValueError, match="label_source"):
+        _cfg(label_source="both").validate()
+
+
+def test_orm_budget_is_not_the_prm_budget():
+    # Two models, two budgets. Equal by accident is the silent trap PLAN_v3 §7 names.
+    c = PRMRolloutConfig()
+    assert c.orm_max_length != c.max_length

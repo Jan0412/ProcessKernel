@@ -348,6 +348,29 @@ class PRMRolloutConfig:
     max_length: int = 16384
     depth_buckets: int = 4             # how many rel_depth bands the reports slice into
 
+    # --- v3: ORM-imputed labelling ---------------------------------------------------
+    # One per campaign, never mixed: level 6 has no evals and is imputed; level 1 is
+    # fully evaluated and is measured.
+    label_source: str = "measured"
+
+    orm_checkpoint: Optional[str] = None
+    # The ORM's own training lists. Their (run, problem, sample) keys are the kernels the
+    # curve must NOT be fit on -- a memorized score is sharper than a fresh one.
+    orm_lists_glob: Optional[str] = None
+    orm_max_length: int = 6144            # listwise_base.yaml -- NOT self.max_length
+    orm_reserve_ref_tokens: int = 1024
+    orm_batch_size: int = 16
+
+    curve_bins: int = 40
+    curve_iters: int = 3
+    offset_kappa: Union[str, float] = "auto"  # a number forces the fixed n/(n+kappa) form
+    offset_clamp: float = 4.0             # ORM-score units
+    use_anchors: bool = True
+    anchor_rounds: list[int] = field(default_factory=lambda: [0])
+    # Anchors are re-graded here, not at build time: graded_target takes the speedup ratio
+    # and v1 rows store speedup_min. 0.0 is what the ORM trained under.
+    calib_speed_quant: float = 0.0
+
     out_dir: str = "data/prm_rollout"
     num_workers: int = 8
 
@@ -358,6 +381,17 @@ class PRMRolloutConfig:
         corpus -- that a tagged run has rows, that a problem has a split -- raise in
         `prefixes.py`, where the corpus is.
         """
+        # v3: checked first so a bad label_source/offset/quant fails on its own knob, not
+        # on run_tags being empty by default.
+        if self.label_source not in ("measured", "imputed"):
+            raise ValueError(f"label_source must be measured|imputed, got {self.label_source!r}")
+        if self.label_source == "imputed" and not self.orm_checkpoint:
+            raise ValueError("label_source=imputed needs orm_checkpoint")
+        if self.offset_kappa != "auto" and float(self.offset_kappa) <= 0:
+            raise ValueError(f"offset_kappa must be 'auto' or > 0, got {self.offset_kappa!r}")
+        if not 0 <= self.calib_speed_quant < 1:
+            raise ValueError(f"calib_speed_quant out of range: {self.calib_speed_quant}")
+
         # `_coerce` has no list case, so `prm_rollout.rounds=[0]` from the CLI arrives as
         # the *string* "[0]" and would iterate as characters. List values belong in a file.
         if not isinstance(self.rounds, list) or not self.rounds:

@@ -63,3 +63,19 @@ prm_rollout:
 
   out_dir: data/prm_rollout_l1
   num_workers: 8
+
+  # v3: level 1 stays measured; the ORM keys are here only so calibrate.py can run its
+  # validation sweep against the measured truth.
+  label_source: measured
+  orm_checkpoint: reranker/data/checkpoints_listwise_kb_deepseek_gptoss_all_rounds_speed_moderate/final
+  orm_lists_glob: reranker/data/lists_{train,val}_kb_deepseek_gptoss_all_rounds_speed_moderate.jsonl
+  orm_max_length: 6144
+  orm_reserve_ref_tokens: 1024
+  orm_batch_size: 16
+  curve_bins: 40
+  curve_iters: 3
+  offset_kappa: auto
+  offset_clamp: 4.0
+  use_anchors: true
+  anchor_rounds: [0, 1, 2]
+  calib_speed_quant: 0.0
