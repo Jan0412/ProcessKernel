@@ -124,6 +124,19 @@ def test_write_atomic_writes_a_lone_surrogate_rather_than_aborting(tmp_path):
         assert f.read() == "x = 'a\ud800b'\n"
 
 
+def test_write_atomic_leaves_another_writers_temp_file_alone(tmp_path):
+    # 16 array tasks publish the manifest into one out_dir. A fixed ".tmp" would have them
+    # writing one file and renaming each other's half-written bytes into place.
+    path = tmp_path / "manifest.json"
+    other = tmp_path / "manifest.json.tmp"
+    other.write_text("another task's half-written bytes")
+
+    build.write_atomic(str(path), '{"ok": true}')
+
+    assert path.read_text() == '{"ok": true}'
+    assert other.read_text() == "another task's half-written bytes"
+
+
 def test_a_wrong_kernel_grades_zero_without_needing_a_baseline(tmp_path, chars):
     _, parts = built(
         tmp_path,

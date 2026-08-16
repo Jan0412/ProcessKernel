@@ -53,6 +53,9 @@ prm_rollout:
   gen_model: openai/gpt-oss-120b       # must match the run behind `run_tags`
   max_num_seqs: 64
   max_model_len: 40960
+  # How much of a unit job B hands one generate() call. Peak memory, nothing else: a real
+  # unit is 14,005 prefixes and 70,025 rollouts, which is ~770 MB of prompts in one call.
+  prefixes_per_batch: 256
 
   eval_runs_dir: /path/to/workdir/KernelBench/runs
   eval_run_name: prm_rollout_l6_v1

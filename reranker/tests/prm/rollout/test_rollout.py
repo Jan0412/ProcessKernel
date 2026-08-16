@@ -770,6 +770,82 @@ def parts_of(conf):
     )
 
 
+def two_units(tmp_path):
+    """A campaign of exactly two units, sorted: ...round0 then ...round1."""
+    ps, rows = a_unit(2)
+    ps.append(prefix(prefix_id="q0", sample_id=0, round=1))
+    rows.append(part_row(sid=0, round=1))
+    return campaign(tmp_path, ps, rows)
+
+
+def test_unit_names_are_the_arrays_index_space(tmp_path):
+    conf = two_units(tmp_path)
+    assert rollout.unit_names(conf.prm_rollout) == [
+        "a_run__shard_00__round0",
+        "a_run__shard_00__round1",
+    ]
+
+
+def many_units(tmp_path, n):
+    """A campaign of ``n`` units, round0..round(n-1) -- enough to index past a small array."""
+    ps, rows = a_unit(1)
+    for r in range(1, n):
+        ps.append(prefix(prefix_id=f"q{r}", sample_id=0, round=r))
+        rows.append(part_row(sid=0, round=r))
+    return campaign(tmp_path, ps, rows)
+
+
+def test_main_selects_the_unit_at_the_array_tasks_own_index_not_a_stride(tmp_path, monkeypatch):
+    # §6's absolute-index requirement, pinned at main() itself: a resubmit of --array=3,7
+    # must hit units 3 and 7, never a re-sliced 0,1. run_rollouts is stubbed so nothing loads.
+    conf = many_units(tmp_path, 8)
+    names = rollout.unit_names(conf.prm_rollout)
+    monkeypatch.setattr(rollout, "load_config", lambda argv: conf)
+
+    seen = []
+    manifest = {
+        "rollouts": 0, "prefixes": 0, "units_generated": 0, "units_reused": 0,
+        "prefix_caching": None, "counts": {},
+    }
+    monkeypatch.setattr(
+        rollout, "run_rollouts", lambda cfg, only=None, **kw: seen.append(only) or manifest
+    )
+
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "3")
+    rollout.main(["--config", "unused"])
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "7")
+    rollout.main(["--config", "unused"])
+    assert seen == [names[3], names[7]]
+
+    seen.clear()
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "8")  # one past the last of 8 units
+    rollout.main(["--config", "unused"])
+    assert seen == []
+
+
+def test_only_generates_the_one_unit_it_names(tmp_path):
+    # The array's whole contract: task i touches unit i and nothing else, so two tasks never
+    # write one part and no unit is generated twice at temperature 0.6.
+    conf = two_units(tmp_path)
+    manifest = rollout.run_rollouts(
+        conf, backend=FakeBackend(default="import torch\n"), count=len,
+        only="a_run__shard_00__round1",
+    )
+    assert parts_of(conf) == ["a_run__shard_00__round1.jsonl.gz"]
+    assert manifest["units_generated"] == 1
+
+
+def test_a_unit_name_no_prefix_belongs_to_is_refused(tmp_path):
+    # A typo in the array index space would otherwise be a task that silently generates
+    # nothing and exits 0, leaving a gap staging only notices much later.
+    conf = two_units(tmp_path)
+    with pytest.raises(KeyError, match="round7"):
+        rollout.run_rollouts(
+            conf, backend=FakeBackend(default="import torch\n"), count=len,
+            only="a_run__shard_00__round7",
+        )
+
+
 def test_the_driver_writes_one_part_per_unit_holding_K_rollouts_for_every_prefix(tmp_path):
     ps, rows = a_unit(2)
     ps.append(prefix(prefix_id="q0", sample_id=0, round=1))
@@ -797,6 +873,83 @@ def test_a_unit_whose_part_is_already_there_is_not_generated_again(tmp_path):
     assert second.calls == []
     assert manifest["units_generated"] == 0 and manifest["units_reused"] == 1
     assert open(stage.unit_path(conf.prm_rollout.out_dir, "a_run__shard_00__round0"), "rb").read() == before
+
+
+def test_a_campaign_killed_between_units_resumes_instead_of_refusing(tmp_path, monkeypatch):
+    # The wall-clock case, which is the normal one at ~14 GPU-h a unit: the manifest is the
+    # only record of what the finished parts were sampled under, so writing it once at the
+    # end leaves a resumed run unable to check itself and refusing outright.
+    #
+    # The kill is patched at _run_unit, not counted in the backend: generate() makes several
+    # backend calls per unit (one per mode and token-budget bucket), so a call count would
+    # not reliably land the fault *between* two units, which is the state under test.
+    ps, rows = a_unit(2)
+    ps.append(prefix(prefix_id="q0", sample_id=0, round=1))
+    rows.append(part_row(sid=0, round=1))
+    conf = campaign(tmp_path, ps, rows)
+
+    real, done = rollout._run_unit, []
+
+    def dies_after_one(*args, **kw):
+        if done:
+            raise RuntimeError("CUDA error: device-side assert triggered")
+        done.append(1)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(rollout, "_run_unit", dies_after_one)
+
+    with pytest.raises(RuntimeError):
+        rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    monkeypatch.undo()
+    out_dir = conf.prm_rollout.out_dir
+    assert os.path.isfile(os.path.join(out_dir, rollout.ROLLOUT_MANIFEST)), \
+        "a unit finished, so its settings must be on disk before the next job reads them"
+
+    manifest = rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    assert manifest["units_generated"] == 1 and manifest["units_reused"] == 1
+
+
+def test_a_campaign_killed_mid_loop_leaves_a_manifest_whose_counters_are_not_negative(tmp_path, monkeypatch):
+    # Regression: _publish() used to pass len(todo), fixed for the whole invocation, while
+    # _metas(out_dir) only grows as units actually finish. Three units, killed after the
+    # first: the old code wrote units_generated=3, units_reused=1-3=-2.
+    ps, rows = a_unit(1)
+    ps.append(prefix(prefix_id="q0", sample_id=0, round=1))
+    rows.append(part_row(sid=0, round=1))
+    ps.append(prefix(prefix_id="r0", sample_id=0, round=2))
+    rows.append(part_row(sid=0, round=2))
+    conf = campaign(tmp_path, ps, rows)
+
+    real, done = rollout._run_unit, []
+
+    def dies_after_one(*args, **kw):
+        if done:
+            raise RuntimeError("CUDA error: device-side assert triggered")
+        done.append(1)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(rollout, "_run_unit", dies_after_one)
+
+    with pytest.raises(RuntimeError):
+        rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    monkeypatch.undo()
+
+    out_dir = conf.prm_rollout.out_dir
+    manifest = json.load(open(os.path.join(out_dir, rollout.ROLLOUT_MANIFEST)))
+    assert manifest["units_generated"] == len(parts_of(conf)) == 1
+    assert manifest["units_reused"] == 0
+
+
+def test_parts_with_no_manifest_at_all_say_so(tmp_path):
+    # Only reachable for a campaign generated before the manifest moved into the loop, but
+    # the old message read as a sampler drift from None and sent operators hunting a config edit.
+    ps, rows = a_unit(2)
+    conf = campaign(tmp_path, ps, rows)
+    rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
+    os.remove(os.path.join(conf.prm_rollout.out_dir, rollout.ROLLOUT_MANIFEST))
+
+    with pytest.raises(ValueError, match="no rollout_manifest.json"):
+        rollout.run_rollouts(conf, backend=FakeBackend(default="import torch\n"), count=len)
 
 
 def test_a_unit_is_handed_to_generate_in_batches_and_not_all_at_once(tmp_path, monkeypatch):

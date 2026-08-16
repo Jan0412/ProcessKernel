@@ -10,6 +10,7 @@ import glob
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import time
 from collections import Counter
@@ -411,10 +412,14 @@ def write_atomic(path: str, text: str) -> None:
 
     surrogatepass for the reason ensure_ascii is spelled out above: most callers hand this
     ASCII JSON, but stage.py hands it a kernel body sliced out of `raw`.
+
+    The temp name must be unique across hosts, not just within one: job B's array spans
+    nodes and out_dir is shared scratch, so pid alone can collide between two nodes.
     """
-    with open(path + ".tmp", "w", encoding="utf-8", errors="surrogatepass") as f:
+    tmp = f"{path}.tmp.{socket.gethostname()}.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8", errors="surrogatepass") as f:
         f.write(text)
-    os.replace(path + ".tmp", path)
+    os.replace(tmp, path)
 
 
 def _text_sha1(text: str) -> str:

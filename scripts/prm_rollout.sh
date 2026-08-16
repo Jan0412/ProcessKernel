@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=prm-rollout
-#SBATCH --output=prm_rollout_%j.out
-#SBATCH --error=prm_rollout_%j.err
+#SBATCH --output=prm_rollout_%A_%a.out
+#SBATCH --error=prm_rollout_%A_%a.err
 #SBATCH --partition=YOUR_PARTITION
 #SBATCH --account=YOUR_ACCOUNT
 #SBATCH --qos=YOUR_QOS
@@ -30,16 +30,17 @@
 # --dependency, because `prm_eval.sh --shards` reads a manifest that staging has not written
 # yet and the array size is evaluated at submit time.
 #
-#   CFG=reranker/configs/prm_rollout.yaml            # or ..._smoke.yaml
-#   python -m reranker.src.prm.rollout.prefixes --config $CFG        # A
-#   CONFIG=$CFG sbatch scripts/prm_rollout.sh                        # B, this script
+#   CFG=reranker/configs/prm_rollout_l6_r0.yaml
+#   python -m reranker.src.prm.rollout.prefixes --config $CFG                       # A
+#   CONFIG=$CFG sbatch --array=0-$(($(CONFIG=$CFG scripts/prm_rollout.sh --units) - 1)) \
+#       scripts/prm_rollout.sh                                                      # B, this script
 #   # ... once it has finished:
 #   python -m reranker.src.prm.rollout.stage --config $CFG           # rollouts -> kernels
 #   OUT_DIR=$PWD/reranker/data/<out_dir> \
 #       sbatch --array=0-$(($(scripts/prm_eval.sh --shards) - 1)) scripts/prm_eval.sh   # C
 
 set -euo pipefail
-cd "$SLURM_SUBMIT_DIR"
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 source ~/.bashrc
 export PATH="$HOME/.local/bin:$PATH"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
@@ -61,6 +62,11 @@ fi
 
 CONFIG="${CONFIG:-reranker/configs/prm_rollout.yaml}"
 
+if [ "${1:-}" = "--units" ]; then
+    uv run --no-sync python -m reranker.src.prm.rollout.rollout --config "$CONFIG" --units
+    exit 0
+fi
+
 echo "============================================================"
 echo "  PRM rollouts (job B) | config $CONFIG"
 echo "  node   : $(hostname)"
@@ -69,7 +75,7 @@ nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader
 
 # vLLM's sampler JIT-compiles flashinfer's top-k/top-p kernel during memory profiling and
 # needs nvcc, which these nodes do not have. See the script for the whole story.
-source "$SLURM_SUBMIT_DIR/scripts/cuda_jit_env.sh"
+source scripts/cuda_jit_env.sh
 
 # A CUDA fault kills the context, so the process cannot recover in-band -- only restart.
 # Each attempt resumes from the parts already on disk, exactly as a resubmitted job would.

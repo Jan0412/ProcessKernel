@@ -12,6 +12,7 @@ import glob
 import gzip
 import json
 import os
+import socket
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -187,11 +188,15 @@ def open_part(path: str):
     over. A context manager because job B writes a unit in batches -- it cannot hold one in
     memory (14,005 prefixes measured on a real unit) and must not publish it until the last
     batch is back.
+
+    The temp name must be unique across hosts, not just within one: job B's array spans
+    nodes and out_dir is shared scratch, so pid alone can collide between two nodes.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with gzip.open(path + ".tmp", "wt") as f:
+    tmp = f"{path}.tmp.{socket.gethostname()}.{os.getpid()}"
+    with gzip.open(tmp, "wt") as f:
         yield f
-    os.replace(path + ".tmp", path)
+    os.replace(tmp, path)
 
 
 def dump_rollouts(rollouts, f) -> None:

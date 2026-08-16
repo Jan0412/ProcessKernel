@@ -338,6 +338,18 @@ def test_the_part_is_written_by_rename_and_leaves_no_half_file_behind(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["u.jsonl.gz"]
 
 
+def test_open_part_leaves_another_writers_temp_file_alone(tmp_path):
+    path = str(tmp_path / "a_run__shard_00__round0.jsonl.gz")
+    other = tmp_path / "a_run__shard_00__round0.jsonl.gz.tmp"
+    other.write_text("another task's half-written bytes")
+
+    with stage.open_part(path) as f:
+        f.write('{"rollout_id": "p0__j00"}\n')
+
+    assert os.path.isfile(path)
+    assert other.read_text() == "another task's half-written bytes"
+
+
 def test_a_staged_kernel_lands_where_the_dataset_reader_looks_for_it(tmp_path):
     # Pinned against the reader rather than restated: build_dataset.py joins eval results back
     # to sources through this exact name, and a second spelling of it here would drift.

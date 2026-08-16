@@ -33,6 +33,9 @@ prm_rollout:
   gen_model: openai/gpt-oss-120b
   max_num_seqs: 64
   max_model_len: 40960
+  # Smaller than the real campaign's 256 on purpose: the smoke run is ~24 prefixes, and this
+  # is what exercises the multi-batch path at all.
+  prefixes_per_batch: 8
 
   eval_runs_dir: /path/to/workdir/KernelBench/runs
   eval_run_name: prm_rollout_smoke

@@ -16,6 +16,7 @@ import dataclasses
 import glob
 import json
 import os
+import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -455,7 +456,19 @@ def prefix_caching(backend) -> bool | None:
         return None
 
 
-def run_rollouts(cfg, backend=None, count=None) -> dict:
+def unit_names(conf) -> list[str]:
+    """The campaign's units, sorted -- the index space an array task selects from.
+
+    Absolute, never a stride: PLAN_v2 §6 requires a partial resubmit to re-run the units it
+    names, and a stride read off SLURM_ARRAY_TASK_COUNT would re-slice them all.
+    """
+    from reranker.src.prm.rollout import stage
+
+    out_dir = _resolve(conf.out_dir)
+    return sorted(units(stage.read_prefixes(os.path.join(out_dir, prefixes.PREFIXES))))
+
+
+def run_rollouts(cfg, backend=None, count=None, only=None) -> dict:
     """Every unit's prefixes -> ``K`` continuations each; returns the manifest it wrote.
 
     Resume is by part and never by content: `code_sha1` hashes text sampled at temperature
@@ -473,15 +486,27 @@ def run_rollouts(cfg, backend=None, count=None) -> dict:
     # it is provenance as much as a check, and a resumed campaign records it too.
     models = check_gen_model(conf, sorted({(p.run_name, p.shard) for p in rows}))
     by_unit = units(rows)
+    if only is not None and only not in by_unit:
+        raise KeyError(
+            f"{only} is not a unit of this campaign -- {len(by_unit)} units are, and job A's "
+            f"prefixes.jsonl under {out_dir} is the only thing that names them"
+        )
+    done = [u for u in by_unit if os.path.exists(stage.unit_path(out_dir, u))]
     todo = {
         unit: ps
         for unit, ps in by_unit.items()
-        if not os.path.exists(stage.unit_path(out_dir, unit))
+        if unit not in set(done) and (only is None or unit == only)
     }
-    if len(todo) < len(by_unit):
+    if done:
         _check_resume(conf, out_dir)
 
+    def _publish(generated: int) -> dict:
+        m = _job_b_manifest(conf, _metas(out_dir), models, generated)
+        build.write_atomic(os.path.join(out_dir, ROLLOUT_MANIFEST), json.dumps(m, indent=2))
+        return m
+
     caching = None
+    generated = 0
     if todo:
         backend = _backend(conf) if backend is None else backend
         caching = prefix_caching(backend)
@@ -504,10 +529,12 @@ def run_rollouts(cfg, backend=None, count=None) -> dict:
             _run_unit(
                 backend, unit, ps, load_sources(part, prompts), conf, count, out_dir, caching
             )
+            generated += 1
+            # After each unit, not once at the end: a job killed on its wall clock still has
+            # to leave the settings its finished parts were sampled under.
+            _publish(generated)
 
-    manifest = _job_b_manifest(conf, _metas(out_dir), models, len(todo))
-    build.write_atomic(os.path.join(out_dir, ROLLOUT_MANIFEST), json.dumps(manifest, indent=2))
-    return manifest
+    return _publish(generated)
 
 
 def _check_resume(conf, out_dir: str) -> None:
@@ -518,7 +545,13 @@ def _check_resume(conf, out_dir: str) -> None:
     one campaign, and a manifest that names only the second.
     """
     path = os.path.join(out_dir, ROLLOUT_MANIFEST)
-    was = json.loads(_read(path)).get("config", {}) if os.path.isfile(path) else {}
+    if not os.path.isfile(path):
+        raise ValueError(
+            f"{out_dir} holds finished units but no {ROLLOUT_MANIFEST}, so what they were "
+            "sampled under cannot be checked against this run. Delete the parts, or generate "
+            "into a new out_dir"
+        )
+    was = json.loads(_read(path)).get("config", {})
     moved = {k: (was.get(k), getattr(conf, k)) for k in SAMPLE_KNOBS if was.get(k) != getattr(conf, k)}
     if moved:
         raise ValueError(
@@ -614,7 +647,23 @@ def _backend(conf):
 
 
 def main(argv=None) -> None:
-    manifest = run_rollouts(load_config(None if argv is None else list(argv)))
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--units" in argv:
+        argv.remove("--units")
+        print(len(unit_names(load_config(argv).prm_rollout)))
+        return
+
+    cfg = load_config(argv)
+    only, task = None, os.environ.get("SLURM_ARRAY_TASK_ID")
+    if task is not None:
+        names = unit_names(cfg.prm_rollout)
+        if int(task) >= len(names):
+            print(f"task {task}: only {len(names)} units, nothing to do")
+            return
+        only = names[int(task)]
+        print(f"task {task}: unit {only}")
+
+    manifest = run_rollouts(cfg, only=only)
     print(
         f"Rollouts: {manifest['rollouts']} from {manifest['prefixes']} prefixes over "
         f"{manifest['units_generated']} units ({manifest['units_reused']} already done)"
