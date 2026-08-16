@@ -1,9 +1,14 @@
-"""What the evals said -> V̂ per prefix: job D's measurement half (PLAN_v2 §6).
+"""What the evals said -> V̂ per prefix: job D's measurement half (PLAN_v2 §6), plus the
+imputed path that turns ORM scores into V̂ via job D's calibrated curve (PLAN_v3 §8).
 
-N1 is the whole point: every number here comes from the prefix's own rollouts. The v1
-verdict for the completion the prefix was cut out of is one draw from a *different*
-distribution -- the continuation the model actually took, kept because it was kept -- so
-pooling it in would bias V̂ toward the observed path. Nothing in this module reads v1's parts.
+N1 is the whole point: a row is measured OR imputed, never averaged. On the measured path
+every number comes from the prefix's own rollouts -- the v1 verdict for the completion the
+prefix was cut out of is one draw from a *different* distribution, so pooling it in would
+bias V̂ toward the observed path, and nothing in this module reads v1's parts. On the imputed
+path every number comes from `curve.json`/`offsets.json` (read, never re-fit -- N7) applied
+to that SAME prefix's own rollouts' ORM scores; an imputed row's measured-only counters
+(`n_compiled`, `n_correct`, `v_binary`, `se_binary`, `se_graded`) are `None`, never `0` --
+mixing the two label sources under one schema is the failure N1 exists to prevent.
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
+from checker.submission import SubmissionAnalyzer
+
 from reranker.src.config import _resolve, load_config
 from reranker.src.data.labels import load_baseline_times
 from reranker.src.prm import corpus, targets
@@ -29,7 +36,7 @@ from reranker.src.prm.build import (
     TRUNCATED,
     write_atomic,
 )
-from reranker.src.prm.rollout import prefixes, stage
+from reranker.src.prm.rollout import calibrate, orm_score, prefixes, stage
 from reranker.src.prm.targets import MEAN, MIN
 
 VALUES = "values.jsonl"
@@ -38,13 +45,19 @@ VALUES_MANIFEST = "values_manifest.json"
 NO_EVAL_ENTRY = corpus.NO_EVAL_ENTRY
 # Applied in this order, and the order is what makes the ledger readable: a rollout that is
 # both truncated and unevaluated is counted once, as truncated (§6). v1's names, from v1's
-# build.py, so one campaign's drops can be read against the other's.
+# build.py, so one campaign's drops can be read against the other's. Shared by both paths.
 REASONS = (TRUNCATED, NO_FINISH_REASON, NO_EVAL_ENTRY, NO_BASELINE, NO_RUNTIME)
 # Not in REASONS: these drop the *prefix*, so no row survives to carry them. They land on
-# the campaign ledger instead, which is why value_for takes one.
+# the campaign ledger instead, which is why aggregate_measured/aggregate_imputed take one.
 TOO_FEW_ROLLOUTS = "too_few_rollouts"
 NO_ROLLOUTS = "no_rollouts"
-LEDGER = REASONS + (TOO_FEW_ROLLOUTS, NO_ROLLOUTS)
+# Imputed-path only, and deliberately NOT in REASONS: an S1 failure does not drop the
+# rollout (it still counts toward n_rollouts, scored 0.0 -- a deduction, not a drop), so it
+# belongs on the campaign ledger beside TOO_FEW_ROLLOUTS, not on the per-row n_dropped dict.
+S1_FAIL = "s1_fail"
+LEDGER = REASONS + (TOO_FEW_ROLLOUTS, NO_ROLLOUTS, S1_FAIL)
+
+_SUBMISSION_ANALYZER = SubmissionAnalyzer()
 
 
 @dataclass(frozen=True)
@@ -57,11 +70,19 @@ class Eval:
 
 @dataclass(frozen=True)
 class Value:
-    """One row of ``values.jsonl`` (PLAN_v2 §5).
+    """One row of ``values.jsonl`` (PLAN_v2 §5, PLAN_v3 §8).
 
     ``n_rollouts`` is the merge key with v1: a v1 row is this same measurement at
     ``n_rollouts = 1``. ``scores`` is kept per rollout so `label_mode`, `speedup_stat` and
     the speed knobs stay re-derivable from a built dataset without re-running an eval.
+
+    ``label_source`` is ``"measured"`` or ``"imputed"`` (N1) -- never both, and a reader must
+    not average across the two. The measured-only counters (``n_compiled``, ``n_correct``,
+    ``v_binary``, ``se_binary``, ``se_graded``) are ``None`` on an imputed row -- ``0`` would
+    claim a compile/correctness verdict this path never observed, and would make the row
+    silently averageable with a measured one. ``orm_offset`` (the per-problem ``c`` applied
+    inside the curve lookup) and ``se_imputed`` are the imputed-only counterparts, ``None``
+    on a measured row.
     """
 
     prefix_id: str
@@ -69,13 +90,16 @@ class Value:
     n_rollouts: int
     n_dropped: dict
     n_dedup_shared: int
-    n_compiled: int
-    n_correct: int
-    v_binary: float
+    n_compiled: int | None
+    n_correct: int | None
+    v_binary: float | None
     v_graded: float
-    se_binary: float
-    se_graded: float
+    se_binary: float | None
+    se_graded: float | None
     scores: list
+    label_source: str = "measured"
+    orm_offset: float | None = None
+    se_imputed: float | None = None
 
 
 def read_verdicts(runs_dir: str, run_name: str) -> dict[tuple[int, int], dict]:
@@ -148,12 +172,15 @@ def join(rows, rollout_map: dict[str, dict], verdicts: dict[tuple[int, int], dic
     return out
 
 
-def value_for(prefix, rows, joined, baselines, cfg, counts) -> Value | None:
+def aggregate_measured(prefix, rows, joined, baselines, cfg, counts) -> Value | None:
     """Aggregate one prefix's rollouts into its measured value, or ``None`` if too few survive.
 
     ``counts`` is the campaign ledger and is updated for every drop, including the ones that
     happened inside a prefix this returns ``None`` for: those evals were paid for, and a
     ledger that forgot them would make the campaign look cheaper than it was.
+
+    Pure movement from v2's ``value_for`` (PLAN_v3 §8) -- this function never touches the ORM,
+    the curve or the offsets; see ``aggregate_imputed`` for the sibling that does.
     """
     baseline = baselines.get(prefix.level, {}).get(prefix.problem_id)
     dropped: Counter = Counter()
@@ -231,11 +258,275 @@ def value_for(prefix, rows, joined, baselines, cfg, counts) -> Value | None:
     )
 
 
+def write_values(values, path) -> None:
+    """The writer, extracted (PLAN_v3 §8) so both aggregation passes share one serialization."""
+    write_atomic(path, "".join(json.dumps(dataclasses.asdict(v)) + "\n" for v in values))
+
+
+# --- the imputed path: rollouts + the ORM's scores + job D's curve -> values.jsonl --------
+
+
+def submission_ok(code: str) -> bool:
+    """Can CPython even ``compile()`` and load this source? Wraps
+    ``checker.submission.SubmissionAnalyzer`` -- every one of its checks (S1.0-S1.3) is a
+    hard failure, so any finding at all means the evaluator would score this kernel 0
+    with certainty.
+
+    Deliberately the ONLY gate `aggregate_imputed` consults before the curve. The linter
+    (``checker.lint``, F1/F2) is never imported by this module and must never be: it flags
+    36% of kernels and holds 28% of all correct ones, so gating on it would delete a quarter
+    of the positives it is meant to score. `SubmissionAnalyzer`'s own registry holds only
+    S1.* checks (never F1./F2.), so this is safe even if a caller passes it code the linter
+    would also flag -- see `test_a_linter_hard_fail_is_still_imputed_normally`.
+    """
+    return not _SUBMISSION_ANALYZER.analyze(code, path="<generated>").findings
+
+
+def aggregate_imputed(prefix, rows, scores, curve, offsets, cfg, counts) -> Value | None:
+    """One prefix's rollouts, scored through the ORM curve instead of an eval verdict.
+
+    ``scores`` is ``rollout_id -> raw ORM logit`` (pre-offset). The offset is applied INSIDE
+    the lookup, ``curve.predict(score + c)``, never ``predict(score) + c`` (the second leaves
+    [0, 1] entirely -- Task 4's own invariant, re-used here rather than re-derived).
+
+    N1's null-not-zero: `n_compiled`/`n_correct`/`v_binary`/`se_binary`/`se_graded` are
+    `None` here, never `0` -- this path never observes a compile or a correctness verdict.
+
+    The S1 submission gate is a deduction, not a prediction: a kernel CPython cannot
+    `compile()` scores 0.0 with certainty and never reaches the curve at all -- measured,
+    1.1% of kernels, 0% of them correct. It still counts toward `n_rollouts` (it is not
+    dropped, unlike TRUNCATED/NO_FINISH_REASON, which drop the rollout because it is not a
+    draw from the policy at all).
+
+    ``se_imputed = sqrt(var(t̂)/K + mean(resid_var_by_band))`` -- the residual term is
+    deliberately NOT divided by K: the curve's errors on one prefix's rollouts share its text
+    and style, so they do not average away like independent sampling noise would.
+    """
+    c = calibrate.offset_for(offsets, prefix.level, prefix.problem_id)
+    ts, bands, dropped = [], [], Counter()
+    # Sorted for the same reason as the measured path: `scores` is a stored column and must
+    # not depend on job B's arrival order.
+    for r in sorted(rows, key=lambda r: r.rollout_id):
+        if r.truncation == corpus.TRUNCATED:
+            # v2's rule, both paths: a stopped generation is not a draw from the policy.
+            dropped[TRUNCATED] += 1
+            counts[TRUNCATED] += 1
+            continue
+        if r.truncation != corpus.OK:
+            dropped[NO_FINISH_REASON] += 1
+            counts[NO_FINISH_REASON] += 1
+            continue
+        if not submission_ok(r.code):
+            counts[S1_FAIL] += 1
+            ts.append(0.0)
+            bands.append(0)
+            continue
+        x = scores[r.rollout_id] + c
+        ts.append(curve.predict(x))
+        bands.append(curve.band(x))
+
+    n = len(ts)
+    if n < cfg.min_rollouts:
+        counts[TOO_FEW_ROLLOUTS] += 1
+        return None
+    resid = sum(curve.resid_var_by_band[b] for b in bands) / n
+    return Value(
+        prefix_id=prefix.prefix_id,
+        K_requested=prefix.K,
+        n_rollouts=n,
+        n_dropped={reason: dropped[reason] for reason in REASONS},
+        n_dedup_shared=0,
+        n_compiled=None, n_correct=None, v_binary=None,   # null, never 0 -- N1
+        v_graded=sum(ts) / n,
+        se_binary=None, se_graded=None,
+        scores=ts,
+        label_source="imputed",
+        orm_offset=c,
+        se_imputed=math.sqrt(statistics.pvariance(ts) / n + resid),
+    )
+
+
+def read_rollout_scores(out_dir: str) -> dict[str, dict]:
+    """``rollout_id -> its orm_scores.jsonl/ row`` (``kind == "rollout"``), over every part
+    under `orm_score.ORM_SCORES` except the anchors part -- those are v1's evaluated
+    kernels, a different id space, and not this campaign's rollouts.
+    """
+    out: dict[str, dict] = {}
+    anchors_part = f"{orm_score.ANCHORS_UNIT}.jsonl"
+    for part in sorted(glob.glob(os.path.join(out_dir, orm_score.ORM_SCORES, "*.jsonl"))):
+        if os.path.basename(part) == anchors_part:
+            continue
+        with open(part) as f:
+            for line in f:
+                row = json.loads(line)
+                if row["kind"] == "rollout":
+                    out[row["id"]] = row
+    return out
+
+
+def load_curve(out_dir: str) -> calibrate.Curve:
+    """``curve.json``, validated beyond what `calibrate.curve_from_dict` checks (lengths and
+    non-emptiness only):
+
+    - **Ascending knots.** A non-ascending ``knots_x`` makes ``np.interp`` return garbage
+      with no error, and this is the curve every imputed label trusts.
+    - **A residual variance that was not silently filled with 0.0.** `calibrate.py` fills
+      `resid_var_by_band` with 0.0 when no band anywhere had >= 2 points to estimate a
+      residual from. 0.0 there claims a precision `se_imputed` never measured, not an
+      absence of noise -- refused here rather than consumed blindly.
+
+    Read, never re-fit (N7): this only calls `calibrate.read_curve`.
+    """
+    curve = calibrate.read_curve(os.path.join(out_dir, calibrate.CURVE))
+    xs = list(curve.knots_x)
+    if any(a > b for a, b in zip(xs, xs[1:])):
+        raise ValueError(
+            f"{calibrate.CURVE} knots_x is not ascending: {xs} -- np.interp silently returns "
+            "garbage on an unsorted x, and this curve is what every imputed label trusts"
+        )
+    if curve.resid_var_by_band and all(v == 0.0 for v in curve.resid_var_by_band):
+        raise ValueError(
+            f"{calibrate.CURVE} resid_var_by_band is all zero -- every band had under 2 "
+            "points to estimate a residual from, and 0.0 there claims a precision se_imputed "
+            "never measured rather than an absence of data"
+        )
+    return curve
+
+
+def _read_calib_manifest(out_dir: str) -> dict:
+    """Job D's manifest, and the gate this module is the sole enforcer of: `calibrate.py`
+    itself no longer refuses a `label_source=measured` fit (it has to run there too, for the
+    level-1 validation sweep -- PLAN_v3), so this is the only machine-checkable barrier left
+    against labelling a real campaign from a curve fit for validation only (N1).
+    """
+    path = os.path.join(out_dir, calibrate.CALIB_MANIFEST)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path} is missing -- run job D (calibrate.py) before imputing values"
+        )
+    with open(path) as f:
+        manifest = json.load(f)
+    if manifest.get("label_source") != "imputed":
+        raise ValueError(
+            f"{calibrate.CALIB_MANIFEST} was fit with label_source="
+            f"{manifest.get('label_source')!r}, not 'imputed' -- a curve fit against measured "
+            "labels is a validation artifact (the level-1 sweep); it may never label a "
+            "campaign (N1)"
+        )
+    return manifest
+
+
+def _unit_of(part_path: str) -> str:
+    name = os.path.basename(part_path)
+    return name[: -len(".jsonl.gz")] if name.endswith(".jsonl.gz") else name
+
+
+def _assert_scores_complete(by_unit: dict[str, list], scores: dict) -> None:
+    """Every landed rollout unit must be fully scored before any value is written.
+
+    `orm_score.score_unit` silently skips (writes nothing for) a unit whose job-B `.meta`
+    sidecar went missing, and that silence is indistinguishable on disk from a unit that
+    legitimately scored nothing -- both leave no part under `orm_score.ORM_SCORES`. On a
+    1.1M-row campaign a silent completeness gap here is worse than a crash, so this checks
+    every rollout of every landed unit has a score, and names exactly the units that do not.
+    """
+    missing = sorted(
+        unit for unit, rows in by_unit.items() if any(r.rollout_id not in scores for r in rows)
+    )
+    if missing:
+        raise ValueError(
+            f"{len(missing)} rollout unit(s) are missing an ORM score for at least one of "
+            f"their rollouts: {missing} -- run job B2 (orm_score.py) for them before writing "
+            "any imputed value; a partial campaign must fail loudly, not report short"
+        )
+
+
+def _assert_checkpoint_matches(scores: dict, curve_ckpt_sha: str | None) -> None:
+    """The rollout scores must have come from the same ORM checkpoint the curve was fit
+    under -- two checkpoints' logits do not share a scale, and `curve.json` records which
+    one it was fit for (Task 4's `orm_checkpoint_sha`).
+    """
+    shas = {row["orm_checkpoint_sha"] for row in scores.values()}
+    if curve_ckpt_sha is not None and shas - {curve_ckpt_sha}:
+        raise ValueError(
+            f"rollout scores carry orm_checkpoint_sha {sorted(shas)} but the curve was fit "
+            f"under {curve_ckpt_sha!r} -- two models' logits do not share a scale, so this "
+            "curve cannot be applied to them"
+        )
+
+
+def build_values_imputed(cfg) -> dict:
+    """Score a whole campaign off job D's curve instead of an eval verdict. CPU only, and it
+    reads no v1 label and no eval shard -- job B's rollouts and job B2's ORM scores are the
+    whole input, plus job D's `curve.json`/`offsets.json` (read, never re-fit -- N7).
+    """
+    rollout_cfg = cfg.prm_rollout
+    rollout_cfg.validate()
+    out_dir = _resolve(rollout_cfg.out_dir)
+
+    calib_manifest = _read_calib_manifest(out_dir)   # gate (b): refuses a non-imputed fit
+    curve = load_curve(out_dir)                      # validated: ascending, resid_var (c, d)
+    offsets, _offsets_meta = calibrate.read_offsets(os.path.join(out_dir, calibrate.OFFSETS))
+
+    prefix_rows = stage.read_prefixes(os.path.join(out_dir, prefixes.PREFIXES))
+    parts = sorted(glob.glob(os.path.join(out_dir, stage.ROLLOUTS, "*.jsonl.gz")))
+    by_unit: dict[str, list] = {}
+    rows = []
+    for part in parts:
+        part_rows = stage.read_rollouts(part)
+        by_unit[_unit_of(part)] = part_rows
+        rows.extend(part_rows)
+
+    raw_scores = read_rollout_scores(out_dir)
+    _assert_scores_complete(by_unit, raw_scores)      # gate (a): every landed unit is scored
+    _assert_checkpoint_matches(
+        raw_scores, calib_manifest.get("anchors", {}).get("orm_checkpoint_sha")
+    )
+    scores = {rid: float(row["orm_score"]) for rid, row in raw_scores.items()}
+
+    by_prefix = defaultdict(list)
+    for r in rows:
+        by_prefix[r.prefix_id].append(r)
+
+    counts: Counter = Counter()
+    imputed = []
+    for prefix in prefix_rows:
+        mine = by_prefix.get(prefix.prefix_id)
+        if not mine:
+            counts[NO_ROLLOUTS] += 1
+            continue
+        value = aggregate_imputed(prefix, mine, scores, curve, offsets, rollout_cfg, counts)
+        if value is not None:
+            imputed.append(value)
+
+    write_values(imputed, os.path.join(out_dir, VALUES))
+    manifest = {
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "config": dataclasses.asdict(rollout_cfg),
+        "label_source": "imputed",
+        "parts": len(parts),
+        "prefixes": len(prefix_rows),
+        "rollouts": len(rows),
+        "scored": len(scores),
+        "values": len(imputed),
+        "shared": 0,
+        "dropped": {reason: counts[reason] for reason in LEDGER},
+        # N7: what this build actually applied. A relabel under a different curve is visible
+        # here without re-hashing anything.
+        "curve_sha1": calib_manifest.get("curve_sha1"),
+        "offsets_sha1": calib_manifest.get("offsets_sha1"),
+    }
+    write_atomic(os.path.join(out_dir, VALUES_MANIFEST), json.dumps(manifest, indent=2))
+    return manifest
+
+
 # --- the pass: prefixes + rollouts + every eval shard -> values.jsonl --------------------
 
 
-def build_values(cfg) -> dict:
-    """Score a whole campaign. CPU only, minutes long, and it reads no v1 label anywhere."""
+def build_values_measured(cfg) -> dict:
+    """Score a whole campaign off its own evals. CPU only, minutes long, and it reads no v1
+    label anywhere.
+    """
     rollout_cfg = cfg.prm_rollout
     rollout_cfg.validate()
     out_dir = _resolve(rollout_cfg.out_dir)
@@ -262,17 +553,15 @@ def build_values(cfg) -> dict:
             # is a normal state -- counted, and legible against `prefixes` in the manifest.
             counts[NO_ROLLOUTS] += 1
             continue
-        value = value_for(prefix, mine, joined, baselines, rollout_cfg, counts)
+        value = aggregate_measured(prefix, mine, joined, baselines, rollout_cfg, counts)
         if value is not None:
             measured.append(value)
 
-    write_atomic(
-        os.path.join(out_dir, VALUES),
-        "".join(json.dumps(dataclasses.asdict(v)) + "\n" for v in measured),
-    )
+    write_values(measured, os.path.join(out_dir, VALUES))
     manifest = {
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "config": dataclasses.asdict(rollout_cfg),
+        "label_source": "measured",
         "parts": len(parts),
         # Read against each other: prefixes - values is what the ledger below has to explain.
         "prefixes": len(prefix_rows),
@@ -286,12 +575,23 @@ def build_values(cfg) -> dict:
     return manifest
 
 
+def build_values(cfg) -> dict:
+    """Score a whole campaign, measured or imputed per ``prm_rollout.label_source`` (N1: a
+    campaign is always wholly one or the other, never a mix).
+    """
+    if cfg.prm_rollout.label_source == "imputed":
+        return build_values_imputed(cfg)
+    return build_values_measured(cfg)
+
+
 def main(argv=None) -> None:
     manifest = build_values(load_config(None if argv is None else list(argv)))
     fired = {r: n for r, n in manifest["dropped"].items() if n}
+    verb = "Imputed" if manifest.get("label_source") == "imputed" else "Measured"
+    against = f" against {manifest['evals']} evals" if "evals" in manifest else ""
     print(
-        f"Measured {manifest['values']} of {manifest['prefixes']} prefixes from "
-        f"{manifest['rollouts']} rollouts against {manifest['evals']} evals"
+        f"{verb} {manifest['values']} of {manifest['prefixes']} prefixes from "
+        f"{manifest['rollouts']} rollouts{against}"
     )
     print(f"  dropped {fired or 'nothing'}")
 

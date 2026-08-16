@@ -21,7 +21,7 @@ import pytest
 
 from reranker.src.config import PRMRolloutConfig, RerankerConfig
 from reranker.src.prm import build
-from reranker.src.prm.rollout import lists, prefixes, rollout, stage, stats, values
+from reranker.src.prm.rollout import calibrate, lists, prefixes, rollout, stage, stats, values
 
 
 def cfg(**over) -> PRMRolloutConfig:
@@ -345,6 +345,136 @@ def test_a_constant_series_has_no_correlation_rather_than_a_zero_one():
 
 def test_a_single_prefix_cannot_be_correlated_with_anything():
     assert stats.correlation([1.0], [10.0]) is None
+
+
+# --- V̂ vs the ORM's encoded sequence length: NOT code length (task 3/6's misnomer) --------
+
+
+def test_mean_encoded_lengths_reads_n_code_tokens_not_generation_length():
+    # n_gen_tokens (999) is deliberately way off n_code_tokens (10, 30) -- if this read the
+    # wrong field the mean would come out near 999, not 20.
+    rolls = [roll("r0", n_gen_tokens=999), roll("r1", n_gen_tokens=999)]
+    orm_scores = {"r0": {"n_code_tokens": 10}, "r1": {"n_code_tokens": 30}}
+    assert stats.mean_encoded_lengths(rolls, orm_scores) == {"p0": 20.0}
+
+
+def test_mean_encoded_lengths_skips_rollouts_the_orm_never_scored():
+    # A measured campaign never runs job B2 at all -- every rollout is unscored, and the
+    # function must return {} rather than KeyError on the first lookup.
+    rolls = [roll("r0"), roll("r1")]
+    assert stats.mean_encoded_lengths(rolls, {"r0": {"n_code_tokens": 10}}) == {"p0": 10.0}
+    assert stats.mean_encoded_lengths(rolls, {}) == {}
+
+
+def test_mean_encoded_lengths_excludes_truncated_rollouts_like_mean_lengths_does():
+    rolls = [roll("r0", n_gen_tokens=100), roll("r1", truncation="truncated")]
+    orm_scores = {"r0": {"n_code_tokens": 10}, "r1": {"n_code_tokens": 9999}}
+    assert stats.mean_encoded_lengths(rolls, orm_scores) == {"p0": 10.0}
+
+
+# --- label_source: config and values.jsonl must agree (task 6 extra req.) -----------------
+
+
+def test_check_label_source_passes_when_config_and_values_agree():
+    assert stats.check_label_source("measured", [_value("p0", [0.0])]) == "measured"
+
+
+def test_check_label_source_passes_on_an_empty_campaign():
+    # Nothing to disagree with -- §12's own checks already gate on an empty campaign.
+    assert stats.check_label_source("measured", []) == "measured"
+
+
+def test_check_label_source_raises_on_a_mismatch():
+    v = dataclasses.replace(_value("p0", [0.0]), label_source="imputed")
+    with pytest.raises(ValueError, match="label_source"):
+        stats.check_label_source("measured", [v])
+
+
+# --- calibration diagnostics: read job D's files, never re-fit (N7) -----------------------
+
+
+def test_calibration_summary_is_none_without_a_calibrate_manifest(tmp_path):
+    assert stats.calibration_summary(str(tmp_path), []) is None
+
+
+def _write_calibration(out_dir, *, knots_x=(0.0, 1.0), resid_var=(0.02, 0.02),
+                       offsets=None, orm_seen=4, orm_unseen=6, label_source="imputed"):
+    (out_dir / calibrate.CURVE).write_text(json.dumps({
+        "knots_x": list(knots_x), "knots_y": [0.0, 1.0], "resid_var_by_band": list(resid_var),
+        "n_by_band": [3, 3], "n_fit": 6,
+        "target_dist": {"fit": {"n": 6, "mean": 0.4}, "all": {"n": 8, "mean": 0.5}},
+    }))
+    (out_dir / calibrate.OFFSETS).write_text(json.dumps({
+        "meta": {"tau2": 0.1, "tau2_raw": 0.1, "tau2_estimable": True, "n_clamped": 0,
+                 "n_problems": 1, "shrink_mean": 0.5},
+        "offsets": offsets if offsets is not None else {"2:37": {"c": 0.1}},
+    }))
+    (out_dir / calibrate.CALIB_MANIFEST).write_text(json.dumps({
+        "label_source": label_source, "anchors": {"orm_seen": orm_seen, "orm_unseen": orm_unseen},
+    }))
+
+
+def test_calibration_summary_reports_the_curve_bands_offsets_and_orm_seen_split(tmp_path):
+    _write_calibration(tmp_path)
+    cal = stats.calibration_summary(str(tmp_path), [pre("p0"), pre("p1")])
+    assert cal["label_source"] == "imputed"
+    assert cal["curve_flags"] == []
+    assert cal["curve_bands"] == [
+        {"band": 0, "score": 0.0, "target": 0.0, "n": 3},
+        {"band": 1, "score": 1.0, "target": 1.0, "n": 3},
+    ]
+    assert cal["offsets"]["tau2"] == 0.1
+    # Both p0 and p1 are level 2 problem 37 (this file's `pre()`), and offsets.json names
+    # exactly that pkey -- no_anchor_rate is 0.0, not the campaign's raw problem count.
+    assert cal["offsets"]["no_anchor_rate"] == 0.0
+    assert cal["orm_seen_vs_unseen"] == {
+        "n_seen": 4, "n_unseen": 6,
+        "target_dist_fit_unseen_only": {"n": 6, "mean": 0.4},
+        "target_dist_all": {"n": 8, "mean": 0.5},
+    }
+
+
+def test_calibration_summary_counts_a_campaign_problem_with_no_offset(tmp_path):
+    _write_calibration(tmp_path, offsets={})   # no problem has an offset at all
+    cal = stats.calibration_summary(str(tmp_path), [pre("p0")])
+    assert cal["offsets"]["no_anchor_rate"] == 100.0
+
+
+def test_calibration_summary_flags_a_non_ascending_curve_rather_than_raising(tmp_path):
+    _write_calibration(tmp_path, knots_x=(1.0, 0.0))
+    cal = stats.calibration_summary(str(tmp_path), [])
+    assert any("ascending" in f for f in cal["curve_flags"])
+
+
+def test_calibration_summary_flags_an_all_zero_resid_var_rather_than_raising(tmp_path):
+    _write_calibration(tmp_path, resid_var=(0.0, 0.0))
+    cal = stats.calibration_summary(str(tmp_path), [])
+    assert any("resid_var_by_band" in f for f in cal["curve_flags"])
+
+
+def test_report_surfaces_calibration_diagnostics_when_present(tmp_path):
+    # A report has to stay legible even over a broken curve (values.load_curve REFUSES this
+    # exact input before labelling anything -- see test_values.py); here it must flag, not
+    # crash, and the rest of the report (spread, checks, ...) still comes back.
+    conf = campaign(tmp_path)
+    _write_calibration(tmp_path / "campaign", knots_x=(1.0, 0.0), resid_var=(0.0, 0.0))
+    out = stats.report(conf)
+    assert out["calibration"]["curve_flags"]
+    assert out["checks"]   # the rest of the report was not aborted by the broken curve
+    assert "encoded_seq_len_r" in out["length_correlation"]
+
+
+def test_the_rendered_report_carries_the_calibration_block_when_present(tmp_path):
+    conf = campaign(tmp_path)
+    _write_calibration(tmp_path / "campaign")
+    text = stats.render(stats.report(conf))
+    assert "calibration" in text
+    assert "encoded seq. length" in text
+
+
+def test_the_rendered_report_has_no_calibration_block_on_a_measured_campaign(tmp_path):
+    text = stats.render(stats.report(campaign(tmp_path)))
+    assert "calibration (" not in text
 
 
 # --- the pass: a whole campaign on disk -> the report and its §12 checks -------------------

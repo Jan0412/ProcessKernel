@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from reranker.src.config import RANDOM, _resolve, load_config
 from reranker.src.prm import build, corpus
 from reranker.src.prm.build import write_atomic
-from reranker.src.prm.rollout import lists, prefixes, stage, values
+from reranker.src.prm.rollout import calibrate, lists, prefixes, stage, values
 
 STATS = "rollout_stats.json"
 
@@ -230,6 +230,23 @@ def mean_lengths(rollout_rows) -> dict[str, float]:
     return {pid: statistics.fmean(ns) for pid, ns in lengths.items()}
 
 
+def mean_encoded_lengths(rollout_rows, orm_scores: dict[str, dict]) -> dict[str, float]:
+    """``prefix_id -> mean ORM-encoded sequence length``, over rollouts that finished and were
+    scored by job B2 (empty on a measured campaign, which never runs job B2).
+
+    Despite its name, ``n_code_tokens`` is NOT code length: it is the whole sequence
+    `orm_score.SequenceEncoder` encoded -- instruction + reference + separator + code + EOS
+    (task 3/6). Reported here as ``encoded_seq_len``, never as a "code length" control, so a
+    reader cannot mistake it for one. Same truncation exclusion as `mean_lengths`, for the
+    same reason: a truncated rollout's fragment is not comparable length signal.
+    """
+    lengths: dict[str, list[int]] = defaultdict(list)
+    for r in rollout_rows:
+        if r.truncation == corpus.OK and r.rollout_id in orm_scores:
+            lengths[r.prefix_id].append(orm_scores[r.rollout_id]["n_code_tokens"])
+    return {pid: statistics.fmean(ns) for pid, ns in lengths.items()}
+
+
 def correlation(xs: list[float], ys: list[float]) -> float | None:
     """Pearson r, or ``None`` where it does not exist (§6's stage-2 guard).
 
@@ -319,6 +336,79 @@ def read_json(path: str, default=None):
         return json.load(f)
 
 
+def check_label_source(cfg_label_source: str, value_rows) -> str:
+    """The config's ``label_source`` must agree with what ``values.jsonl`` actually carries --
+    a stale file left over from a different build (or a hand-edited config) would otherwise
+    silently mislabel every number in this report. Empty ``value_rows`` has nothing to
+    disagree with and is not itself an error here (§12's own checks already gate on it).
+    """
+    seen = {v.label_source for v in value_rows}
+    if seen and seen != {cfg_label_source}:
+        raise ValueError(
+            f"{values.VALUES} carries label_source {sorted(seen)} but the config says "
+            f"{cfg_label_source!r} -- the two disagree about what these V-hats mean"
+        )
+    return cfg_label_source
+
+
+def calibration_summary(out_dir: str, prefix_rows) -> dict | None:
+    """Job D's curve/offsets, surfaced into the campaign report -- ``None`` on a measured
+    campaign, which never wrote one. Read only (N7): unlike ``values.load_curve`` (which
+    REFUSES to apply a broken curve before labelling anything -- (c)/(d) of this task), a
+    report has to stay legible even when the curve it is describing IS broken, so the same
+    two defects are FLAGGED here (`curve_flags`) instead of raising.
+    """
+    manifest = read_json(os.path.join(out_dir, calibrate.CALIB_MANIFEST))
+    if manifest is None:
+        return None
+    curve = read_json(os.path.join(out_dir, calibrate.CURVE)) or {}
+    offsets_blob = read_json(os.path.join(out_dir, calibrate.OFFSETS)) or {}
+    offsets, meta = offsets_blob.get("offsets", {}), offsets_blob.get("meta", {})
+    anchors = manifest.get("anchors", {})
+
+    xs, resid = curve.get("knots_x") or [], curve.get("resid_var_by_band") or []
+    flags = []
+    if any(a > b for a, b in zip(xs, xs[1:])):
+        flags.append("knots_x is not ascending -- np.interp would return garbage")
+    if resid and all(v == 0.0 for v in resid):
+        flags.append("resid_var_by_band is all zero -- se_imputed would understate its error")
+
+    campaign_problems = {f"{p.level}:{p.problem_id}" for p in prefix_rows}
+    no_anchor = campaign_problems - set(offsets)
+    target_dist = curve.get("target_dist", {})
+
+    return {
+        "label_source": manifest.get("label_source"),
+        "curve_flags": flags,
+        # band -> mean score -> mean target -> n, in one table (the fitted curve itself).
+        "curve_bands": [
+            {"band": i, "score": x, "target": y, "n": n}
+            for i, (x, y, n) in enumerate(
+                zip(xs, curve.get("knots_y") or [], curve.get("n_by_band") or [None] * len(xs))
+            )
+        ],
+        "offsets": {
+            "tau2": meta.get("tau2"), "tau2_raw": meta.get("tau2_raw"),
+            "tau2_estimable": meta.get("tau2_estimable"),
+            "shrink_mean": meta.get("shrink_mean"),
+            "clamp_rate": pct(meta.get("n_clamped", 0), meta.get("n_problems", 0)),
+            "n_problems": meta.get("n_problems"),
+            # This campaign's own problems, not the anchor set's -- offset_for silently
+            # returns 0.0 for one with no anchors, which this makes visible instead.
+            "no_anchor_rate": (
+                pct(len(no_anchor), len(campaign_problems)) if campaign_problems else None
+            ),
+        },
+        # The finding-2 diagnostic: everything above split by whether a candidate could even
+        # appear in the ORM's own training lists.
+        "orm_seen_vs_unseen": {
+            "n_seen": anchors.get("orm_seen"), "n_unseen": anchors.get("orm_unseen"),
+            "target_dist_fit_unseen_only": target_dist.get("fit"),
+            "target_dist_all": target_dist.get("all"),
+        },
+    }
+
+
 def report(cfg) -> dict:
     """Measure a finished campaign and check it against §12; returns the report it writes."""
     rollout_cfg = cfg.prm_rollout
@@ -340,6 +430,7 @@ def report(cfg) -> dict:
 
     prefix_rows = stage.read_prefixes(at(prefixes.PREFIXES))
     value_rows = lists.read_values(at(values.VALUES))
+    label_source = check_label_source(rollout_cfg.label_source, value_rows)
     by_split = {
         split: lists.read_lists(at(lists.LISTS.format(split=split)))
         for split in (prefixes.TRAIN, prefixes.VAL)
@@ -355,9 +446,15 @@ def report(cfg) -> dict:
     ]
     lengths = mean_lengths(rollout_rows)
     paired = [(pid, lengths[pid]) for pid in sorted(scores_by_id) if pid in lengths]
+    # Empty on a measured campaign (job B2 never runs there); mean_encoded_lengths then
+    # returns {} and the second correlation below reports n=0, r=None rather than crashing.
+    orm_scores = values.read_rollout_scores(out_dir)
+    enc_lengths = mean_encoded_lengths(rollout_rows, orm_scores)
+    enc_paired = [(pid, enc_lengths[pid]) for pid in sorted(scores_by_id) if pid in enc_lengths]
 
     out = {
         "out_dir": out_dir,
+        "label_source": label_source,
         "created": manifest.get("created"),
         "git_sha": manifest.get("git_sha"),
         "git_dirty": manifest.get("git_dirty"),
@@ -404,7 +501,17 @@ def report(cfg) -> dict:
                 [statistics.fmean(scores_by_id[pid]) for pid, _ in paired],
                 [n for _, n in paired],
             ),
+            # On both length measures (task 6 extra req. e): continuation length (above,
+            # `n_gen_tokens`, meaningful on either label source) and the ORM's own encoded
+            # sequence length (below -- imputed campaigns only, and NOT "code length", see
+            # mean_encoded_lengths).
+            "encoded_seq_len_n": len(enc_paired),
+            "encoded_seq_len_r": correlation(
+                [statistics.fmean(scores_by_id[pid]) for pid, _ in enc_paired],
+                [n for _, n in enc_paired],
+            ),
         },
+        "calibration": calibration_summary(out_dir, prefix_rows),
         "depth": [
             {
                 "lo": band.lo,
@@ -609,9 +716,32 @@ def render(out: dict) -> str:
         f"V-hat histogram   {out['value_histogram']}",
         f"V-hat vs continuation length   r {_f(lc['r'])} over {lc['n']:,} prefixes"
         "   (a strong positive r is 'longer is better', not signal)",
+        f"V-hat vs ORM encoded seq. length   r {_f(lc['encoded_seq_len_r'])} "
+        f"over {lc['encoded_seq_len_n']:,} prefixes"
+        "   (n_code_tokens is the WHOLE encoded sequence, not code alone)",
         "",
         "by source   " + str(out["by_source"]),
         "by round    " + str(out["by_round"]),
+    ]
+
+    cal = out.get("calibration")
+    if cal is not None:
+        off = cal["offsets"]
+        lines += [
+            "",
+            f"calibration (label_source={cal['label_source']!r})"
+            f"{'   FLAGS: ' + '; '.join(cal['curve_flags']) if cal['curve_flags'] else ''}",
+            f"  curve bands   " + str(cal["curve_bands"]),
+            f"  offsets   tau2 {_f(off['tau2'])}   shrink_mean {_f(off['shrink_mean'])}   "
+            f"clamp_rate {_f(off['clamp_rate'])}%   no_anchor_rate {_f(off['no_anchor_rate'])}%"
+            f"   n_problems {off['n_problems']}",
+            f"  ORM-seen vs unseen   seen {cal['orm_seen_vs_unseen']['n_seen']}   "
+            f"unseen {cal['orm_seen_vs_unseen']['n_unseen']}   "
+            f"target_dist(fit) {cal['orm_seen_vs_unseen']['target_dist_fit_unseen_only']}   "
+            f"target_dist(all) {cal['orm_seen_vs_unseen']['target_dist_all']}",
+        ]
+
+    lines += [
         "",
         "checks",
         "-" * 78,

@@ -51,7 +51,12 @@ class Item:
 
 @dataclass(frozen=True)
 class ListRow:
-    """One row of ``lists_{train,val}.jsonl`` (PLAN_v2 §5)."""
+    """One row of ``lists_{train,val}.jsonl`` (PLAN_v2 §5, PLAN_v3 §8).
+
+    ``label_source`` is the list's, not each item's (N5): every ``Value`` a list is built
+    from shares one ``label_source`` by construction (a campaign is wholly measured or
+    wholly imputed), and ``build_one`` asserts it rather than trusting that.
+    """
 
     list_key: str
     run_tag: str
@@ -63,6 +68,7 @@ class ListRow:
     split: str
     source: str
     items: list
+    label_source: str = "measured"
 
 
 def rel(value) -> float:
@@ -91,8 +97,15 @@ def group(prefix_rows, value_rows) -> dict[str, list[tuple]]:
     return {key: sorted(pairs, key=lambda pv: pv[0].prefix_id) for key, pairs in out.items()}
 
 
-def build_list(key: str, members: list[tuple], split: str, cfg, counts) -> ListRow | None:
-    """One list, or ``None`` for one that cannot be ranked -- counted either way."""
+def build_one(key: str, members: list[tuple], split: str, cfg, counts) -> ListRow | None:
+    """One list, or ``None`` for one that cannot be ranked -- counted either way.
+
+    N5: every member's ``Value.label_source`` must agree. Free by construction -- a campaign
+    (and so ``values.jsonl``) is wholly measured or wholly imputed, and N2 already forbids a
+    list spanning problems -- but asserted here rather than assumed, because a future
+    per-prefix tiering (some prefixes measured, some imputed, inside one campaign) would
+    otherwise break it silently.
+    """
     if len(members) < cfg.min_list_size:
         # Sized first so the ledger adds up: a one-item list is also trivially all-equal,
         # and counting it under both reasons would report more lists than were built.
@@ -101,7 +114,18 @@ def build_list(key: str, members: list[tuple], split: str, cfg, counts) -> ListR
     members = sorted(members, key=lambda pv: pv[0].prefix_id)
     _check_invariants(key, [p for p, _ in members])
 
-    items = [Item(p.prefix_id, rel(v), v.n_rollouts, v.se_graded) for p, v in members]
+    sources = {v.label_source for _, v in members}
+    if len(sources) > 1:
+        raise ValueError(f"N5: list {key} mixes label_source {sorted(sources)} across its items")
+    source = sources.pop()
+
+    # `se` is the error bar on V̂, computed the way its own label_source measures it: se_graded
+    # (a sampling std) on a measured list, se_imputed (curve residual + rollout spread, see
+    # values.aggregate_imputed) on an imputed one. One field, one meaning either way.
+    items = [
+        Item(p.prefix_id, rel(v), v.n_rollouts, v.se_imputed if source == "imputed" else v.se_graded)
+        for p, v in members
+    ]
     if len({item.rel for item in items}) < 2:
         # No valid ranking pair. The same drop listwise/lists.py:163 already makes, restated
         # here rather than imported, because importing it would mean editing that file.
@@ -119,6 +143,7 @@ def build_list(key: str, members: list[tuple], split: str, cfg, counts) -> ListR
         rel_depth_mean=sum(p.rel_depth for p, _ in members) / len(members),
         split=split,
         source=first.source,
+        label_source=source,
         items=items,
     )
 
@@ -175,7 +200,7 @@ def build_lists(cfg) -> dict:
         if split not in (TRAIN, VAL):
             counts[OTHER_SPLIT] += 1
             continue
-        row = build_list(key, members, split, rollout_cfg, counts)
+        row = build_one(key, members, split, rollout_cfg, counts)
         if row is not None:
             built[split].append(row)
 

@@ -10,19 +10,24 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import statistics
 from collections import Counter
 
 import pytest
 import yaml
 
 from reranker.src.config import PRMRolloutConfig, RerankerConfig
-from reranker.src.prm.rollout import prefixes, rollout, stage, values
+from reranker.src.prm.rollout import calibrate, orm_score, prefixes, rollout, stage, values
 
 TAG = "ar"
 LEVEL, PROBLEM = 2, 37
 # speedup 1.0 against lo=0.2 hi=4.0 quant=0.1 -> speed_p 0.5 -> graded target 0.75.
 BASELINES = {LEVEL: {PROBLEM: {"mean": 1.0, "min": 1.0}}}
 AT_BASELINE = 0.75
+# A bare "import torch\n" fails checker.submission's S1.1 (no ModelNew) -- irrelevant on the
+# measured path (aggregate_measured never reads `.code`), but roll()'s default has to be
+# submission-clean for the imputed-path tests below that reuse it unmodified.
+CLEAN_CODE = "import torch\nimport torch.nn as nn\n\nclass ModelNew(nn.Module):\n    def forward(self, x):\n        return x\n"
 
 
 def cfg(**over) -> PRMRolloutConfig:
@@ -69,7 +74,7 @@ def roll(rid, **over) -> rollout.Rollout:
         prefix_id=rid.rsplit("__j", 1)[0],
         j=0,
         continuation="...",
-        code="import torch\n",
+        code=CLEAN_CODE,
         code_sha1="a" * 40,
         n_prefix_tokens=10,
         n_gen_tokens=20,
@@ -102,7 +107,7 @@ def graded(*outcomes, shared=()) -> tuple:
 def value(*outcomes, prefix=None, config=None, **over):
     rows, joined = graded(*outcomes, **over)
     counts: Counter = Counter()
-    return values.value_for(
+    return values.aggregate_measured(
         prefix or pre(), rows, joined, BASELINES, config or cfg(), counts
     ), counts
 
@@ -117,7 +122,7 @@ def specs(*rows, prefix=None, config=None, baselines=None):
             spec["verdict"] if "verdict" in spec else verdict(), spec.get("shared", False)
         )
     counts: Counter = Counter()
-    row = values.value_for(
+    row = values.aggregate_measured(
         prefix or pre(),
         rollouts,
         joined,
@@ -165,7 +170,7 @@ def test_scores_are_ordered_by_rollout_id_whatever_order_they_arrive_in():
         "p1__j01": values.Eval(verdict(correct=False)),
         "p1__j00": values.Eval(verdict(correct=True)),
     }
-    row = values.value_for(pre(), rows, joined, BASELINES, cfg(), Counter())
+    row = values.aggregate_measured(pre(), rows, joined, BASELINES, cfg(), Counter())
     assert row.scores == [AT_BASELINE, 0.0]
 
 
@@ -252,7 +257,7 @@ def test_a_rollout_the_map_does_not_place_is_an_error_not_a_silent_drop():
     # prefix without it would report a K the campaign never bought.
     rows = [roll("p1__j00")]
     with pytest.raises(KeyError, match="p1__j00"):
-        values.value_for(pre(), rows, {}, BASELINES, cfg(), Counter())
+        values.aggregate_measured(pre(), rows, {}, BASELINES, cfg(), Counter())
 
 
 def test_a_rollout_that_shared_another_s_eval_is_counted():
@@ -443,3 +448,347 @@ def test_the_cli_scores_the_campaign_its_config_names(tmp_path):
     values.main(["--config", str(path)])
     assert (out_dir / values.VALUES_MANIFEST).exists()
     assert written(out_dir)[0]["prefix_id"] == "p1"
+
+
+# ============================================================================================
+# The imputed path (PLAN_v3 §8): ORM scores -> V̂ via job D's curve.
+# ============================================================================================
+
+
+class _StubCurve:
+    """A single-band linear curve: predict(x) = x * scale, band(x) = 0 always. Real enough
+    for aggregate_imputed's arithmetic without depending on calibrate.fit_joint (N7 -- this
+    module never fits, it only ever reads a curve, real or stubbed)."""
+
+    def __init__(self, scale: float = 0.2, resid_var: float = 0.0):
+        self.resid_var_by_band = [resid_var]
+        self._scale = scale
+
+    def predict(self, x: float) -> float:
+        return x * self._scale
+
+    def band(self, x: float) -> int:
+        return 0
+
+
+S1_FAIL_CODE = "def (:\n"   # does not even parse -- checker.submission's own S1.0 fixture
+OK_CODE = CLEAN_CODE
+# Loadable (compiles, has ModelNew.forward) but a real F1.2 "dead kernel" finding: `k` is
+# defined and never launched, computed in torch instead. Lifted verbatim from
+# checker/tests/submission/test_submission_analyzer.py's own CHEATING fixture, which that
+# suite uses to prove the exact same thing: SubmissionAnalyzer has nothing to say about it.
+F1_FAIL_CODE = (
+    "import torch\nimport torch.nn as nn\nimport triton\nimport triton.language as tl\n\n"
+    "@triton.jit\n"
+    "def k(x_ptr, o_ptr, n, BLOCK: tl.constexpr):\n"
+    "    pass\n\n\n"
+    "class ModelNew(nn.Module):\n"
+    "    def forward(self, x):\n"
+    "        return torch.conv2d(x, x)\n"
+)
+
+
+def _impute(scores, resid_var=0.0, offset=0.0, truncated=(), min_rollouts=1,
+            s1_fail=(), f1_fail=(), prefix=None, config=None):
+    """``aggregate_imputed`` over synthetic rollouts, one per element of ``scores``."""
+    p = prefix or pre()
+    rows, score_map = [], {}
+    for i, s in enumerate(scores):
+        rid = f"p1__j{i:02d}"
+        if i in s1_fail:
+            code = S1_FAIL_CODE
+        elif i in f1_fail:
+            code = F1_FAIL_CODE
+        else:
+            code = OK_CODE
+        rows.append(roll(rid, code=code, truncation="truncated" if i in truncated else "ok"))
+        score_map[rid] = s
+    curve = _StubCurve(resid_var=resid_var)
+    offsets = {f"{p.level}:{p.problem_id}": {"c": offset}}
+    return values.aggregate_imputed(
+        p, rows, score_map, curve, offsets, config or cfg(min_rollouts=min_rollouts), Counter()
+    )
+
+
+def _measure(targets, config=None):
+    """``aggregate_measured`` over synthetic rollouts: any ``t > 0`` is a correct kernel with
+    a speedup so large it saturates the graded ladder at 1.0 (`t == 0.0` incorrect). Exact
+    intermediate values are not the point here -- only that both paths reaggregate the same
+    way and that the imputed-only fields stay unset on a measured row.
+    """
+    conf = config or cfg()
+    rows, joined = [], {}
+    for i, t in enumerate(targets):
+        rid = f"p1__j{i:02d}"
+        rows.append(roll(rid))
+        joined[rid] = values.Eval(verdict(correct=t > 0, runtime=0.001, fastest=0.001))
+    return values.aggregate_measured(pre(), rows, joined, BASELINES, conf, Counter())
+
+
+def _run_job_d(curve_scale: float) -> dict:
+    """Three prefixes, aggregated both ways under one curve scale -- proof that the two
+    paths are actually independent, not just documented as such."""
+    out = {"measured": [], "imputed": []}
+    for i in range(3):
+        pid = f"p{i}"
+        rows, joined = graded(True, False)
+        mv = values.aggregate_measured(pre(pid), rows, joined, BASELINES, cfg(), Counter())
+        out["measured"].append(mv.v_graded)
+
+        irows = [roll(f"{pid}__j00"), roll(f"{pid}__j01")]
+        iscores = {f"{pid}__j00": 1.0 + i, f"{pid}__j01": 2.0 + i}
+        curve = _StubCurve(scale=curve_scale)
+        iv = values.aggregate_imputed(pre(pid), irows, iscores, curve, {}, cfg(), Counter())
+        out["imputed"].append(iv.v_graded)
+    return out
+
+
+def test_imputed_row_has_null_counts_not_zero():
+    # 0 would make measured and imputed silently averageable, which N1 forbids.
+    v = _impute(scores=[1.0, 2.0])
+    assert v.n_correct is None and v.n_compiled is None
+    assert v.label_source == "imputed"
+
+
+def test_measured_row_never_consults_the_orm():
+    v = _measure(targets=[0.0, 1.0, 0.0])
+    assert v.label_source == "measured"
+    assert v.orm_offset is None and v.se_imputed is None
+
+
+def test_se_imputed_matches_the_hand_computed_value():
+    v = _impute(scores=[1.0, 3.0], resid_var=0.04)   # t̂ = 0.2, 0.6 on the stub curve
+    want = math.sqrt(statistics.pvariance([0.2, 0.6]) / 2 + 0.04)
+    assert v.se_imputed == pytest.approx(want, abs=1e-9)
+
+
+def test_offset_is_applied_inside_the_lookup():
+    # knots_x are already in corrected units, so applying c after would double-count it.
+    hot = _impute(scores=[1.0], offset=+2.0).v_graded
+    cold = _impute(scores=[1.0], offset=-2.0).v_graded
+    assert hot > cold
+    assert _impute(scores=[3.0], offset=0.0).v_graded == pytest.approx(hot)
+
+
+def test_truncated_rollout_is_dropped_before_imputation():
+    v = _impute(scores=[1.0, 2.0, 3.0], truncated=[2])
+    assert v.n_rollouts == 2
+
+
+def test_min_rollouts_fires_on_the_imputed_path_too():
+    assert _impute(scores=[1.0], min_rollouts=3) is None
+
+
+def test_changing_the_curve_moves_every_shell_label_and_no_core_label():
+    a = _run_job_d(curve_scale=1.0)
+    b = _run_job_d(curve_scale=0.5)
+    assert all(x != y for x, y in zip(a["imputed"], b["imputed"]))
+    assert a["measured"] == b["measured"]
+
+
+def test_scores_reaggregate_to_v_graded_on_both_paths():
+    for v in (_measure(targets=[0.0, 1.0]), _impute(scores=[1.0, 3.0])):
+        assert sum(v.scores) / len(v.scores) == pytest.approx(v.v_graded)
+
+
+def test_an_s1_failure_scores_zero_without_touching_the_curve():
+    # 0 of 25 such kernels were correct and the evaluator cannot even import the file, so
+    # this is a deduction. A curve that would map its score high must not get the chance.
+    v = _impute(scores=[9.0, 1.0], s1_fail=[0])
+    assert v.scores[0] == 0.0
+    assert v.n_rollouts == 2
+
+
+def test_a_linter_hard_fail_is_still_imputed_normally():
+    # Regression guard: F1 covers 36% of kernels and holds 28% of all correct ones. A future
+    # "gate on the linter too" refactor must fail here, not in production. The premise is
+    # checked, not assumed: F1_FAIL_CODE really does trip a real F1 finding today.
+    import checker
+
+    assert any(f.check_id.startswith("F1.") for f in checker.analyze_source(F1_FAIL_CODE).findings)
+    v = _impute(scores=[9.0], f1_fail=[0], min_rollouts=1)
+    assert v.scores[0] > 0.0
+
+
+# --- five requirements from the reviews of Tasks 3-5, not in the brief but load-bearing ----
+
+
+def test_submission_ok_matches_checker_submission_directly():
+    assert values.submission_ok(OK_CODE) is True
+    assert values.submission_ok(S1_FAIL_CODE) is False
+
+
+# (a) campaign completeness: every landed rollout unit must have a score part -------------
+
+
+def test_assert_scores_complete_names_the_missing_unit():
+    by_unit = {"u0": [roll("p1__j00")], "u1": [roll("p2__j00")]}
+    with pytest.raises(ValueError, match="u1"):
+        values._assert_scores_complete(by_unit, {"p1__j00": {}})
+
+
+def test_assert_scores_complete_passes_when_every_rollout_is_scored():
+    by_unit = {"u0": [roll("p1__j00")], "u1": [roll("p2__j00")]}
+    values._assert_scores_complete(by_unit, {"p1__j00": {}, "p2__j00": {}})   # no raise
+
+
+# (b) label_source gate: calibrate.py no longer refuses a measured fit, so this is the only
+# barrier left against labelling a real campaign from a curve fit for validation only --------
+
+
+def test_read_calib_manifest_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="calibrate"):
+        values._read_calib_manifest(str(tmp_path))
+
+
+def test_read_calib_manifest_refuses_a_measured_fit(tmp_path):
+    (tmp_path / calibrate.CALIB_MANIFEST).write_text(
+        json.dumps({"label_source": "measured", "anchors": {}})
+    )
+    with pytest.raises(ValueError, match="label_source"):
+        values._read_calib_manifest(str(tmp_path))
+
+
+def test_read_calib_manifest_accepts_an_imputed_fit(tmp_path):
+    (tmp_path / calibrate.CALIB_MANIFEST).write_text(
+        json.dumps({"label_source": "imputed", "anchors": {}})
+    )
+    assert values._read_calib_manifest(str(tmp_path))["label_source"] == "imputed"
+
+
+# (c), (d) curve.json is validated on load, not consumed blindly -----------------------------
+
+
+def _curve_json(**over):
+    d = {"knots_x": [0.0, 5.0], "knots_y": [0.0, 1.0], "resid_var_by_band": [0.01, 0.01],
+         "n_by_band": [2, 2], "n_fit": 4}
+    d.update(over)
+    return d
+
+
+def test_load_curve_refuses_non_ascending_knots(tmp_path):
+    (tmp_path / calibrate.CURVE).write_text(json.dumps(_curve_json(knots_x=[5.0, 0.0])))
+    with pytest.raises(ValueError, match="ascending"):
+        values.load_curve(str(tmp_path))
+
+
+def test_load_curve_refuses_an_all_zero_resid_var(tmp_path):
+    (tmp_path / calibrate.CURVE).write_text(
+        json.dumps(_curve_json(resid_var_by_band=[0.0, 0.0]))
+    )
+    with pytest.raises(ValueError, match="resid_var_by_band"):
+        values.load_curve(str(tmp_path))
+
+
+def test_load_curve_accepts_a_healthy_curve(tmp_path):
+    (tmp_path / calibrate.CURVE).write_text(json.dumps(_curve_json()))
+    curve = values.load_curve(str(tmp_path))
+    assert curve.predict(0.0) == pytest.approx(0.0)
+
+
+# --- the pass end to end: an on-disk imputed campaign ---------------------------------------
+
+
+def _orm_row(rid, score=1.0, ckpt="ck1", n_tokens=50) -> dict:
+    return {"kind": "rollout", "id": rid, "level": LEVEL, "problem_id": PROBLEM,
+            "code_sha1": "a" * 40, "orm_score": score, "orm_checkpoint_sha": ckpt,
+            "n_code_tokens": n_tokens}
+
+
+def _offsets_json(offsets=None) -> dict:
+    meta = {"tau2": 0.1, "tau2_raw": 0.1, "tau2_estimable": True, "kappa_mode": "auto",
+            "c_std": 0.0, "c_std_core": 0.0, "n_clamped": 0, "n_no_anchors": 0,
+            "n_no_info": 0, "n_informative": 1, "frac_informative": 1.0,
+            "shrink_mean": 1.0, "n_problems": 1}
+    return {"meta": meta, "offsets": offsets or {}}
+
+
+def _calib_manifest_json(label_source="imputed", ckpt="ck1") -> dict:
+    return {"created": "T", "config": {}, "label_source": label_source,
+            "anchors": {"orm_checkpoint_sha": ckpt}, "fit": {}, "curve": {},
+            "curve_sha1": "cs1", "offsets_sha1": "os1"}
+
+
+def imputed_campaign(tmp_path, *, unit_rids: dict, scored_units, score_ckpt="ck1",
+                     manifest_ckpt="ck1", curve=None, offsets=None,
+                     calib_label_source="imputed", prefix_rows=None):
+    """Every artifact jobs A, B, B2 and D write for an imputed campaign, laid out as they lay
+    it out: ``unit_rids`` maps unit name -> the rollout_ids landed under it, ``scored_units``
+    is the subset that also gets an ``orm_scores.jsonl/<unit>.jsonl`` part.
+    """
+    out_dir = tmp_path / "campaign"
+    (out_dir / stage.ROLLOUTS).mkdir(parents=True)
+    (out_dir / orm_score.ORM_SCORES).mkdir(parents=True)
+    for unit, rids in unit_rids.items():
+        stage.write_rollouts(
+            [roll(rid) for rid in rids], str(out_dir / stage.ROLLOUTS / f"{unit}.jsonl.gz")
+        )
+        if unit in scored_units:
+            lines = "".join(json.dumps(_orm_row(rid, ckpt=score_ckpt)) + "\n" for rid in rids)
+            (out_dir / orm_score.ORM_SCORES / f"{unit}.jsonl").write_text(lines)
+    (out_dir / prefixes.PREFIXES).write_text(
+        "".join(json.dumps(dataclasses.asdict(p)) + "\n" for p in (prefix_rows or [pre()]))
+    )
+    (out_dir / calibrate.CURVE).write_text(json.dumps(curve if curve is not None else _curve_json()))
+    (out_dir / calibrate.OFFSETS).write_text(
+        json.dumps(offsets if offsets is not None else _offsets_json())
+    )
+    (out_dir / calibrate.CALIB_MANIFEST).write_text(
+        json.dumps(_calib_manifest_json(label_source=calib_label_source, ckpt=manifest_ckpt))
+    )
+    config = RerankerConfig(prm_rollout=cfg(
+        out_dir=str(out_dir), label_source="imputed", orm_checkpoint="ck", min_rollouts=1,
+    ))
+    return config, out_dir
+
+
+def test_build_values_imputed_writes_rows_end_to_end(tmp_path):
+    config, out_dir = imputed_campaign(
+        tmp_path, unit_rids={"u0": ["p1__j00", "p1__j01"]}, scored_units={"u0"}
+    )
+    manifest = values.build_values(config)
+    assert manifest["label_source"] == "imputed"
+    assert manifest["values"] == 1
+    (row,) = written(out_dir)
+    assert row["label_source"] == "imputed"
+    assert row["n_correct"] is None and row["n_compiled"] is None
+    assert row["se_imputed"] is not None
+
+
+def test_build_values_dispatches_to_the_imputed_path(tmp_path):
+    # build_values, not build_values_imputed directly: the dispatcher is what main() and every
+    # existing measured-path caller actually run.
+    config, out_dir = imputed_campaign(
+        tmp_path, unit_rids={"u0": ["p1__j00", "p1__j01"]}, scored_units={"u0"}
+    )
+    values.build_values(config)
+    assert (out_dir / values.VALUES).exists()
+
+
+def test_build_values_imputed_refuses_when_a_unit_is_unscored(tmp_path):
+    config, _ = imputed_campaign(
+        tmp_path,
+        unit_rids={"u0": ["p1__j00"], "u1": ["p2__j00"]},
+        scored_units={"u0"},
+        prefix_rows=[pre("p1"), pre("p2")],
+    )
+    with pytest.raises(ValueError, match="u1"):
+        values.build_values(config)
+
+
+def test_build_values_imputed_refuses_a_measured_calibrate_manifest(tmp_path):
+    config, _ = imputed_campaign(
+        tmp_path, unit_rids={"u0": ["p1__j00"]}, scored_units={"u0"},
+        calib_label_source="measured",
+    )
+    with pytest.raises(ValueError, match="label_source"):
+        values.build_values(config)
+
+
+def test_build_values_imputed_refuses_a_checkpoint_mismatch(tmp_path):
+    config, _ = imputed_campaign(
+        tmp_path, unit_rids={"u0": ["p1__j00"]}, scored_units={"u0"},
+        score_ckpt="wrong-ckpt", manifest_ckpt="ck1",
+    )
+    with pytest.raises(ValueError, match="orm_checkpoint_sha"):
+        values.build_values(config)

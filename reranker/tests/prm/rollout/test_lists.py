@@ -93,7 +93,7 @@ def members(*pairs):
 
 
 def built(*pairs, split="train", config=None, counts=None):
-    return lists.build_list(
+    return lists.build_one(
         KEY, members(*pairs), split, config or cfg(), counts if counts is not None else Counter()
     )
 
@@ -109,7 +109,7 @@ def test_a_prefix_with_one_correct_rollout_carries_that_kernels_own_graded_relev
     conf = cfg()
     su = 2.0
     single = (1.0 + speed_p(su, conf.speedup_lo, conf.speedup_hi, conf.speed_quant)) / 2
-    row = lists.build_list(
+    row = lists.build_one(
         KEY, [(pre("p1"), val("p1", v_graded=single, n_rollouts=1)), *members(("p2", 0.0))],
         "train", conf, Counter(),
     )
@@ -307,3 +307,39 @@ def test_a_list_the_campaign_cannot_rank_is_counted_rather_than_written(tmp_path
     assert manifest["dropped"][lists.ALL_EQUAL] == 1
     assert manifest["lists"] == {"train": 0, "val": 0}
     assert read_lists(out_dir, "train") == []
+
+
+# --- N5: a list never mixes label_source, and imputed items pick up se_imputed -----------
+#
+# The brief's own two-line sketch (`build_one([_item(src="measured"), ...])`) calls
+# `build_one` with only a list of items, but the real function still needs `key`/`split`/
+# `cfg`/`counts` (N2/N4/min_list_size all live here too), and `min_list_size` (>= 2, checked
+# in `cfg().validate()`) means a genuine one-item call would be dropped as TOO_SMALL before
+# N5 is ever reached. Adapted to the real 5-arg signature and two items -- see task-6-report.
+
+
+def test_a_list_never_mixes_label_sources():
+    with pytest.raises(ValueError, match="label_source"):
+        built(
+            (pre("p1"), val("p1", v_graded=0.8, label_source="measured")),
+            (pre("p2"), val("p2", v_graded=0.0, label_source="imputed")),
+        )
+
+
+def test_rel_is_two_v_graded_on_the_imputed_path_too():
+    row = built(
+        (pre("p1"), val("p1", v_graded=0.385, label_source="imputed", se_imputed=0.11)),
+        (pre("p2"), val("p2", v_graded=0.0, label_source="imputed", se_imputed=0.11)),
+    )
+    assert row.label_source == "imputed"
+    assert row.items[0].rel == pytest.approx(0.77)
+
+
+def test_an_imputed_items_se_is_se_imputed_not_se_graded():
+    # One field, two ways of computing it (lists.py's docstring): se_graded would silently
+    # carry the DEFAULT from `val()` (0.2) rather than the value actually passed.
+    row = built(
+        (pre("p1"), val("p1", v_graded=0.8, label_source="imputed", se_imputed=0.05)),
+        (pre("p2"), val("p2", v_graded=0.0, label_source="imputed", se_imputed=0.09)),
+    )
+    assert [item.se for item in row.items] == [0.05, 0.09]
