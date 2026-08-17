@@ -471,6 +471,24 @@ class _StubCurve:
         return 0
 
 
+class _BandedCurve:
+    """Two bands split at x = 0, with DISTINCT residual variances -- the shape `_StubCurve`
+    cannot express and the only shape that can tell `band(score + c)` from `band(score)`.
+    `predict` stays linear so v_graded is unaffected either way: the whole difference lands in
+    `se_imputed`, which is where dropping the offset from the band lookup would hide.
+    """
+
+    def __init__(self, lo_var: float = 0.01, hi_var: float = 0.09, scale: float = 0.1):
+        self.resid_var_by_band = [lo_var, hi_var]
+        self._scale = scale
+
+    def predict(self, x: float) -> float:
+        return x * self._scale
+
+    def band(self, x: float) -> int:
+        return 1 if x >= 0.0 else 0
+
+
 S1_FAIL_CODE = "def (:\n"   # does not even parse -- checker.submission's own S1.0 fixture
 OK_CODE = CLEAN_CODE
 # Loadable (compiles, has ModelNew.forward) but a real F1.2 "dead kernel" finding: `k` is
@@ -489,7 +507,7 @@ F1_FAIL_CODE = (
 
 
 def _impute(scores, resid_var=0.0, offset=0.0, truncated=(), min_rollouts=1,
-            s1_fail=(), f1_fail=(), prefix=None, config=None):
+            s1_fail=(), f1_fail=(), prefix=None, config=None, curve=None):
     """``aggregate_imputed`` over synthetic rollouts, one per element of ``scores``."""
     p = prefix or pre()
     rows, score_map = [], {}
@@ -503,10 +521,10 @@ def _impute(scores, resid_var=0.0, offset=0.0, truncated=(), min_rollouts=1,
             code = OK_CODE
         rows.append(roll(rid, code=code, truncation="truncated" if i in truncated else "ok"))
         score_map[rid] = s
-    curve = _StubCurve(resid_var=resid_var)
     offsets = {f"{p.level}:{p.problem_id}": {"c": offset}}
     return values.aggregate_imputed(
-        p, rows, score_map, curve, offsets, config or cfg(min_rollouts=min_rollouts), Counter()
+        p, rows, score_map, curve or _StubCurve(resid_var=resid_var), offsets,
+        config or cfg(min_rollouts=min_rollouts), Counter()
     )
 
 
@@ -570,6 +588,23 @@ def test_offset_is_applied_inside_the_lookup():
     assert _impute(scores=[3.0], offset=0.0).v_graded == pytest.approx(hot)
 
 
+def test_the_band_is_looked_up_at_the_offset_corrected_score_too():
+    # `x = score + c` feeds predict AND band. Dropping `+ c` from the band lookup alone leaves
+    # every v_graded identical and silently shifts every se_imputed in the campaign, which is
+    # why this needs two bands with different residual variances to be visible at all.
+    # score -1.0 with c = +2.0 is x = +1.0: the HIGH band. Banding the raw -1.0 reads the low.
+    v = _impute(scores=[-1.0, -1.0], offset=+2.0, curve=_BandedCurve(0.01, 0.09))
+    assert v.se_imputed == pytest.approx(math.sqrt(0.09))    # not sqrt(0.01)
+
+
+def test_se_imputed_averages_each_rollouts_own_bands_residual_variance():
+    # Straddling the split: one rollout per band, so the residual term is the mean of the two
+    # and not whichever band the first rollout happened to land in.
+    v = _impute(scores=[-1.0, 1.0], curve=_BandedCurve(0.01, 0.09))
+    want = math.sqrt(statistics.pvariance([-0.1, 0.1]) / 2 + (0.01 + 0.09) / 2)
+    assert v.se_imputed == pytest.approx(want, abs=1e-12)
+
+
 def test_truncated_rollout_is_dropped_before_imputation():
     v = _impute(scores=[1.0, 2.0, 3.0], truncated=[2])
     assert v.n_rollouts == 2
@@ -577,6 +612,20 @@ def test_truncated_rollout_is_dropped_before_imputation():
 
 def test_min_rollouts_fires_on_the_imputed_path_too():
     assert _impute(scores=[1.0], min_rollouts=3) is None
+
+
+def test_min_rollouts_is_counted_after_the_drops_not_before():
+    # 3 rollouts arrived, 2 were truncated: the prefix has ONE usable draw against a floor of
+    # 2 and must leave the corpus. Counting arrivals instead would keep a V-hat from one draw.
+    assert _impute(scores=[1.0, 2.0, 3.0], truncated=[1, 2], min_rollouts=2) is None
+    assert _impute(scores=[1.0, 2.0, 3.0], truncated=[2], min_rollouts=2).n_rollouts == 2
+
+
+def test_an_imputed_row_leaves_every_measured_only_field_null():
+    # N1's other three: v_binary/se_binary/se_graded are verdict-derived, and a 0.0 there would
+    # read as "measured, and it was zero" -- averageable with a real measured row.
+    v = _impute(scores=[1.0, 2.0])
+    assert v.v_binary is None and v.se_binary is None and v.se_graded is None
 
 
 def test_changing_the_curve_moves_every_shell_label_and_no_core_label():
@@ -621,15 +670,26 @@ def test_submission_ok_matches_checker_submission_directly():
 # (a) campaign completeness: every landed rollout unit must have a score part -------------
 
 
-def test_assert_scores_complete_names_the_missing_unit():
+def test_assert_scores_complete_names_the_unscored_unit():
     by_unit = {"u0": [roll("p1__j00")], "u1": [roll("p2__j00")]}
     with pytest.raises(ValueError, match="u1"):
-        values._assert_scores_complete(by_unit, {"p1__j00": {}})
+        values._assert_scores_complete(["u0", "u1"], by_unit, {"p1__j00": {}})
 
 
-def test_assert_scores_complete_passes_when_every_rollout_is_scored():
+def test_assert_scores_complete_names_a_unit_whose_rollout_part_never_landed():
+    # The QoS cap runs a 16-task array in waves, so a dead task is a live failure mode: u1
+    # is in the plan and left nothing on disk. An expected set globbed off the parts cannot
+    # see it -- by_unit has no u1 key to be wrong about -- and the campaign writes short.
+    by_unit = {"u0": [roll("p1__j00")]}
+    with pytest.raises(ValueError, match="u1"):
+        values._assert_scores_complete(["u0", "u1"], by_unit, {"p1__j00": {}})
+
+
+def test_assert_scores_complete_passes_when_every_planned_unit_landed_and_scored():
     by_unit = {"u0": [roll("p1__j00")], "u1": [roll("p2__j00")]}
-    values._assert_scores_complete(by_unit, {"p1__j00": {}, "p2__j00": {}})   # no raise
+    values._assert_scores_complete(
+        ["u0", "u1"], by_unit, {"p1__j00": {}, "p2__j00": {}}
+    )   # no raise
 
 
 # (b) label_source gate: calibrate.py no longer refuses a measured fit, so this is the only
@@ -672,6 +732,15 @@ def test_load_curve_refuses_non_ascending_knots(tmp_path):
         values.load_curve(str(tmp_path))
 
 
+def test_load_curve_refuses_equal_adjacent_knots(tmp_path):
+    # np.interp tolerates a tie, so nothing downstream would raise -- but band()'s
+    # searchsorted(side="right") can then never land on the earlier of the two, so that band's
+    # resid_var_by_band entry is dead and every se_imputed there reports its neighbour's.
+    (tmp_path / calibrate.CURVE).write_text(json.dumps(_curve_json(knots_x=[0.0, 0.0])))
+    with pytest.raises(ValueError, match="ascending"):
+        values.load_curve(str(tmp_path))
+
+
 def test_load_curve_refuses_an_all_zero_resid_var(tmp_path):
     (tmp_path / calibrate.CURVE).write_text(
         json.dumps(_curve_json(resid_var_by_band=[0.0, 0.0]))
@@ -709,22 +778,34 @@ def _calib_manifest_json(label_source="imputed", ckpt="ck1") -> dict:
             "curve_sha1": "cs1", "offsets_sha1": "os1"}
 
 
+# The unit names `rollout.unit_name` gives this file's prefixes: run__shard__roundN. Not
+# arbitrary strings any more -- values.py now takes its expected unit set from prefixes.jsonl
+# (via orm_score.rollout_units), so a fixture whose parts are named u0/u1 describes a campaign
+# where every planned unit is missing and every landed one unplanned.
+U0, U1 = "a_run__shard_00__round0", "a_run__shard_01__round0"
+
+
 def imputed_campaign(tmp_path, *, unit_rids: dict, scored_units, score_ckpt="ck1",
-                     manifest_ckpt="ck1", curve=None, offsets=None,
-                     calib_label_source="imputed", prefix_rows=None):
+                     manifest_ckpt="ck1", curve=None, offsets=None, score=1.0,
+                     calib_label_source="imputed", prefix_rows=None, land_units=None):
     """Every artifact jobs A, B, B2 and D write for an imputed campaign, laid out as they lay
     it out: ``unit_rids`` maps unit name -> the rollout_ids landed under it, ``scored_units``
-    is the subset that also gets an ``orm_scores.jsonl/<unit>.jsonl`` part.
+    is the subset that also gets an ``orm_scores.jsonl/<unit>.jsonl`` part, and ``land_units``
+    (default: all of them) is the subset whose rollout part is written at all -- a unit outside
+    it is one whose array task died, planned in ``prefixes.jsonl`` and absent from disk.
     """
     out_dir = tmp_path / "campaign"
     (out_dir / stage.ROLLOUTS).mkdir(parents=True)
     (out_dir / orm_score.ORM_SCORES).mkdir(parents=True)
     for unit, rids in unit_rids.items():
-        stage.write_rollouts(
-            [roll(rid) for rid in rids], str(out_dir / stage.ROLLOUTS / f"{unit}.jsonl.gz")
-        )
+        if land_units is None or unit in land_units:
+            stage.write_rollouts(
+                [roll(rid) for rid in rids], str(out_dir / stage.ROLLOUTS / f"{unit}.jsonl.gz")
+            )
         if unit in scored_units:
-            lines = "".join(json.dumps(_orm_row(rid, ckpt=score_ckpt)) + "\n" for rid in rids)
+            lines = "".join(
+                json.dumps(_orm_row(rid, score=score, ckpt=score_ckpt)) + "\n" for rid in rids
+            )
             (out_dir / orm_score.ORM_SCORES / f"{unit}.jsonl").write_text(lines)
     (out_dir / prefixes.PREFIXES).write_text(
         "".join(json.dumps(dataclasses.asdict(p)) + "\n" for p in (prefix_rows or [pre()]))
@@ -744,7 +825,7 @@ def imputed_campaign(tmp_path, *, unit_rids: dict, scored_units, score_ckpt="ck1
 
 def test_build_values_imputed_writes_rows_end_to_end(tmp_path):
     config, out_dir = imputed_campaign(
-        tmp_path, unit_rids={"u0": ["p1__j00", "p1__j01"]}, scored_units={"u0"}
+        tmp_path, unit_rids={U0: ["p1__j00", "p1__j01"]}, scored_units={U0}
     )
     manifest = values.build_values(config)
     assert manifest["label_source"] == "imputed"
@@ -759,7 +840,7 @@ def test_build_values_dispatches_to_the_imputed_path(tmp_path):
     # build_values, not build_values_imputed directly: the dispatcher is what main() and every
     # existing measured-path caller actually run.
     config, out_dir = imputed_campaign(
-        tmp_path, unit_rids={"u0": ["p1__j00", "p1__j01"]}, scored_units={"u0"}
+        tmp_path, unit_rids={U0: ["p1__j00", "p1__j01"]}, scored_units={U0}
     )
     values.build_values(config)
     assert (out_dir / values.VALUES).exists()
@@ -768,17 +849,32 @@ def test_build_values_dispatches_to_the_imputed_path(tmp_path):
 def test_build_values_imputed_refuses_when_a_unit_is_unscored(tmp_path):
     config, _ = imputed_campaign(
         tmp_path,
-        unit_rids={"u0": ["p1__j00"], "u1": ["p2__j00"]},
-        scored_units={"u0"},
-        prefix_rows=[pre("p1"), pre("p2")],
+        unit_rids={U0: ["p1__j00"], U1: ["p2__j00"]},
+        scored_units={U0},
+        prefix_rows=[pre("p1"), pre("p2", shard="shard_01")],
     )
-    with pytest.raises(ValueError, match="u1"):
+    with pytest.raises(ValueError, match="shard_01"):
+        values.build_values(config)
+
+
+def test_build_values_imputed_refuses_when_a_planned_units_part_never_landed(tmp_path):
+    # The dead-array-task case, end to end: prefixes.jsonl plans two units, only one landed.
+    # Globbing the parts for the expected set passes this campaign and writes p2's prefixes
+    # off as no_rollouts -- a 1.1M-row campaign short by a sixteenth, with no error anywhere.
+    config, _ = imputed_campaign(
+        tmp_path,
+        unit_rids={U0: ["p1__j00"], U1: ["p2__j00"]},
+        scored_units={U0},
+        land_units={U0},
+        prefix_rows=[pre("p1"), pre("p2", shard="shard_01")],
+    )
+    with pytest.raises(ValueError, match="shard_01"):
         values.build_values(config)
 
 
 def test_build_values_imputed_refuses_a_measured_calibrate_manifest(tmp_path):
     config, _ = imputed_campaign(
-        tmp_path, unit_rids={"u0": ["p1__j00"]}, scored_units={"u0"},
+        tmp_path, unit_rids={U0: ["p1__j00"]}, scored_units={U0},
         calib_label_source="measured",
     )
     with pytest.raises(ValueError, match="label_source"):
@@ -787,8 +883,47 @@ def test_build_values_imputed_refuses_a_measured_calibrate_manifest(tmp_path):
 
 def test_build_values_imputed_refuses_a_checkpoint_mismatch(tmp_path):
     config, _ = imputed_campaign(
-        tmp_path, unit_rids={"u0": ["p1__j00"]}, scored_units={"u0"},
+        tmp_path, unit_rids={U0: ["p1__j00"]}, scored_units={U0},
         score_ckpt="wrong-ckpt", manifest_ckpt="ck1",
     )
     with pytest.raises(ValueError, match="orm_checkpoint_sha"):
         values.build_values(config)
+
+
+def test_the_offset_on_disk_reaches_the_lookup_end_to_end(tmp_path):
+    # The real read_offsets -> offset_for path, not a hand-built dict: _offsets_json defaults
+    # to no offsets at all, so every end-to-end test above runs at c = 0 and the whole
+    # per-problem correction could be dropped without one of them noticing.
+    # score 1.0 on knots (0, 5) -> (0, 1) is 0.2; with c = +1.0 the lookup is at 2.0 -> 0.4.
+    def run(offsets):
+        config, out_dir = imputed_campaign(
+            tmp_path / str(bool(offsets)), unit_rids={U0: ["p1__j00"]}, scored_units={U0},
+            offsets=_offsets_json(offsets),
+        )
+        values.build_values(config)
+        return written(out_dir)[0]
+
+    plain, shifted = run({}), run({f"{LEVEL}:{PROBLEM}": {"c": 1.0}})
+    assert plain["orm_offset"] == 0.0 and plain["v_graded"] == pytest.approx(0.2)
+    assert shifted["orm_offset"] == 1.0 and shifted["v_graded"] == pytest.approx(0.4)
+
+
+def test_build_values_imputed_reports_the_campaigns_clip_rate(tmp_path):
+    # curve.n_clipped is a live counter aggregate_imputed drives and used to discard. A score
+    # of 9.0 is past the curve's last knot (5.0), so the label is the flat extrapolation --
+    # the distribution-shift signal, and free to count.
+    config, _ = imputed_campaign(
+        tmp_path, unit_rids={U0: ["p1__j00", "p1__j01"]}, scored_units={U0}, score=9.0
+    )
+    manifest = values.build_values(config)
+    assert manifest["curve_lookups"] == 2
+    assert manifest["clipped"] == 2
+    assert manifest["clip_rate_pct"] == pytest.approx(100.0)
+
+
+def test_a_campaign_inside_the_curves_range_clips_nothing(tmp_path):
+    config, _ = imputed_campaign(
+        tmp_path, unit_rids={U0: ["p1__j00"]}, scored_units={U0}, score=1.0
+    )
+    manifest = values.build_values(config)
+    assert manifest["clipped"] == 0 and manifest["clip_rate_pct"] == 0.0

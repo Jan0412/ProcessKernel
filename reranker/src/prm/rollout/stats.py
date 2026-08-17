@@ -351,13 +351,20 @@ def check_label_source(cfg_label_source: str, value_rows) -> str:
     return cfg_label_source
 
 
-def calibration_summary(out_dir: str, prefix_rows) -> dict | None:
-    """Job D's curve/offsets, surfaced into the campaign report -- ``None`` on a measured
-    campaign, which never wrote one. Read only (N7): unlike ``values.load_curve`` (which
-    REFUSES to apply a broken curve before labelling anything -- (c)/(d) of this task), a
-    report has to stay legible even when the curve it is describing IS broken, so the same
-    two defects are FLAGGED here (`curve_flags`) instead of raising.
+def calibration_summary(out_dir: str, prefix_rows, label_source: str) -> dict | None:
+    """Job D's curve, offsets and how its fit went, surfaced into the campaign report.
+
+    ``None`` unless THIS campaign's labels came from the curve. Keying off
+    ``calibrate_manifest.json`` existing was wrong: the level-1 validation sweep runs job D
+    beside a fully measured campaign, so the file is there and the report described a curve
+    that labelled nothing in it.
+
+    Read only (N7): unlike ``values.load_curve`` (which REFUSES to apply a broken curve before
+    labelling anything), a report has to stay legible even when the curve it is describing IS
+    broken, so the same defects are FLAGGED here (`curve_flags`) instead of raising.
     """
+    if label_source != "imputed":
+        return None
     manifest = read_json(os.path.join(out_dir, calibrate.CALIB_MANIFEST))
     if manifest is None:
         return None
@@ -368,10 +375,18 @@ def calibration_summary(out_dir: str, prefix_rows) -> dict | None:
 
     xs, resid = curve.get("knots_x") or [], curve.get("resid_var_by_band") or []
     flags = []
-    if any(a > b for a, b in zip(xs, xs[1:])):
-        flags.append("knots_x is not ascending -- np.interp would return garbage")
+    # `>=`, matching values.load_curve's refusal: a tie is not garbage to np.interp, but it
+    # makes one band unreachable by band(), so a report that passed it would disagree with
+    # the gate that would have refused the same file.
+    if any(a >= b for a, b in zip(xs, xs[1:])):
+        flags.append("knots_x is not strictly ascending -- np.interp would return garbage")
     if resid and all(v == 0.0 for v in resid):
         flags.append("resid_var_by_band is all zero -- se_imputed would understate its error")
+    fit = manifest.get("fit") or {}
+    # What the apply pass actually paid, off values_manifest.json: `Curve.n_clipped` is a live
+    # counter aggregate_imputed drove, and the share of rollouts that landed outside the
+    # curve's fitted score range is the distribution-shift signal job D's own fit cannot see.
+    valued = read_json(os.path.join(out_dir, values.VALUES_MANIFEST)) or {}
 
     campaign_problems = {f"{p.level}:{p.problem_id}" for p in prefix_rows}
     no_anchor = campaign_problems - set(offsets)
@@ -380,6 +395,19 @@ def calibration_summary(out_dir: str, prefix_rows) -> dict | None:
     return {
         "label_source": manifest.get("label_source"),
         "curve_flags": flags,
+        # A non-converged fit is not a footnote: the offsets and the curve were still moving
+        # when job D stopped, and every V-hat in the campaign came off that curve.
+        "fit": {
+            "converged": fit.get("converged"),
+            "n_iters": fit.get("n_iters"),
+            "max_offset_delta": fit.get("max_offset_delta"),
+            "max_knot_delta": fit.get("max_knot_delta"),
+        },
+        "clipped": {
+            "n": valued.get("clipped"),
+            "lookups": valued.get("curve_lookups"),
+            "rate_pct": valued.get("clip_rate_pct"),
+        },
         # band -> mean score -> mean target -> n, in one table (the fitted curve itself).
         "curve_bands": [
             {"band": i, "score": x, "target": y, "n": n}
@@ -511,7 +539,7 @@ def report(cfg) -> dict:
                 [n for _, n in enc_paired],
             ),
         },
-        "calibration": calibration_summary(out_dir, prefix_rows),
+        "calibration": calibration_summary(out_dir, prefix_rows, label_source),
         "depth": [
             {
                 "lo": band.lo,
@@ -663,6 +691,10 @@ def _f(x) -> str:
     return "n/a" if x is None else f"{x:.4f}"
 
 
+def _n(x) -> str:
+    return "n/a" if x is None else f"{x:,}"
+
+
 def render(out: dict) -> str:
     """The report as text; the same numbers ``rollout_stats.json`` carries."""
     p, sp, sz = out["pipeline"], out["spread"], out["list_sizes"]
@@ -726,12 +758,31 @@ def render(out: dict) -> str:
 
     cal = out.get("calibration")
     if cal is not None:
-        off = cal["offsets"]
+        off, fit, clip = cal["offsets"], cal["fit"], cal["clipped"]
+        # A banner, not a field: `converged: False` is the state of the real level-1 fit, and
+        # a reader who has to notice one key among forty will not. `None` (an old manifest
+        # that recorded no fit) shouts too -- unknown convergence is not convergence.
+        if not fit["converged"]:
+            lines += [
+                "",
+                "!" * 78,
+                f"!!  JOB D'S FIT DID NOT CONVERGE after {fit['n_iters']} iterations: "
+                f"max_offset_delta {_f(fit['max_offset_delta'])} (tol {calibrate.TOL}), "
+                f"max_knot_delta {_f(fit['max_knot_delta'])}",
+                "!!  every V-hat above was labelled from that curve -- raise curve_iters and "
+                "re-fit before trusting them",
+                "!" * 78,
+            ]
         lines += [
             "",
             f"calibration (label_source={cal['label_source']!r})"
             f"{'   FLAGS: ' + '; '.join(cal['curve_flags']) if cal['curve_flags'] else ''}",
+            f"  fit   converged {fit['converged']}   iters {fit['n_iters']}   "
+            f"max_offset_delta {_f(fit['max_offset_delta'])}   "
+            f"max_knot_delta {_f(fit['max_knot_delta'])}",
             f"  curve bands   " + str(cal["curve_bands"]),
+            f"  clipped   {_n(clip['n'])} of {_n(clip['lookups'])} curve lookups "
+            f"({_f(clip['rate_pct'])}%)   <- rollouts outside the curve's fitted score range",
             f"  offsets   tau2 {_f(off['tau2'])}   shrink_mean {_f(off['shrink_mean'])}   "
             f"clamp_rate {_f(off['clamp_rate'])}%   no_anchor_rate {_f(off['no_anchor_rate'])}%"
             f"   n_problems {off['n_problems']}",

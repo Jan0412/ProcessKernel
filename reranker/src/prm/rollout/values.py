@@ -56,6 +56,10 @@ NO_ROLLOUTS = "no_rollouts"
 # belongs on the campaign ledger beside TOO_FEW_ROLLOUTS, not on the per-row n_dropped dict.
 S1_FAIL = "s1_fail"
 LEDGER = REASONS + (TOO_FEW_ROLLOUTS, NO_ROLLOUTS, S1_FAIL)
+# Also on the campaign counter and deliberately NOT in LEDGER: not a drop, the denominator of
+# the campaign's clip rate. `Curve.n_clipped` counts lookups that fell outside the fitted
+# score range; the two together are the distribution-shift signal job D's own fit cannot see.
+CURVE_LOOKUPS = "curve_lookups"
 
 _SUBMISSION_ANALYZER = SubmissionAnalyzer()
 
@@ -322,7 +326,10 @@ def aggregate_imputed(prefix, rows, scores, curve, offsets, cfg, counts) -> Valu
             bands.append(0)
             continue
         x = scores[r.rollout_id] + c
+        counts[CURVE_LOOKUPS] += 1
         ts.append(curve.predict(x))
+        # The SAME corrected x predict() got: the knots and the band edges are one array, so
+        # banding the raw score would read se_imputed off a band the value never came from.
         bands.append(curve.band(x))
 
     n = len(ts)
@@ -368,8 +375,11 @@ def load_curve(out_dir: str) -> calibrate.Curve:
     """``curve.json``, validated beyond what `calibrate.curve_from_dict` checks (lengths and
     non-emptiness only):
 
-    - **Ascending knots.** A non-ascending ``knots_x`` makes ``np.interp`` return garbage
-      with no error, and this is the curve every imputed label trusts.
+    - **Strictly ascending knots.** A non-ascending ``knots_x`` makes ``np.interp`` return
+      garbage with no error, and this is the curve every imputed label trusts. Equal adjacent
+      knots are refused too: `np.interp` tolerates them, but `band`'s `searchsorted` then can
+      never return the earlier of the two, so one band's `resid_var_by_band` entry is dead and
+      `se_imputed` silently reports its neighbour's.
     - **A residual variance that was not silently filled with 0.0.** `calibrate.py` fills
       `resid_var_by_band` with 0.0 when no band anywhere had >= 2 points to estimate a
       residual from. 0.0 there claims a precision `se_imputed` never measured, not an
@@ -379,10 +389,11 @@ def load_curve(out_dir: str) -> calibrate.Curve:
     """
     curve = calibrate.read_curve(os.path.join(out_dir, calibrate.CURVE))
     xs = list(curve.knots_x)
-    if any(a > b for a, b in zip(xs, xs[1:])):
+    if any(a >= b for a, b in zip(xs, xs[1:])):
         raise ValueError(
-            f"{calibrate.CURVE} knots_x is not ascending: {xs} -- np.interp silently returns "
-            "garbage on an unsorted x, and this curve is what every imputed label trusts"
+            f"{calibrate.CURVE} knots_x is not strictly ascending: {xs} -- np.interp silently "
+            "returns garbage on an unsorted x, a tie makes one band unreachable by band(), "
+            "and this curve is what every imputed label trusts"
         )
     if curve.resid_var_by_band and all(v == 0.0 for v in curve.resid_var_by_band):
         raise ValueError(
@@ -421,23 +432,30 @@ def _unit_of(part_path: str) -> str:
     return name[: -len(".jsonl.gz")] if name.endswith(".jsonl.gz") else name
 
 
-def _assert_scores_complete(by_unit: dict[str, list], scores: dict) -> None:
-    """Every landed rollout unit must be fully scored before any value is written.
+def _assert_scores_complete(expected, by_unit: dict[str, list], scores: dict) -> None:
+    """Every unit the campaign plans must have landed, and every landed rollout must be scored.
 
-    `orm_score.score_unit` silently skips (writes nothing for) a unit whose job-B `.meta`
-    sidecar went missing, and that silence is indistinguishable on disk from a unit that
-    legitimately scored nothing -- both leave no part under `orm_score.ORM_SCORES`. On a
-    1.1M-row campaign a silent completeness gap here is worse than a crash, so this checks
-    every rollout of every landed unit has a score, and names exactly the units that do not.
+    `expected` is `orm_score.rollout_units(out_dir)` -- the unit index off `prefixes.jsonl`,
+    never a glob of what landed. A dead array task leaves no part on disk at all (the QoS cap
+    runs a 16-task array in waves, so this is a live failure mode), and an "expected" set
+    derived from the glob cannot see it: the unit is absent from `by_unit`, the check passes,
+    its prefixes fall through to NO_ROLLOUTS and the campaign writes short with no error. That
+    is precisely the failure this gate exists to prevent.
+
+    The second half is the other silence: `orm_score.score_unit` writes nothing for a unit
+    whose job-B `.meta` sidecar went missing, which on disk looks identical to a unit that
+    legitimately scored nothing. On a 1.1M-row campaign either gap is worse than a crash.
     """
-    missing = sorted(
+    absent = sorted(set(expected) - set(by_unit))
+    unscored = sorted(
         unit for unit, rows in by_unit.items() if any(r.rollout_id not in scores for r in rows)
     )
-    if missing:
+    if absent or unscored:
         raise ValueError(
-            f"{len(missing)} rollout unit(s) are missing an ORM score for at least one of "
-            f"their rollouts: {missing} -- run job B2 (orm_score.py) for them before writing "
-            "any imputed value; a partial campaign must fail loudly, not report short"
+            f"{len(absent) + len(unscored)} rollout unit(s) are incomplete -- "
+            f"{absent} never landed a rollout part (re-run job B for them), "
+            f"{unscored} are missing an ORM score for at least one rollout (re-run job B2); "
+            "a partial campaign must fail loudly, not report short"
         )
 
 
@@ -478,7 +496,10 @@ def build_values_imputed(cfg) -> dict:
         rows.extend(part_rows)
 
     raw_scores = read_rollout_scores(out_dir)
-    _assert_scores_complete(by_unit, raw_scores)      # gate (a): every landed unit is scored
+    # gate (a): every unit prefixes.jsonl plans has landed AND is scored. The expected set is
+    # orm_score's, off prefixes.jsonl -- `parts` above is what landed, which cannot detect a
+    # unit that never did.
+    _assert_scores_complete(orm_score.rollout_units(out_dir), by_unit, raw_scores)
     _assert_checkpoint_matches(
         raw_scores, calib_manifest.get("anchors", {}).get("orm_checkpoint_sha")
     )
@@ -511,6 +532,13 @@ def build_values_imputed(cfg) -> dict:
         "values": len(imputed),
         "shared": 0,
         "dropped": {reason: counts[reason] for reason in LEDGER},
+        # Not a drop: rollouts whose corrected score fell outside the curve's fitted range.
+        # `curve` was loaded here and nothing else touched it, so the counter is this pass's.
+        "curve_lookups": counts[CURVE_LOOKUPS],
+        "clipped": curve.n_clipped,
+        "clip_rate_pct": (
+            100.0 * curve.n_clipped / counts[CURVE_LOOKUPS] if counts[CURVE_LOOKUPS] else 0.0
+        ),
         # N7: what this build actually applied. A relabel under a different curve is visible
         # here without re-hashing anything.
         "curve_sha1": calib_manifest.get("curve_sha1"),

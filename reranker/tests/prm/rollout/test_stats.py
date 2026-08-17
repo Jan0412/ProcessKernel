@@ -394,11 +394,12 @@ def test_check_label_source_raises_on_a_mismatch():
 
 
 def test_calibration_summary_is_none_without_a_calibrate_manifest(tmp_path):
-    assert stats.calibration_summary(str(tmp_path), []) is None
+    assert stats.calibration_summary(str(tmp_path), [], "imputed") is None
 
 
 def _write_calibration(out_dir, *, knots_x=(0.0, 1.0), resid_var=(0.02, 0.02),
-                       offsets=None, orm_seen=4, orm_unseen=6, label_source="imputed"):
+                       offsets=None, orm_seen=4, orm_unseen=6, label_source="imputed",
+                       fit=None):
     (out_dir / calibrate.CURVE).write_text(json.dumps({
         "knots_x": list(knots_x), "knots_y": [0.0, 1.0], "resid_var_by_band": list(resid_var),
         "n_by_band": [3, 3], "n_fit": 6,
@@ -411,12 +412,22 @@ def _write_calibration(out_dir, *, knots_x=(0.0, 1.0), resid_var=(0.02, 0.02),
     }))
     (out_dir / calibrate.CALIB_MANIFEST).write_text(json.dumps({
         "label_source": label_source, "anchors": {"orm_seen": orm_seen, "orm_unseen": orm_unseen},
+        "fit": fit if fit is not None else {"converged": True, "n_iters": 3,
+                                           "max_offset_delta": 0.001, "max_knot_delta": 0.002},
     }))
+
+
+def test_calibration_summary_is_none_on_a_measured_campaign_that_also_ran_job_d(tmp_path):
+    # The level-1 validation sweep, which is a real campaign that just ran: job D fits and
+    # writes calibrate_manifest.json beside labels that came from evals, not from the curve.
+    # Keying the block off the file existing described a curve that labelled nothing.
+    _write_calibration(tmp_path, label_source="measured")
+    assert stats.calibration_summary(str(tmp_path), [pre("p0")], "measured") is None
 
 
 def test_calibration_summary_reports_the_curve_bands_offsets_and_orm_seen_split(tmp_path):
     _write_calibration(tmp_path)
-    cal = stats.calibration_summary(str(tmp_path), [pre("p0"), pre("p1")])
+    cal = stats.calibration_summary(str(tmp_path), [pre("p0"), pre("p1")], "imputed")
     assert cal["label_source"] == "imputed"
     assert cal["curve_flags"] == []
     assert cal["curve_bands"] == [
@@ -436,27 +447,54 @@ def test_calibration_summary_reports_the_curve_bands_offsets_and_orm_seen_split(
 
 def test_calibration_summary_counts_a_campaign_problem_with_no_offset(tmp_path):
     _write_calibration(tmp_path, offsets={})   # no problem has an offset at all
-    cal = stats.calibration_summary(str(tmp_path), [pre("p0")])
+    cal = stats.calibration_summary(str(tmp_path), [pre("p0")], "imputed")
     assert cal["offsets"]["no_anchor_rate"] == 100.0
 
 
 def test_calibration_summary_flags_a_non_ascending_curve_rather_than_raising(tmp_path):
     _write_calibration(tmp_path, knots_x=(1.0, 0.0))
-    cal = stats.calibration_summary(str(tmp_path), [])
+    cal = stats.calibration_summary(str(tmp_path), [], "imputed")
+    assert any("ascending" in f for f in cal["curve_flags"])
+
+
+def test_calibration_summary_flags_equal_adjacent_knots_too(tmp_path):
+    # Same rule values.load_curve refuses on: a tie leaves one band unreachable by band().
+    _write_calibration(tmp_path, knots_x=(1.0, 1.0))
+    cal = stats.calibration_summary(str(tmp_path), [], "imputed")
     assert any("ascending" in f for f in cal["curve_flags"])
 
 
 def test_calibration_summary_flags_an_all_zero_resid_var_rather_than_raising(tmp_path):
     _write_calibration(tmp_path, resid_var=(0.0, 0.0))
-    cal = stats.calibration_summary(str(tmp_path), [])
+    cal = stats.calibration_summary(str(tmp_path), [], "imputed")
     assert any("resid_var_by_band" in f for f in cal["curve_flags"])
+
+
+def test_calibration_summary_surfaces_whether_job_ds_fit_converged(tmp_path):
+    # The real level-1 fit is converged=False at max_knot_delta 0.0296, stable over 40-80
+    # iterations, and a campaign labelled from it must not look identical to a converged one.
+    _write_calibration(tmp_path, fit={"converged": False, "n_iters": 80,
+                                      "max_offset_delta": 0.02, "max_knot_delta": 0.0296})
+    cal = stats.calibration_summary(str(tmp_path), [], "imputed")
+    assert cal["fit"] == {"converged": False, "n_iters": 80,
+                          "max_offset_delta": 0.02, "max_knot_delta": 0.0296}
+
+
+def test_calibration_summary_reports_the_campaigns_clip_rate(tmp_path):
+    # values.py counts these while labelling and used to discard them; the share of rollouts
+    # landing outside the curve's fitted range is the distribution-shift signal.
+    _write_calibration(tmp_path)
+    _json(tmp_path / values.VALUES_MANIFEST,
+          {"curve_lookups": 400, "clipped": 7, "clip_rate_pct": 1.75})
+    cal = stats.calibration_summary(str(tmp_path), [], "imputed")
+    assert cal["clipped"] == {"n": 7, "lookups": 400, "rate_pct": 1.75}
 
 
 def test_report_surfaces_calibration_diagnostics_when_present(tmp_path):
     # A report has to stay legible even over a broken curve (values.load_curve REFUSES this
     # exact input before labelling anything -- see test_values.py); here it must flag, not
     # crash, and the rest of the report (spread, checks, ...) still comes back.
-    conf = campaign(tmp_path)
+    conf = campaign(tmp_path, label_source="imputed")
     _write_calibration(tmp_path / "campaign", knots_x=(1.0, 0.0), resid_var=(0.0, 0.0))
     out = stats.report(conf)
     assert out["calibration"]["curve_flags"]
@@ -465,15 +503,40 @@ def test_report_surfaces_calibration_diagnostics_when_present(tmp_path):
 
 
 def test_the_rendered_report_carries_the_calibration_block_when_present(tmp_path):
-    conf = campaign(tmp_path)
+    conf = campaign(tmp_path, label_source="imputed")
     _write_calibration(tmp_path / "campaign")
     text = stats.render(stats.report(conf))
     assert "calibration" in text
     assert "encoded seq. length" in text
 
 
+def test_the_rendered_report_shouts_when_the_fit_did_not_converge(tmp_path):
+    # Not a field forty keys down a JSON blob: 1.1M labels come off this curve, so a reader
+    # skimming the report has to trip over it.
+    conf = campaign(tmp_path, label_source="imputed")
+    _write_calibration(tmp_path / "campaign",
+                       fit={"converged": False, "n_iters": 80, "max_offset_delta": 0.02,
+                            "max_knot_delta": 0.0296})
+    text = stats.render(stats.report(conf))
+    assert "DID NOT CONVERGE" in text
+    assert "!!" in text
+
+
+def test_the_rendered_report_stays_quiet_when_the_fit_converged(tmp_path):
+    conf = campaign(tmp_path, label_source="imputed")
+    _write_calibration(tmp_path / "campaign")
+    text = stats.render(stats.report(conf))
+    assert "DID NOT CONVERGE" not in text
+    assert "converged True" in text
+
+
 def test_the_rendered_report_has_no_calibration_block_on_a_measured_campaign(tmp_path):
-    text = stats.render(stats.report(campaign(tmp_path)))
+    # The manifest IS written here, which is the case that actually occurs (the level-1
+    # validation sweep runs job D beside a measured campaign). Without it this test passed
+    # against a fixture that could not have shown the bug.
+    conf = campaign(tmp_path)
+    _write_calibration(tmp_path / "campaign", label_source="measured")
+    text = stats.render(stats.report(conf))
     assert "calibration (" not in text
 
 
@@ -496,9 +559,14 @@ def campaign(
     values_dropped=None,
     lists_dropped=None,
     stage_over=None,
+    label_source="measured",
     **over,
 ):
-    """Every artifact jobs A-D write, laid out as they lay it out. Returns the config."""
+    """Every artifact jobs A-D write, laid out as they lay it out. Returns the config.
+
+    ``label_source`` moves the config AND the ``values.jsonl`` rows together -- `report` cross-
+    checks the two (`check_label_source`), so a fixture that moved only one would not build.
+    """
     out = tmp_path / "campaign"
     (out / "rollouts").mkdir(parents=True, exist_ok=True)
     ps = [pre("p0"), pre("p1")] if ps is None else ps
@@ -510,7 +578,8 @@ def campaign(
         "".join(json.dumps(dataclasses.asdict(p)) + "\n" for p in ps)
     )
     (out / values.VALUES).write_text(
-        "".join(json.dumps(dataclasses.asdict(_value(pid, s))) + "\n" for pid, s in scores.items())
+        "".join(json.dumps(dataclasses.asdict(_value(pid, s, label_source))) + "\n"
+                for pid, s in scores.items())
     )
     for split, rows in (("train", train), ("val", val)):
         (out / lists.LISTS.format(split=split)).write_text(
@@ -538,16 +607,25 @@ def campaign(
     })
     if accounting is not None:
         _json(out / stats.ACCOUNTING, accounting)
-    return RerankerConfig(prm_rollout=cfg(out_dir=str(out), **over))
+    if label_source == "imputed":
+        over.setdefault("orm_checkpoint", "ck")   # config.validate refuses imputed without one
+    return RerankerConfig(prm_rollout=cfg(out_dir=str(out), label_source=label_source, **over))
 
 
-def _value(prefix_id, scores):
-    n = len(scores)
+def _value(prefix_id, scores, label_source="measured"):
+    n, imputed = len(scores), label_source == "imputed"
     return values.Value(
         prefix_id=prefix_id, K_requested=4, n_rollouts=n,
-        n_dropped={r: 0 for r in values.REASONS}, n_dedup_shared=0, n_compiled=n,
-        n_correct=sum(1 for s in scores if s > 0), v_binary=0.0,
-        v_graded=sum(scores) / n, se_binary=0.0, se_graded=0.0, scores=scores,
+        n_dropped={r: 0 for r in values.REASONS}, n_dedup_shared=0,
+        # N1: the measured-only counters are null on an imputed row, never 0.
+        n_compiled=None if imputed else n,
+        n_correct=None if imputed else sum(1 for s in scores if s > 0),
+        v_binary=None if imputed else 0.0,
+        v_graded=sum(scores) / n,
+        se_binary=None if imputed else 0.0,
+        se_graded=None if imputed else 0.0,
+        scores=scores, label_source=label_source,
+        orm_offset=0.0 if imputed else None, se_imputed=0.1 if imputed else None,
     )
 
 
