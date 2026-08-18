@@ -476,6 +476,45 @@ class PRMRolloutConfig:
 
 
 @dataclass
+class PRMTrainConfig:
+    """PRM listwise training (``reranker.src.prm.rollout.train``); see prm_plan/PLAN_TRAINER.md §6.
+
+    The lists, the prefixes, the v1 parts, the encoder's `max_length` and the depth bands are
+    read from `prm_rollout`; the backbone from `model`; the HF arguments from `train`. A second
+    copy of `out_dir` here would be a way for the trainer to read a different campaign than the
+    one job D wrote.
+    """
+
+    sigma: float = 1.0        # logistic slope, straight into lambdarank_loss
+    loss_alpha: float = 0.5   # correctness-vs-speed pair weighting, straight into lambdarank_loss
+
+    # How many val lists an eval scores. 0 = every one of them, so adding this knob moved no
+    # existing run's number. A campaign's val split is ~26k lists at ~3.2 prefixes each, and
+    # the eval runs every `eval_steps` -- uncapped that is ~1h per eval against ~14h of
+    # training, i.e. the measurement costs more than the thing measured.
+    eval_max_lists: int = 0
+    # Seeded because the cap has to draw the SAME lists in every arm of a backbone comparison:
+    # two runs scored on different subsets are not comparable, and nothing in the numbers
+    # would say so.
+    eval_subsample_seed: int = 42
+
+    def validate(self) -> None:
+        # softplus(-sigma * (s_i - s_j)) is constant at sigma=0 whatever the model does, so the
+        # loss stops depending on the scores and training is a no-op that still logs a curve.
+        if self.sigma <= 0:
+            raise ValueError(f"prm_train.sigma must be > 0, got {self.sigma}")
+        # Outside [0, 1] one of the two pair groups carries a negative weight, and the loss is
+        # then minimized by ranking that group wrong.
+        if not 0.0 <= self.loss_alpha <= 1.0:
+            raise ValueError(f"prm_train.loss_alpha must be in [0, 1], got {self.loss_alpha}")
+        if self.eval_max_lists < 0:
+            raise ValueError(
+                f"prm_train.eval_max_lists must be >= 0 (0 = every list), got "
+                f"{self.eval_max_lists}"
+            )
+
+
+@dataclass
 class MLflowConfig:
     db_file: str = "mlflow.db"
     experiment: str = "KernelReranker"
@@ -496,6 +535,32 @@ class RerankerConfig:
     listwise: ListwiseConfig = field(default_factory=ListwiseConfig)
     prm: PRMConfig = field(default_factory=PRMConfig)
     prm_rollout: PRMRolloutConfig = field(default_factory=PRMRolloutConfig)
+    prm_train: PRMTrainConfig = field(default_factory=PRMTrainConfig)
+
+
+def check_prm_budgets(cfg: RerankerConfig) -> list[str]:
+    """Cross the three token budgets against their models, and refuse a crossed backbone.
+
+    A section's own `validate()` cannot do this: it sees only itself, and every one of these
+    facts spans two sections (ARCHITECTURE S4). Returns the lines to log rather than printing,
+    so a caller decides where they go and a test can read them.
+    """
+    prm_name, orm_name = cfg.prm_rollout.base_model, cfg.model.base_model
+    if prm_name != orm_name:
+        raise ValueError(
+            f"prm_rollout.base_model ({prm_name!r}) and model.base_model ({orm_name!r}) name "
+            "different backbones. They are one model with two names -- the first is "
+            "rank_eval's tokenizer fallback, the second is what build_backbone loads -- so "
+            "crossed, training and job E would disagree about the tokenizer with every number "
+            "still computing. Set model.base_model in the PRM training config."
+        )
+    return [
+        f"gen  max_new_tokens={cfg.prm_rollout.max_new_tokens:<6} model={cfg.prm_rollout.gen_model}",
+        f"prm  max_length={cfg.prm_rollout.max_length:<10} model={prm_name}",
+        # Printed because it is the budget this job must NOT pick up: it bounds the ORM's
+        # SequenceEncoder over ref + kernel, not the PRM's prompt + raw[:cut_char].
+        f"orm  max_length={cfg.model.max_length:<10} model={orm_name}  (unused here)",
+    ]
 
 
 def _resolve(path: str) -> str:
@@ -565,15 +630,44 @@ def _apply_override(cfg: RerankerConfig, dotted_key: str, value: Any) -> None:
     setattr(obj, leaf, value)
 
 
+def _merge(base: dict, over: dict) -> dict:
+    """``over`` onto ``base``, recursing into dicts. A list replaces, never appends."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_yaml(path: str, seen: Optional[list[str]] = None) -> dict:
+    """Load a config YAML, first applying any ``_base:`` it inherits from.
+
+    The dataset variants differ in a handful of paths but must share every training
+    knob -- copied instead, one of six files silently drifts and the runs stop being
+    comparable. ``_base`` is resolved relative to the file that names it.
+    """
+    path = os.path.abspath(path)
+    seen = (seen or []) + [path]
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    base = raw.pop("_base", None)
+    if base is None:
+        return raw
+    base_path = base if os.path.isabs(base) else os.path.join(os.path.dirname(path), base)
+    if os.path.abspath(base_path) in seen:
+        raise ValueError(f"_base cycle: {' -> '.join(seen + [os.path.abspath(base_path)])}")
+    return _merge(_load_yaml(base_path, seen), raw)
+
+
 def load_config(argv: Optional[list[str]] = None) -> RerankerConfig:
     """Parse `--config path` plus dotted `key=value` overrides into a RerankerConfig."""
     parser = argparse.ArgumentParser(description="Kernel reranker pipeline")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     args, overrides = parser.parse_known_args(argv)
 
-    with open(args.config) as f:
-        raw = yaml.safe_load(f) or {}
-    cfg = _from_dict(RerankerConfig, raw)
+    cfg = _from_dict(RerankerConfig, _load_yaml(args.config))
 
     for item in overrides:
         if "=" not in item:

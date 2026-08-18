@@ -11,7 +11,15 @@ dependencies = [
     "kernelbench",
     "torch",
     "vllm==0.25.1",
-
+    # Both needed by reranker.src.prm.rollout.train, and neither was ever declared.
+    # Unpinned on purpose: they must resolve against the transformers and torch already in the
+    # venv, not drag them forward.
+    # HF's Trainer refuses to *construct* without accelerate -- so this blocks the three ORM
+    # trainers too, not only the PRM one. >=1.1.0 is the floor transformers itself names.
+    "accelerate>=1.1.0",
+    # build_training_args hardcodes report_to=["mlflow"], and the PRM trainer logs into the
+    # same mlflow.db as the ORM runs (ARCHITECTURE §9 prescribed this; it was never done).
+    "mlflow",
 ]
 
 [dependency-groups]
