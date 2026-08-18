@@ -6,11 +6,16 @@
 #
 #   CONFIG=reranker/configs/prm_train_qwen3base06b.yaml sbatch scripts/prm_train.sh
 #
-# `_base: prm_rollout.yaml` inherits the campaign section whole, so the trainer reads the
-# exact out_dir / parts_glob / max_length / depth bands job D wrote. Previously these were
-# copied into this file and a parity test kept the copy honest; inheriting removes the copy.
+# `_base` inherits the campaign section whole, so the trainer reads the exact out_dir /
+# parts_glob / max_length / depth bands job D wrote. Previously these were copied into this
+# file and a parity test kept the copy honest; inheriting removes the copy.
+#
+# prm_rollout_l6_r0, not prm_rollout: both are the gpt-oss kb6 corpus with the same list
+# bounds, backbone and depth bands, but this one is round 0 only and `label_source: imputed`
+# -- the v3 campaign whose labels come from the ORM through calibrate's curve. Point this
+# back at prm_rollout.yaml to train on the measured [0,1,2] build instead.
 
-_base: prm_rollout.yaml
+_base: prm_rollout_l6_r0.yaml
 
 model:
   # base_model comes from the arm. head_type and attention are shared so a difference
@@ -43,10 +48,12 @@ train:
   # Mandatory, not an economy: one list is up to 8 prefixes x 16,384 tokens in one forward.
   gradient_checkpointing: true
   logging_steps: 10
-  # ~951 steps/epoch at effective batch 128, so 3 epochs is ~2,854 steps and 75 gives ~38
-  # evals -- enough to locate the turn, which the ORM found at ~epoch 2.5 of 8.
-  eval_steps: 75
-  save_steps: 75                   # must stay a multiple of eval_steps for load_best_model_at_end
+  # 19,702 train lists at effective batch 128 is ~154 steps/epoch, so 3 epochs is ~462 steps
+  # -- an eighth of the [0,1,2] build this was first sized for. 25 gives ~18 evals; the 75
+  # that gave ~38 there would give 6 here, and load_best_model_at_end would be choosing the
+  # turn from six points.
+  eval_steps: 25
+  save_steps: 25                   # must stay a multiple of eval_steps for load_best_model_at_end
   save_total_limit: 2
   # The override's whole point: eval_pr_auc is pointwise and this trainer never computes it,
   # so load_best_model_at_end would never find its key.

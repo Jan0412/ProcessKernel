@@ -6,8 +6,9 @@
 #SBATCH --account=YOUR_ACCOUNT
 #SBATCH --qos=YOUR_QOS
 #SBATCH --nodes=1
-# 4 on one node. Data-parallel over lists: the corpus is ~121,800 train lists at ~4,000
-# tokens each, which is ~14h of forward+backward on one H100 and ~4h on four.
+# 4 on one node. Data-parallel over lists. Sized for the [0,1,2] build's ~121,800 train
+# lists (~14h of forward+backward on one H100, ~4h on four); the l6_r0 campaign is 19,702,
+# so ~2h of training against ~1.5h of eval -- the wall clock below is unchanged margin.
 #SBATCH --gres=gpu:h100:4
 #
 # Excluded (2026-08-13): node01 is the only node whose driver (590.48.01) satisfies torch
