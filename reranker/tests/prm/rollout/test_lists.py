@@ -16,7 +16,7 @@ import yaml
 
 from reranker.src.config import PRMRolloutConfig, RerankerConfig
 from reranker.src.data.labels import speed_p
-from reranker.src.prm.rollout import lists, prefixes, values
+from reranker.src.prm.rollout import calibrate, lists, prefixes, values
 
 TAG = "ar"
 LEVEL, PROBLEM, ROUND, DEPTH = 2, 37, 0, 20
@@ -343,3 +343,58 @@ def test_an_imputed_items_se_is_se_imputed_not_se_graded():
         (pre("p2"), val("p2", v_graded=0.0, label_source="imputed", se_imputed=0.09)),
     )
     assert [item.se for item in row.items] == [0.05, 0.09]
+
+
+# --- drop_dead_problems: a problem no anchor of which ever passed -------------------------
+#
+# Its imputed V̂ are all the ORM's invention and so is their order, and the ALL_EQUAL drop
+# above cannot see it: imputed V̂ are floats and never tie. The dead set is decided by
+# calibrate.py, which is the only job that loads the anchors, and read back here.
+
+
+def dead_file(out_dir, *pkeys):
+    (out_dir / calibrate.OFFSETS).write_text(
+        json.dumps({"meta": {}, "offsets": {}, "dead": list(pkeys)}))
+
+
+def test_a_dead_problems_lists_are_dropped_and_counted(tmp_path):
+    config, out_dir = campaign(tmp_path, drop_dead_problems=True)
+    dead_file(out_dir, f"{LEVEL}:{PROBLEM}")
+    manifest = lists.build_lists(config)
+    assert manifest["dropped"][lists.DEAD_PROBLEM] == 1
+    assert manifest["lists"] == {"train": 0, "val": 0}
+    assert read_lists(out_dir, "train") == []
+
+
+def test_a_live_problem_is_untouched_by_the_filter(tmp_path):
+    config, out_dir = campaign(tmp_path, drop_dead_problems=True)
+    dead_file(out_dir, "6:999")
+    manifest = lists.build_lists(config)
+    assert manifest["dropped"][lists.DEAD_PROBLEM] == 0
+    assert len(read_lists(out_dir, "train")) == 1
+
+
+def test_the_filter_is_off_unless_the_config_asks_for_it(tmp_path):
+    # Level 1 is measured and keeps every list; only an imputed campaign turns this on.
+    config, out_dir = campaign(tmp_path)
+    dead_file(out_dir, f"{LEVEL}:{PROBLEM}")
+    manifest = lists.build_lists(config)
+    assert manifest["dropped"][lists.DEAD_PROBLEM] == 0
+    assert len(read_lists(out_dir, "train")) == 1
+
+
+def test_the_filter_refuses_to_run_before_job_d_has(tmp_path):
+    # Silently dropping nothing would look exactly like a campaign with no dead problems.
+    config, _ = campaign(tmp_path, drop_dead_problems=True)
+    with pytest.raises(FileNotFoundError, match="calibrate"):
+        lists.build_lists(config)
+
+
+def test_a_dead_list_is_counted_once_and_not_also_as_all_equal(tmp_path):
+    # The ledger has to add up: every list leaves by exactly one door.
+    config, out_dir = campaign(tmp_path, pairs=(("p1", 0.5), ("p2", 0.5)),
+                               drop_dead_problems=True)
+    dead_file(out_dir, f"{LEVEL}:{PROBLEM}")
+    manifest = lists.build_lists(config)
+    assert manifest["dropped"][lists.DEAD_PROBLEM] == 1
+    assert manifest["dropped"][lists.ALL_EQUAL] == 0

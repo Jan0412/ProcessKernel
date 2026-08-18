@@ -28,7 +28,10 @@ from reranker.src.prm.rollout import orm_score
 CURVE, OFFSETS = "curve.json", "offsets.json"
 CALIB_MANIFEST = "calibrate_manifest.json"
 
-TOL = 0.01          # offset units -- the alternating fit's convergence test
+TOL = 0.01          # offset units -- the alternating fit's convergence test, applied to
+TOL_TAIL = 0.01     # every problem but the worst 1%: a few sit on the clamp boundary and
+                    # flip forever without moving the fit
+DAMP = 0.5          # how far the offset state steps toward each new solve
 MIN_BAND = 2        # below this a band cannot estimate a residual variance of its own
 NO_INFO_VAR = 1e6   # the variance of an offset the curve carries no information about
 MIN_INFORMATIVE_FRAC = 0.1   # below this share of problems informing tau2, main warns
@@ -171,6 +174,12 @@ def read_curve(path: str) -> Curve:
         return curve_from_dict(json.load(f))
 
 
+def curve_fit_sample(anchors, conf) -> list:
+    """The anchors the curve is fit on. One definition, so fit_isotonic and the manifest's
+    reported target_dist cannot disagree about what was fitted."""
+    return list(anchors) if conf.curve_fit_orm_seen else [a for a in anchors if not a.orm_seen]
+
+
 def fit_isotonic(anchors, offsets: dict, conf) -> Curve:
     """Equal-count bands over OFFSET-CORRECTED scores, band means, then PAVA via sklearn.
 
@@ -179,13 +188,20 @@ def fit_isotonic(anchors, offsets: dict, conf) -> Curve:
     through them would read every rollout hot. Monotonicity is enforced rather than hoped
     for -- it is the ORM's only claim, and a sparse band that inverts by chance would
     otherwise assert something the ORM never said.
+
+    `curve_fit_orm_seen` overrides that exclusion, and level 6 needs it: the ORM's listwise
+    build kept the lists containing correct kernels, so there "unseen" is very nearly "this
+    problem had no correct kernel" -- 99.6% of the unseen anchors are target 0 and the curve
+    collapses to [0.0000, 0.0422]. An exclusion selected on the label costs more than the
+    memorization it avoids, which on this corpus is +0.169 score at target 0 and -0.268 at
+    target > 0.5 -- small, and not even one-directional.
     """
-    fit = [a for a in anchors if not a.orm_seen]
+    fit = curve_fit_sample(anchors, conf)
     if not fit:
         raise ValueError(
             f"no ORM-unseen anchors to fit the curve on ({len(anchors)} anchors, every one of "
             "them in the ORM's training lists) -- fitting on memorized scores is what "
-            "orm_lists_glob exists to prevent"
+            "orm_lists_glob exists to prevent; set curve_fit_orm_seen to fit on them anyway"
         )
     xs = np.array([a.score + offsets.get(a.pkey, 0.0) for a in fit], dtype=float)
     ys = np.array([a.target for a in fit], dtype=float)
@@ -239,8 +255,12 @@ def _solve(anchors, curve: Curve, clamp: float) -> tuple[float, bool]:
     return (lo + hi) / 2, False
 
 
+def _shrink(tau2: float, var: dict, keys) -> dict:
+    return {p: (tau2 / (tau2 + var[p]) if tau2 + var[p] > 0 else 0.0) for p in keys}
+
+
 def eb_shrink(c_hat: dict, var: dict, kappa="auto", n_anchors: dict | None = None,
-              informative=None) -> dict:
+              informative=None, tau2: float | None = None) -> dict:
     """Per-problem shrink factors toward c = 0. `auto` is empirical Bayes, tau2/(tau2+var_i).
 
     tau2 is estimated over `informative` only -- by default the problems whose variance is
@@ -260,6 +280,11 @@ def eb_shrink(c_hat: dict, var: dict, kappa="auto", n_anchors: dict | None = Non
         return {"tau2": None, "tau2_raw": None, "tau2_estimable": False,
                 "n_informative": len(core),
                 "shrink": {p: n_anchors[p] / (n_anchors[p] + k) for p in c_hat}}
+    if tau2 is not None:
+        # Frozen by fit_joint after its first pass -- see its docstring for why re-estimating
+        # it every pass cannot converge.
+        return {"tau2": tau2, "tau2_raw": tau2, "tau2_estimable": True,
+                "n_informative": len(core), "shrink": _shrink(tau2, var, c_hat)}
     if len(core) < 2:
         # Fewer than two usable ĉ is no ensemble to borrow strength from. The one problem (if
         # any) that IS identified keeps its solved offset -- Var over a single value is 0 by
@@ -278,8 +303,7 @@ def eb_shrink(c_hat: dict, var: dict, kappa="auto", n_anchors: dict | None = Non
     # floored 0.0 and a measured 0.0 mean very different things.
     tau2 = max(0.0, tau2_raw)
     return {"tau2": tau2, "tau2_raw": tau2_raw, "tau2_estimable": True,
-            "n_informative": len(core),
-            "shrink": {p: (tau2 / (tau2 + var[p]) if tau2 + var[p] > 0 else 0.0) for p in c_hat}}
+            "n_informative": len(core), "shrink": _shrink(tau2, var, c_hat)}
 
 
 def _no_offsets_meta(conf) -> dict:
@@ -291,7 +315,7 @@ def _no_offsets_meta(conf) -> dict:
             "frac_informative": 0.0, "shrink_mean": 0.0, "n_problems": 0}
 
 
-def fit_offsets(anchors, curve: Curve, conf) -> tuple[dict, dict]:
+def fit_offsets(anchors, curve: Curve, conf, tau2: float | None = None) -> tuple[dict, dict]:
     """One offset per problem, moment-matched against `curve` then shrunk.
 
     Uses **all** of a problem's anchors, memorized ones included: the contamination bias
@@ -314,7 +338,7 @@ def fit_offsets(anchors, curve: Curve, conf) -> tuple[dict, dict]:
     # value, so it would widen the spread on nothing; a no-information ĉ is not a measurement
     # at all. Both are still shrunk with everyone else, just not used to estimate the spread.
     core = {p for p in raw if var[p] < NO_INFO_VAR and not clamped[p]}
-    eb = eb_shrink(raw, var, conf.offset_kappa, n, informative=core)
+    eb = eb_shrink(raw, var, conf.offset_kappa, n, informative=core, tau2=tau2)
     out = {p: {"c": raw[p] * eb["shrink"][p], "raw": raw[p], "var": var[p],
                "shrink": eb["shrink"][p], "n_anchors": n[p], "clamped": clamped[p]}
            for p in raw}
@@ -346,6 +370,33 @@ def read_offsets(path: str) -> tuple[dict, dict]:
     return blob["offsets"], blob["meta"]
 
 
+def dead_problems(anchors) -> list[str]:
+    """Problems every anchor of which failed. A problem with no anchors is absent: unknown,
+    not dead."""
+    best: dict[str, float] = {}
+    for a in anchors:
+        if a.target > best.get(a.pkey, -1.0):
+            best[a.pkey] = a.target
+    return sorted(p for p, t in best.items() if t <= 0.0)
+
+
+def read_dead(path: str) -> set[str]:
+    """Beside `offsets` rather than inside it: a problem is dead by what its anchors measured,
+    which the offsets-off ablation (`use_anchors: false`, offsets == {}) must not erase."""
+    with open(path) as f:
+        return set(json.load(f).get("dead", []))
+
+
+def _offset_step(c: dict, new: dict, damp: bool) -> tuple[dict, float, float]:
+    """The next offset state, the worst move, and the worst move outside the top 1%."""
+    moves = sorted(abs(new[p]["c"] - c.get(p, 0.0)) for p in new)
+    if not moves:
+        return {}, 0.0, 0.0
+    nxt = {p: c.get(p, 0.0) + DAMP * (new[p]["c"] - c.get(p, 0.0)) if damp else new[p]["c"]
+           for p in new}
+    return nxt, moves[-1], moves[-1 - int(TOL_TAIL * len(moves))]
+
+
 def fit_joint(anchors, conf) -> tuple[Curve, dict, dict]:
     """One pooled fit averages across the offset spread and flattens the curve (PLAN_v3 §2).
 
@@ -354,10 +405,18 @@ def fit_joint(anchors, conf) -> tuple[Curve, dict, dict]:
 
     `c_i` is difficulty plus the ORM's arbitrary per-problem drift, confounded, and nothing
     downstream needs to tell them apart. Do not report it as "problem difficulty".
+
+    tau2 is frozen after the first pass. It measures how much problems still differ, and
+    applying the offsets is exactly what makes them stop differing -- re-estimating it every
+    pass erases its own evidence, and the fit cycles with period 2 rather than converging
+    (offsets at full spread, then zeroed as noise, forever). The offset state is then damped
+    toward each solve instead of replaced by it, which settles the few problems sitting on
+    the clamp boundary. Damping cannot move the fixed point: where two values agree, so does
+    their mean.
     """
     c: dict[str, float] = {}
     curve, meta, new = None, {}, {}
-    knots, delta_k = None, None
+    knots, delta_k, tau2, tau2_raw = None, None, None, None
     for it in range(max(1, conf.curve_iters)):
         curve = fit_isotonic(anchors, c, conf)
         # Diagnostic only, and on the knot *values*: convergence is tested on the offsets,
@@ -369,13 +428,19 @@ def fit_joint(anchors, conf) -> tuple[Curve, dict, dict]:
             # The offsets-off ablation. Full meta, not a short one: main() and the manifest
             # read the same keys on both paths.
             return curve, {}, {**_no_offsets_meta(conf), "n_iters": it + 1, "converged": True,
-                               "max_offset_delta": 0.0, "max_knot_delta": delta_k}
-        new, meta = fit_offsets(anchors, curve, conf)
-        delta = max((abs(new[p]["c"] - c.get(p, 0.0)) for p in new), default=0.0)
-        c = {p: new[p]["c"] for p in new}
-        meta |= {"n_iters": it + 1, "converged": delta < TOL, "max_offset_delta": float(delta),
+                               "max_offset_delta": 0.0, "p99_offset_delta": 0.0,
+                               "max_knot_delta": delta_k}
+        new, meta = fit_offsets(anchors, curve, conf, tau2)
+        if tau2 is None:
+            tau2, tau2_raw = meta["tau2"], meta["tau2_raw"]
+        # tau2_raw is pass 1's, and says whether the frozen value was floored; a later pass
+        # is handed tau2 and has nothing of its own to report.
+        meta["tau2_raw"] = tau2_raw
+        c, delta, delta_q = _offset_step(c, new, damp=bool(it))
+        meta |= {"n_iters": it + 1, "converged": delta_q < TOL,
+                 "max_offset_delta": float(delta), "p99_offset_delta": float(delta_q),
                  "max_knot_delta": delta_k}
-        if delta < TOL:
+        if delta_q < TOL:
             break
     return curve, new, meta
 
@@ -504,20 +569,23 @@ def calibrate(cfg) -> dict:
     anchors, ledger = load_anchors(cfg)
     curve, offsets, meta = fit_joint(anchors, conf)
 
-    dist = {"fit": target_dist([a for a in anchors if not a.orm_seen]),
+    dist = {"fit": target_dist(curve_fit_sample(anchors, conf)),
             "all": target_dist(anchors)}
     curve_path = os.path.join(out_dir, CURVE)
     offsets_path = os.path.join(out_dir, OFFSETS)
     build.write_atomic(curve_path, json.dumps(
         {**curve.to_dict(), "curve_bins": conf.curve_bins,
          "orm_checkpoint_sha": ledger["orm_checkpoint_sha"], "target_dist": dist}, indent=2))
-    build.write_atomic(offsets_path, json.dumps({"meta": meta, "offsets": offsets}, indent=2))
+    dead = dead_problems(anchors)
+    build.write_atomic(offsets_path, json.dumps(
+        {"meta": meta, "offsets": offsets, "dead": dead}, indent=2))
 
     manifest = {
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "config": dataclasses.asdict(conf),
         "label_source": conf.label_source,
         "anchors": ledger,
+        "dead_problems": len(dead),
         "fit": meta,
         "curve": {"n_knots": len(curve.knots_x), "n_fit": curve.n_fit,
                   "y_lo": float(curve.knots_y[0]), "y_hi": float(curve.knots_y[-1]),
@@ -551,8 +619,8 @@ def summary(manifest: dict) -> tuple[list[str], list[str]]:
     if not fit["converged"]:
         warn.append(
             f"WARNING: the alternating fit did not converge in {fit['n_iters']} iterations "
-            f"(max_offset_delta={fit['max_offset_delta']:.4f} > {TOL}) -- raise curve_iters "
-            "before trusting these labels")
+            f"(p99_offset_delta={fit['p99_offset_delta']:.4f} > {TOL}) -- the offsets are "
+            "still moving, so these labels depend on where the loop stopped")
     if fit["n_problems"] > 1 and fit["kappa_mode"] == "auto" and not fit["tau2_estimable"]:
         # Says what eb_shrink's degrade branch actually does: every unidentified offset goes
         # to 0 and at most one survives. With none surviving the run is the pooled fit, which
@@ -804,7 +872,7 @@ def _fit_curve_then_offsets(curve_anchors, offset_anchors, cfg) -> tuple[Curve, 
     """
     c: dict = {}
     curve, meta, new = None, {}, {}
-    knots, delta_k = None, None
+    knots, delta_k, tau2, tau2_raw = None, None, None, None
     for it in range(max(1, cfg.curve_iters)):
         curve = fit_isotonic(curve_anchors, c, cfg)
         delta_k = None if knots is None or len(knots) != len(curve.knots_y) else float(
@@ -812,13 +880,17 @@ def _fit_curve_then_offsets(curve_anchors, offset_anchors, cfg) -> tuple[Curve, 
         knots = curve.knots_y
         if not cfg.use_anchors:
             return curve, {}, {**_no_offsets_meta(cfg), "n_iters": it + 1, "converged": True,
-                               "max_offset_delta": 0.0, "max_knot_delta": delta_k}
-        new, meta = fit_offsets(offset_anchors, curve, cfg)
-        delta = max((abs(new[p]["c"] - c.get(p, 0.0)) for p in new), default=0.0)
-        c = {p: new[p]["c"] for p in new}
-        meta |= {"n_iters": it + 1, "converged": delta < TOL, "max_offset_delta": float(delta),
+                               "max_offset_delta": 0.0, "p99_offset_delta": 0.0,
+                               "max_knot_delta": delta_k}
+        new, meta = fit_offsets(offset_anchors, curve, cfg, tau2)
+        if tau2 is None:
+            tau2, tau2_raw = meta["tau2"], meta["tau2_raw"]
+        meta["tau2_raw"] = tau2_raw
+        c, delta, delta_q = _offset_step(c, new, damp=bool(it))
+        meta |= {"n_iters": it + 1, "converged": delta_q < TOL,
+                 "max_offset_delta": float(delta), "p99_offset_delta": float(delta_q),
                  "max_knot_delta": delta_k}
-        if delta < TOL:
+        if delta_q < TOL:
             break
     return curve, new, meta
 

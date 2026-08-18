@@ -67,14 +67,32 @@ prm_rollout:
   # v3: level 6 has no evals, so it is labelled by the ORM.
   label_source: imputed
   orm_checkpoint: reranker/data/checkpoints_listwise_kb_deepseek_gptoss_all_rounds_speed_moderate/final
-  orm_lists_glob: reranker/data/lists_{train,val}_kb_deepseek_gptoss_all_rounds_speed_moderate.jsonl
+  # `data/`, NOT `reranker/data/`: this one goes through _resolve, which prepends reranker/,
+  # so the shipped prefix doubled it and matched nothing. (orm_checkpoint below is used raw,
+  # hence its different prefix.) Ends at _speed_moderate so the model-suffixed siblings
+  # (_dscoder13b, _qwen*) cannot match -- exactly two files.
+  orm_lists_glob: data/lists_*_kb_deepseek_gptoss_all_rounds_speed_moderate.jsonl
   orm_max_length: 6144
   orm_reserve_ref_tokens: 1024
   orm_batch_size: 16
+  # The ORM trained on kb6, and its listwise build kept the lists holding correct kernels, so
+  # excluding what it saw leaves a fit sample that is 99.6% target 0 and a curve pinned to
+  # [0.0000, 0.0422]. Fitting on everything gives [0.0005, 0.6145] -- level 1's own curve is
+  # [0.0000, 0.6302]. Level 1 needs no such key: it has 0 seen anchors.
+  curve_fit_orm_seen: true
   curve_bins: 40
-  curve_iters: 3
+  curve_iters: 16
   offset_kappa: auto
   offset_clamp: 4.0
   use_anchors: true
-  anchor_rounds: [0]
+  # Wider than `rounds` on purpose. A prefix cut from round 1-2 measures a degraded policy and
+  # is excluded; an anchor is only a (score, target) pair, and the offsets need many per
+  # problem -- round 0 alone gives 3.98, where var_i swamps the between-problem spread and
+  # tau2 floors to 0, i.e. every offset is 0. Rounds 0-2 give 8.35 (level 1 has 34.99).
+  anchor_rounds: [0, 1, 2]
   calib_speed_quant: 0.0
+  # Level 6 is labelled by the ORM, so a problem no anchor of which ever passed hands its lists
+  # an order nothing measured. Scored against level 1's truth, thinned to this campaign's 8.35
+  # anchors/problem: catches ~60% of those lists at the cost of ~16% of the good ones. Taken
+  # deliberately -- fewer, cleaner labels beat more noisy ones.
+  drop_dead_problems: true

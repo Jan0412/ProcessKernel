@@ -361,12 +361,20 @@ class PRMRolloutConfig:
     orm_reserve_ref_tokens: int = 1024
     orm_batch_size: int = 16
 
+    # Fit the curve on the memorized anchors too. Off by default; on where excluding them
+    # would leave a fit sample selected on the label. See fit_isotonic.
+    curve_fit_orm_seen: bool = False
+
     curve_bins: int = 40
-    curve_iters: int = 3
+    curve_iters: int = 16
     offset_kappa: Union[str, float] = "auto"  # a number forces the fixed n/(n+kappa) form
     offset_clamp: float = 4.0             # ORM-score units
     use_anchors: bool = True
     anchor_rounds: list[int] = field(default_factory=lambda: [0])
+    # Drop every list of a problem whose anchors all failed -- the ORM invented its order.
+    # Off by default: scored on level 1 it also costs 16% of the good lists at level 6's
+    # anchor density. See lists.build_lists.
+    drop_dead_problems: bool = False
     # Anchors are re-graded here, not at build time: graded_target takes the speedup ratio
     # and v1 rows store speedup_min. 0.0 is what the ORM trained under.
     calib_speed_quant: float = 0.0

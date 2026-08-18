@@ -81,6 +81,20 @@ def test_fit_isotonic_refuses_an_all_seen_anchor_set():
         calibrate.fit_isotonic(_anchors([(x, 1.0) for x in range(20)], seen=True), {}, _cfg())
 
 
+def test_curve_fit_orm_seen_puts_the_memorized_anchors_back_in():
+    # On level 6 the exclusion is selected on the label, so it collapses the curve instead of
+    # protecting it. The flag has to reach both the fit count and the knots.
+    clean = _anchors([(x, 0.0) for x in range(20)], seen=False)
+    seen = _anchors([(x, 1.0) for x in range(20)], seen=True)
+    c = calibrate.fit_isotonic(clean + seen, {}, _cfg(curve_bins=5, curve_fit_orm_seen=True))
+    assert c.n_fit == 40 and max(c.knots_y) > 0.4
+
+
+def test_curve_fit_orm_seen_makes_an_all_seen_anchor_set_fittable():
+    a = _anchors([(x, 1.0) for x in range(20)], seen=True)
+    assert calibrate.fit_isotonic(a, {}, _cfg(curve_fit_orm_seen=True)).n_fit == 20
+
+
 def test_offset_corrected_scores_are_what_the_knots_are_placed_on():
     a = _anchors([(0.0, 0.0), (1.0, 1.0)], pid=3)
     c = calibrate.fit_isotonic(a, {"6:3": 5.0}, _cfg(curve_bins=2))
@@ -326,7 +340,7 @@ def test_alternating_fit_recovers_the_truth_the_pooled_fit_flattens():
     # s - c_true, so the fit is checked against numbers no fitting code produced.
     a = _two_offset_problems()
     flat, _, _ = calibrate.fit_joint(a, _cfg(curve_iters=1))
-    good, off, meta = calibrate.fit_joint(a, _cfg(curve_iters=3))
+    good, off, meta = calibrate.fit_joint(a, _cfg(curve_iters=6))
     # Not the span: the extreme knots come from whichever problem reaches furthest and are
     # unflattened either way. The slope through the overlap is what pooling averages out.
     slope = lambda c: c.predict(1.0) - c.predict(-1.0)             # noqa: E731
@@ -337,6 +351,69 @@ def test_alternating_fit_recovers_the_truth_the_pooled_fit_flattens():
     assert off["6:2"]["c"] == pytest.approx(+2.0, abs=0.15)
     assert 3.5 < meta["tau2"] < 4.5                                # Var([-2, +2]) = 4
     assert meta["converged"] is True and meta["max_offset_delta"] < calibrate.TOL
+
+
+def test_tau2_is_frozen_after_the_first_pass():
+    # The fix for the period-2 cycle. tau2 asks how much problems still differ; applying the
+    # offsets is what makes them stop, so a pass-2 estimate reads its own effect and collapses.
+    a = _two_offset_problems()
+    first = calibrate.fit_joint(a, _cfg(curve_iters=1))[2]["tau2"]
+    for iters in (2, 3, 4, 5, 8):
+        assert calibrate.fit_joint(a, _cfg(curve_iters=iters))[2]["tau2"] == first
+
+
+def test_the_fit_converges_geometrically_instead_of_cycling():
+    # Before damping + freezing this alternated between two states forever, and the reported
+    # delta never fell: on level 6 it sat at ~1.39 for twenty passes.
+    a = _two_offset_problems()
+    deltas = [calibrate.fit_joint(a, _cfg(curve_iters=i))[2]["max_offset_delta"]
+              for i in range(1, 7)]
+    assert deltas == sorted(deltas, reverse=True)                  # monotone, never a cycle
+    for prev, cur in zip(deltas[1:], deltas[2:]):                  # halving, per DAMP = 0.5
+        assert cur == pytest.approx(prev * calibrate.DAMP, rel=0.3)
+    assert calibrate.fit_joint(a, _cfg(curve_iters=6))[2]["converged"] is True
+
+
+def test_an_even_and_an_odd_iteration_count_now_agree():
+    # The bug this replaced: curve_iters was a parity switch. Odd landed on offsets at full
+    # spread, even on offsets zeroed against a curve fit as though they were not -- so an
+    # even value silently shipped an incoherent fit.
+    a = _two_offset_problems()
+    _, even, m_even = calibrate.fit_joint(a, _cfg(curve_iters=4))
+    _, odd, m_odd = calibrate.fit_joint(a, _cfg(curve_iters=5))
+    assert m_even["tau2"] == m_odd["tau2"]
+    for pkey in ("6:1", "6:2"):
+        assert even[pkey]["c"] == pytest.approx(odd[pkey]["c"], abs=0.02)
+
+
+def test_the_convergence_test_ignores_the_worst_one_percent_but_not_on_a_small_fit():
+    # A few problems sit on the clamp boundary and flip forever without moving the fit.
+    big = {f"p{i}": {"c": 0.0} for i in range(200)}
+    big["p0"]["c"] = 99.0                                          # the one wild mover
+    _, worst, trimmed = calibrate._offset_step({}, big, damp=False)
+    assert worst == 99.0 and trimmed == 0.0
+    # Under 100 problems there is no 1% to trim, so nothing is hidden.
+    small = {"p0": {"c": 99.0}, "p1": {"c": 0.0}}
+    _, worst, trimmed = calibrate._offset_step({}, small, damp=False)
+    assert worst == 99.0 and trimmed == 99.0
+
+
+def test_damping_moves_the_state_halfway_and_leaves_the_returned_offsets_alone():
+    # Damping is on the iteration state only: the offsets fit_joint returns stay the exact
+    # moment-match against the curve it returns, which is what N7's consumers apply.
+    nxt, _, _ = calibrate._offset_step({"p": 0.0}, {"p": {"c": 1.0}}, damp=True)
+    assert nxt["p"] == pytest.approx(0.5)
+    nxt, _, _ = calibrate._offset_step({"p": 0.0}, {"p": {"c": 1.0}}, damp=False)
+    assert nxt["p"] == pytest.approx(1.0)
+
+
+def test_eb_shrink_uses_a_frozen_tau2_verbatim_instead_of_estimating_one():
+    out = calibrate.eb_shrink(c_hat={1: 0.01, 2: -0.01}, var={1: 0.25, 2: 0.25}, tau2=4.0)
+    assert out["tau2"] == 4.0 and out["tau2_raw"] == 4.0 and out["tau2_estimable"] is True
+    assert out["shrink"][1] == pytest.approx(4.0 / 4.25)
+    # Same inputs, estimating: these c_hat have no spread at all, so it would shrink to ~0.
+    free = calibrate.eb_shrink(c_hat={1: 0.01, 2: -0.01}, var={1: 0.25, 2: 0.25})
+    assert free["shrink"][1] < 0.01
 
 
 def test_a_fit_that_did_not_converge_says_so():
@@ -528,7 +605,7 @@ def test_calibrate_writes_a_curve_and_offsets_and_shas_both_into_the_manifest(tm
     assert curve["n_fit"] == 20                       # 24 anchors, 4 of them memorized
 
     offsets = json.loads(open(os.path.join(out_dir, calibrate.OFFSETS)).read())
-    assert set(offsets) == {"meta", "offsets"}
+    assert set(offsets) == {"meta", "offsets", "dead"}
     assert set(offsets["offsets"]) == {"6:1", "6:2"}
     assert set(offsets["offsets"]["6:1"]) == {"c", "raw", "var", "shrink", "n_anchors",
                                               "clamped"}
@@ -945,3 +1022,64 @@ def test_load_anchors_carries_the_score_rows_code_length(tmp_path):
     cfg = _campaign(tmp_path, rows, scores)
     anchors, _ = calibrate.load_anchors(cfg)
     assert anchors[0].n_code_tokens == 3
+
+
+# --- the dead set ---------------------------------------------------------------------------
+#
+# A problem no anchor of which ever passed. Every V̂ in its lists is then the ORM's invention
+# and so is their order -- and lists.py's all-equal drop cannot catch it, because imputed V̂
+# are floats and never tie. Decided here rather than in lists.py because this is the only job
+# that loads the anchors.
+
+
+def _dead_campaign(tmp_path, **over):
+    """Problem 1 never passes; problem 2 passes twice."""
+    rows, scores = [], []
+    for pid, passing in ((1, ()), (2, (1, 2))):
+        for sid in range(3):
+            correct = sid in passing
+            row = _row(pid=pid, sid=sid, correct=correct,
+                       speedup_min=2.0 if correct else None,
+                       speedup=2.0 if correct else None)
+            rows.append(row)
+            scores.append(_score_row(row, 1.0 if correct else -2.0))
+    return _campaign(tmp_path, rows, scores, curve_bins=2, **over)
+
+
+def test_dead_problems_names_only_the_problem_whose_anchors_all_failed():
+    anchors = (_anchors([(-3.0, 0.0), (-2.0, 0.0)], pid=1)
+               + _anchors([(-3.0, 0.0), (1.0, 0.6)], pid=2))
+    assert calibrate.dead_problems(anchors) == ["6:1"]
+
+
+def test_one_passing_anchor_is_enough_to_keep_a_problem_alive():
+    # The predicate is evidence of failure, not weight of it: 11 failures and one pass is a
+    # problem the policy can solve, and its lists rank something real.
+    anchors = _anchors([(-3.0, 0.0)] * 11 + [(2.0, 0.05)], pid=7)
+    assert calibrate.dead_problems(anchors) == []
+
+
+def test_calibrate_writes_the_dead_set_and_counts_it_in_the_manifest(tmp_path):
+    cfg = _dead_campaign(tmp_path)
+    manifest = calibrate.calibrate(cfg)
+    path = os.path.join(cfg.prm_rollout.out_dir, calibrate.OFFSETS)
+    assert calibrate.read_dead(path) == {"6:1"}
+    assert manifest["dead_problems"] == 1
+
+
+def test_the_dead_set_survives_the_offsets_off_ablation(tmp_path):
+    # Why it sits beside `offsets` rather than inside it: use_anchors=false writes offsets {},
+    # which would take every per-problem field with it -- including one that is not an offset.
+    cfg = _dead_campaign(tmp_path, use_anchors=False)
+    calibrate.calibrate(cfg)
+    path = os.path.join(cfg.prm_rollout.out_dir, calibrate.OFFSETS)
+    assert calibrate.read_offsets(path)[0] == {}
+    assert calibrate.read_dead(path) == {"6:1"}
+
+
+def test_an_offsets_file_written_before_the_dead_set_existed_reads_as_empty(tmp_path):
+    # Not a default that hides a bug: lists.py only consults this when drop_dead_problems is
+    # on, and an empty set there means "drop nothing", which is the pre-existing behaviour.
+    path = tmp_path / "offsets.json"
+    path.write_text(json.dumps({"meta": {}, "offsets": {}}))
+    assert calibrate.read_dead(str(path)) == set()

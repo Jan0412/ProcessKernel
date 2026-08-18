@@ -20,17 +20,18 @@ from dataclasses import dataclass
 from reranker.src.config import _resolve, load_config
 from reranker.src.data.splits import load_splits
 from reranker.src.prm.build import write_atomic
-from reranker.src.prm.rollout import prefixes, stage, values
+from reranker.src.prm.rollout import calibrate, prefixes, stage, values
 from reranker.src.prm.rollout.prefixes import TRAIN, VAL
 
 LISTS = "lists_{split}.jsonl"
 LISTS_MANIFEST = "lists_manifest.json"
 
 TOO_SMALL, ALL_EQUAL = "too_small", "all_equal"
+DEAD_PROBLEM = "dead_problem"
 # A problem v1 held back for test: v2 writes train and val only, so it is counted out here
 # rather than silently landing in one of them.
 OTHER_SPLIT = "other_split"
-LEDGER = (TOO_SMALL, ALL_EQUAL, OTHER_SPLIT)
+LEDGER = (TOO_SMALL, ALL_EQUAL, DEAD_PROBLEM, OTHER_SPLIT)
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,22 @@ def build_lists(cfg) -> dict:
     # label sets, putting a v2 val problem in v1's train set with nothing able to see it.
     splits = load_splits(_resolve(rollout_cfg.splits_json))
 
+    # A problem no anchor of which ever passed. The measured drop below cannot fire on it --
+    # imputed V̂ are floats and never tie -- so its lists survive carrying an order the ORM
+    # invented. On level 1, where the truth is known, the predicate is right about 9 problems
+    # in 10 at that level's anchor density and catches 60% of the invented-order lists, but it
+    # is density-dependent: at level 6's 8.35 anchors/problem it also destroys 16% of the good
+    # ones. Hence a knob, off by default, and only worth turning on where labels are imputed.
+    dead: set[str] = set()
+    if rollout_cfg.drop_dead_problems:
+        offsets_path = os.path.join(out_dir, calibrate.OFFSETS)
+        if not os.path.exists(offsets_path):
+            raise FileNotFoundError(
+                f"drop_dead_problems needs {offsets_path}: the dead set is decided from the "
+                "anchors, which only calibrate.py loads, so job D must run before this one"
+            )
+        dead = calibrate.read_dead(offsets_path)
+
     counts: Counter = Counter()
     built: dict[str, list[ListRow]] = {TRAIN: [], VAL: []}
     for key, members in sorted(group(prefix_rows, value_rows).items()):
@@ -199,6 +216,10 @@ def build_lists(cfg) -> dict:
         split = splits[first.level, first.problem_id]
         if split not in (TRAIN, VAL):
             counts[OTHER_SPLIT] += 1
+            continue
+        # Before build_one so the ledger adds up: a dead list is counted once, here.
+        if f"{first.level}:{first.problem_id}" in dead:
+            counts[DEAD_PROBLEM] += 1
             continue
         row = build_one(key, members, split, rollout_cfg, counts)
         if row is not None:

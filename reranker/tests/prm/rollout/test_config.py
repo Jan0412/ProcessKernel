@@ -254,7 +254,10 @@ def test_v3_defaults_match_the_orm_checkpoint():
     assert c.orm_max_length == 6144              # listwise_base.yaml, not PLAN_v3's 4096
     assert c.orm_reserve_ref_tokens == 1024
     assert c.calib_speed_quant == 0.0            # what the ORM trained under
-    assert c.curve_bins == 40 and c.curve_iters == 3
+    # A ceiling, not a schedule: the damped fit halves its residual per pass and breaks
+    # out when it converges -- level 1 stops at 14. 3 was chosen when the loop cycled
+    # and the count only picked a phase.
+    assert c.curve_bins == 40 and c.curve_iters == 16
     assert c.offset_kappa == "auto" and c.offset_clamp == 4.0
     assert c.use_anchors is True
     assert c.anchor_rounds == [0]
