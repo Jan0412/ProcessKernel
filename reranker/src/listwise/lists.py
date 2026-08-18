@@ -24,8 +24,8 @@ candidate list, referencing source rows by ``(run_name, sample_id)`` with their
 validation / model selection).
 
 Usage:
-    bash reranker/scripts/build_lists.sh [configs/listwise_config.yaml]
-    python -m reranker.src.listwise.lists --config configs/listwise_config.yaml
+    bash reranker/scripts/build_lists.sh [configs/listwise_kb_deepseek_gptoss.yaml]
+    python -m reranker.src.listwise.lists --config configs/listwise_kb_deepseek_gptoss.yaml
 """
 
 from __future__ import annotations
@@ -43,6 +43,29 @@ from reranker.src.data.labels import code_hash, speed_p
 def _read_jsonl(path: str) -> list[dict]:
     with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+# What a list is built from. The rest of the row -- kernel_src and ref_arch_src, ~6.7 KB of
+# the ~7 -- is never read here, only hashed, so it is dropped as each line is parsed rather
+# than held for the whole build. Keeping it is what put the 132k-row all-rounds build over
+# this machine's 8 GiB cgroup limit and got it killed between the dataset and the lists.
+_LIST_FIELDS = (
+    "level", "problem_id", "run_name", "sample_id", "compiled", "label", "speedup", "speedup_min"
+)
+
+
+def _read_candidates(path: str) -> list[dict]:
+    """Stream the source dataset into just the fields a list needs, plus the source hash."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            full = json.loads(line)
+            row = {k: full.get(k) for k in _LIST_FIELDS}
+            row["code_hash"] = code_hash(full["kernel_src"])
+            rows.append(row)
+    return rows
 
 
 # --- fresh problem-level train/val split (mirrors pairwise/pairs.py) ----------
@@ -128,7 +151,7 @@ def _build_list_for_problem(rows: list[dict], lw, rng: random.Random) -> list[di
         if not r.get("compiled"):
             continue
         if lw.dedup_by_code_hash:
-            h = code_hash(r["kernel_src"])
+            h = r["code_hash"]
             if h in seen:
                 continue
             seen.add(h)
@@ -210,7 +233,7 @@ def build_lists(cfg: RerankerConfig) -> tuple[str, str, str]:
             f"Source dataset not found: {source_path}. Build it with reranker.src.data.build_dataset first."
         )
 
-    rows = _read_jsonl(source_path)
+    rows = _read_candidates(source_path)
     by_problem: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:
         by_problem[(r["level"], r["problem_id"])].append(r)

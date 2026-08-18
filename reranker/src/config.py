@@ -35,6 +35,11 @@ BASELINE_TIMING_JSON = (
 @dataclass
 class DataConfig:
     run_dirs: list[str] = field(default_factory=list)
+    # Which lint-loop rounds to read out of each run. null = the run root, i.e. only the
+    # kernel each sample finished on. A list expands every shard into rounds/round_R, giving
+    # the earlier attempts as extra candidates. Never both: the root kernel is byte-identical
+    # to its own final round, so a run read twice would grade one kernel as two candidates.
+    rounds: Optional[list[int]] = None
     level: Union[int, list[int]] = 1
     kernelbench_dir: str = ".."
     dataset_jsonl: str = "data/dataset.jsonl"
@@ -360,15 +365,44 @@ def _apply_override(cfg: RerankerConfig, dotted_key: str, value: Any) -> None:
     setattr(obj, leaf, value)
 
 
+def _merge(base: dict, over: dict) -> dict:
+    """``over`` onto ``base``, recursing into dicts. A list replaces, never appends."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_yaml(path: str, seen: Optional[list[str]] = None) -> dict:
+    """Load a config YAML, first applying any ``_base:`` it inherits from.
+
+    The dataset variants differ in a handful of paths but must share every training
+    knob -- copied instead, one of six files silently drifts and the runs stop being
+    comparable. ``_base`` is resolved relative to the file that names it.
+    """
+    path = os.path.abspath(path)
+    seen = (seen or []) + [path]
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    base = raw.pop("_base", None)
+    if base is None:
+        return raw
+    base_path = base if os.path.isabs(base) else os.path.join(os.path.dirname(path), base)
+    if os.path.abspath(base_path) in seen:
+        raise ValueError(f"_base cycle: {' -> '.join(seen + [os.path.abspath(base_path)])}")
+    return _merge(_load_yaml(base_path, seen), raw)
+
+
 def load_config(argv: Optional[list[str]] = None) -> RerankerConfig:
     """Parse `--config path` plus dotted `key=value` overrides into a RerankerConfig."""
     parser = argparse.ArgumentParser(description="Kernel reranker pipeline")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     args, overrides = parser.parse_known_args(argv)
 
-    with open(args.config) as f:
-        raw = yaml.safe_load(f) or {}
-    cfg = _from_dict(RerankerConfig, raw)
+    cfg = _from_dict(RerankerConfig, _load_yaml(args.config))
 
     for item in overrides:
         if "=" not in item:

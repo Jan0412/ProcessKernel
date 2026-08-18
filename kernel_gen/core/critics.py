@@ -61,7 +61,12 @@ def lint_critic(
         submission_report = submission.analyze(code, path="<generated>")
         blocked = blocking.feedback(submission_report, previous_check_ids)
 
-        shown = blocked if blocked.text is not None else feedback(
+        # ABLATION (one-off, revert after): the submission gate no longer feeds the
+        # prompt, so the loop is linter-only and `clean` means "lints clean" again --
+        # an unloadable file now ends its slot. `blocked` is still computed above, so
+        # submission_ok and the S1 findings are recorded as before, just never shown.
+        # shown = blocked if blocked.text is not None else feedback(
+        shown = feedback(
             report,
             previous_check_ids=previous_check_ids,
             max_findings=max_findings,

@@ -11,9 +11,9 @@ Steps:
   6. Log params, metrics, the resolved config, and the best model to MLflow.
 
 Usage:
-    python -m reranker.src.listwise.train --config configs/listwise_config.yaml
-    python -m reranker.src.listwise.train --config configs/listwise_config.yaml listwise.sigma=2.0
-    python -m reranker.src.listwise.train --config configs/listwise_config.yaml train.max_steps=20   # smoke test
+    python -m reranker.src.listwise.train --config configs/listwise_kb_deepseek_gptoss.yaml
+    python -m reranker.src.listwise.train --config configs/listwise_kb_deepseek_gptoss.yaml listwise.sigma=2.0
+    python -m reranker.src.listwise.train --config configs/listwise_kb_deepseek_gptoss.yaml train.max_steps=20   # smoke test
 """
 
 from __future__ import annotations
