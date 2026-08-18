@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from collections import defaultdict
 from collections.abc import Iterator
 
 import numpy as np
@@ -43,6 +44,10 @@ class Anchor:
     score: float        # the raw ORM logit, uncorrected
     target: float       # the re-graded v1 target, [0, 1]
     orm_seen: bool      # in the ORM's own training lists -- excluded from the CURVE fit only
+    # Defaulted so every existing positional Anchor(...) construction still works. Added for
+    # validate()'s _length_control (Task 5): the ORM's pair accuracy has to be checked against
+    # code length, and length lives on the score row, not anywhere else this module carries.
+    n_code_tokens: int = 0
 
     @property
     def pkey(self) -> str:
@@ -455,7 +460,8 @@ def load_anchors(cfg) -> tuple[list[Anchor], dict]:
             ledger["no_target"] += 1
             continue
         ledger["orm_seen" if is_seen else "orm_unseen"] += 1
-        out.append(Anchor(s["id"], level, problem_id, float(s["orm_score"]), target, is_seen))
+        out.append(Anchor(s["id"], level, problem_id, float(s["orm_score"]), target, is_seen,
+                          int(s["n_code_tokens"])))
     ledger["kept"] = len(out)
     ledger["problems"] = len({a.pkey for a in out})
     return out, ledger
@@ -573,6 +579,328 @@ def summary(manifest: dict) -> tuple[list[str], list[str]]:
             f"NOTE: label_source={manifest['label_source']!r} -- this is a validation fit "
             "against measured labels; nothing may be labelled from this curve")
     return lines, warn
+
+
+# --- validate: level-1 full-corpus calibration check ---------------------------------------
+#
+# Level 1 is 100% measured. Production, on level 6, fits the curve and every problem's offset
+# on that problem's own already-evaluated anchors, then applies it to that SAME problem's
+# newly generated rollouts -- the curve has seen the problems it labels, never the kernels.
+# The headline here is the identical composition run on level 1: fit_joint on every level-1
+# anchor (no problem split anywhere), impute every level-1 prefix from its own rollouts,
+# compare to its own measured V̂. `pair_agreement` from that run is the gate (>= 0.65) on
+# whether level 6 gets 1.1M imputed labels. The core-size sweep below is a separate
+# DIAGNOSTIC (how many problems' anchors the CURVE needs), never the gate.
+
+PAIR_GAP = 0.15           # validate()'s headline threshold: pairs closer than this are noise
+LENGTH_DECILES = 10       # _length_control's length-conditioning granularity
+
+
+@dataclasses.dataclass(frozen=True)
+class Measured:
+    """One level-1 prefix's ground truth, keyed by prefix_id in the `measured` map `validate`
+    takes. `round` and `depth_bucket` are not in the brief's docstring ("prefix -> (list_key,
+    V̂, level, pid)") but are required by its own prose ("per depth bucket and per round"),
+    and by nothing else this module carries -- they have to live here.
+    """
+
+    list_key: str
+    v: float               # measured V̂ (job C's own evaluation, never touches the ORM)
+    level: int
+    problem_id: int
+    round: int
+    depth_bucket: int
+
+    @property
+    def pkey(self) -> str:
+        return f"{self.level}:{self.problem_id}"
+
+
+def _impute_one(prefix_id: str, m: Measured, rollout_scores: dict, curve: Curve,
+                offsets: dict) -> float | None:
+    """A prefix's imputed V̂: mean of curve.predict(score + offset) over its own rollouts' raw
+    ORM scores -- the same lookup Task 6's aggregate_imputed uses, minus the drop bookkeeping
+    this check does not need. `None`, not 0.0, when the prefix has no scored rollouts: a
+    missing score is a data gap, not a measurement of zero.
+    """
+    scores = rollout_scores.get(prefix_id)
+    if not scores:
+        return None
+    c = offset_for(offsets, m.level, m.problem_id)
+    return float(np.mean([curve.predict(s + c) for s in scores]))
+
+
+def _cal_error(measured: dict, imputed: dict) -> float | None:
+    diffs = [abs(imputed[p] - measured[p].v) for p in measured if p in imputed]
+    return float(np.mean(diffs)) if diffs else None
+
+
+def _slice(measured: dict, imputed: dict, key) -> dict:
+    """cal_error by `key(m)` -- a good average hiding a bad bucket is exactly what per-round
+    and per-depth-bucket reporting exists to catch. `n` rides along so a 2-point bucket is
+    not read the way a 200-point one is.
+    """
+    by_bucket = defaultdict(list)
+    for p, m in measured.items():
+        if p in imputed:
+            by_bucket[key(m)].append(abs(imputed[p] - m.v))
+    return {str(k): {"cal_error": float(np.mean(v)), "n": len(v)}
+            for k, v in sorted(by_bucket.items(), key=lambda kv: str(kv[0]))}
+
+
+def _pair_agreement(measured: dict, imputed: dict, gap: float = PAIR_GAP) -> dict:
+    """The headline number: of prefix pairs INSIDE ONE LIST whose measured V̂ differ by more
+    than `gap`, the fraction the imputed labels order the same way. Within a list, never
+    across problems -- lambdarank only ever compares two items sharing a list, so that is the
+    only scale a shell label's ordering is ever asked to be right on. Strict `>` on the gap: a
+    pair sitting exactly on the boundary is not evidence either way. An imputed tie (equal
+    values) counts as disagreement -- it failed to preserve an order that was there to
+    preserve, whatever the reason.
+    """
+    by_list = defaultdict(list)
+    for p, m in measured.items():
+        if p in imputed:
+            by_list[m.list_key].append((m.v, imputed[p]))
+    agree = n = 0
+    for items in by_list.values():
+        for i, (vi, ti) in enumerate(items):
+            for vj, tj in items[i + 1:]:
+                if abs(vi - vj) <= gap:
+                    continue
+                n += 1
+                agree += (vi > vj) == (ti > tj)
+    return {"pair_agreement": (agree / n) if n else None, "n_pairs": n}
+
+
+def _pkey_pairs(anchors, gap: float = PAIR_GAP):
+    """Within-problem anchor pairs whose measured target differs by more than `gap` -- the
+    population `_length_control`'s pair-accuracy numbers are computed over. Within-problem for
+    the same reason as `_pair_agreement`: a raw ORM score is not on a shared scale across
+    problems (that is what the offset corrects for), so an across-problem pair is not
+    comparable at all.
+    """
+    by_p = defaultdict(list)
+    for a in anchors:
+        by_p[a.pkey].append(a)
+    for group in by_p.values():
+        for i, ai in enumerate(group):
+            for aj in group[i + 1:]:
+                if abs(ai.target - aj.target) > gap:
+                    yield ai, aj
+
+
+def _pair_acc(pairs) -> float | None:
+    pairs = list(pairs)
+    if not pairs:
+        return None
+    return sum((a.score > b.score) == (a.target > b.target) for a, b in pairs) / len(pairs)
+
+
+def _length_control(anchors, gap: float = PAIR_GAP, n_deciles: int = LENGTH_DECILES) -> dict:
+    """The ORM's raw-score pair accuracy, overall and length-controlled.
+
+    Length-controlled = restricted to pairs whose two anchors share a length decile: within a
+    decile length cannot tell the pair apart, so whatever accuracy survives there is not
+    length. If `decile_mean` sits well below `overall`, the overall number is mostly length
+    doing the work -- the ORM is a length proxy, imputed labels built on it would inherit
+    that, and the shell must not ship. This is the one diagnostic in the sweep that is not
+    about the curve or the offsets at all: a perfectly calibrated curve fit on a length proxy
+    is still a length proxy.
+    """
+    all_pairs = list(_pkey_pairs(anchors, gap))
+    overall = _pair_acc(all_pairs)
+    lengths = np.array([a.n_code_tokens for a in anchors], dtype=float)
+    if lengths.size == 0 or lengths.max() == lengths.min():
+        return {"overall": overall, "decile_mean": None, "decile_min": None, "n_deciles_used": 0}
+    edges = np.quantile(lengths, np.linspace(0, 1, n_deciles + 1))
+    decile_of = {a.key: int(np.clip(np.searchsorted(edges[1:-1], a.n_code_tokens, side="right"),
+                                    0, n_deciles - 1))
+                 for a in anchors}
+    by_decile = defaultdict(list)
+    for a, b in all_pairs:
+        if decile_of[a.key] == decile_of[b.key]:
+            by_decile[decile_of[a.key]].append((a, b))
+    accs = [acc for acc in (_pair_acc(p) for p in by_decile.values()) if acc is not None]
+    return {"overall": overall, "decile_mean": float(np.mean(accs)) if accs else None,
+            "decile_min": float(np.min(accs)) if accs else None, "n_deciles_used": len(accs)}
+
+
+def _fit_error_row(eval_problems: set, msg: str) -> dict:
+    """The shape a fold/ablation reports when its fit raised. Same keys a real fit returns
+    (`main`'s summary and Task 8 read one shape), every metric `None`, the reason named --
+    visible in the output, never a silently shortened sweep or ablation table.
+    """
+    return {"eval_problems": sorted(eval_problems), "fit_error": msg,
+            "cal_error": None, "cal_error_by_round": {}, "cal_error_by_depth": {},
+            "pair_agreement": None, "n_pairs": 0, "n_clipped": None, "tau2": None,
+            "clamp_rate": None, "no_anchor_rate": None, "n_missing_scores": None,
+            "c_std": None, "converged": False, "max_knot_delta": None}
+
+
+def _measure_fit(curve: Curve, offsets: dict, meta: dict, rollout_scores: dict,
+                 measured: dict) -> dict:
+    """Impute every prefix in `measured` from `rollout_scores` against an already-fitted
+    `curve`/`offsets`, and report every diagnostic against the ground truth. Pure comparison,
+    agnostic to how the fit was produced -- shared by the full-corpus headline/ablations and
+    the core-size sweep's curve-subset diagnostic, so both report off the identical machinery.
+
+    `curve.n_clipped` is a live counter that also incremented on every `_solve` bisection call
+    inside `fit_offsets` -- one problem's offset solve alone can be dozens of predict() calls,
+    many of them out of range while the search still brackets. Snapshotting it here, before
+    this function's own impute loop runs, is what keeps the reported figure the imputation
+    signal Task 7 gates on (rollouts landing outside the curve's fitted range) rather than
+    solver noise from fitting.
+    """
+    clipped_before = curve.n_clipped
+    imputed: dict = {}
+    n_missing = 0
+    for p, m in measured.items():
+        v = _impute_one(p, m, rollout_scores, curve, offsets)
+        if v is None:
+            n_missing += 1
+        else:
+            imputed[p] = v
+    eval_problems = {m.pkey for m in measured.values()}
+    no_anchor = eval_problems - set(offsets)
+    return {
+        "eval_problems": sorted(eval_problems), "fit_error": None,
+        "cal_error": _cal_error(measured, imputed),
+        "cal_error_by_round": _slice(measured, imputed, key=lambda m: m.round),
+        "cal_error_by_depth": _slice(measured, imputed, key=lambda m: m.depth_bucket),
+        **_pair_agreement(measured, imputed),
+        "n_clipped": curve.n_clipped - clipped_before, "tau2": meta.get("tau2"),
+        "clamp_rate": meta.get("n_clamped", 0) / max(len(offsets), 1),
+        "no_anchor_rate": (len(no_anchor) / len(eval_problems)) if eval_problems else None,
+        "n_missing_scores": n_missing,
+        "c_std": meta.get("c_std_core"), "converged": meta.get("converged"),
+        "max_knot_delta": meta.get("max_knot_delta"),
+    }
+
+
+def _fold(anchors, rollout_scores, measured, cfg) -> dict:
+    """The full-corpus headline, or an ablation of it: fit_joint on every one of `anchors` --
+    no problem split -- then impute and compare every prefix in `measured`. This is exactly
+    production's own composition (curve and every problem's offset from the SAME anchor set),
+    which is why it is the number the gate reads, not the core-size sweep below.
+    """
+    try:
+        curve, offsets, meta = fit_joint(anchors, cfg)
+    except ValueError as e:
+        return _fit_error_row({m.pkey for m in measured.values()}, str(e))
+    return _measure_fit(curve, offsets, meta, rollout_scores, measured)
+
+
+def _fit_curve_then_offsets(curve_anchors, offset_anchors, cfg) -> tuple[Curve, dict, dict]:
+    """`fit_joint`'s own alternation (curve <-> offsets), decoupled: the curve is refit on
+    `curve_anchors` every iteration, offsets on `offset_anchors` -- so a problem can inform
+    the curve, the offsets, both or neither, independently. `fit_joint` takes one anchor set
+    and cannot express that, and it is not to be changed for this; this composes the same two
+    calls it makes (`fit_isotonic`, `fit_offsets`, both untouched) over two different sets.
+
+    Mirrors `fit_joint`'s `use_anchors=False` early return too: today every caller (the
+    core-size sweep, its stability re-draws) always passes a `cfg` with `use_anchors=True`, so
+    this branch is unreached, but the two functions are meant to do the same thing and a
+    silent divergence here would be a trap for whoever reuses this with a different `cfg`.
+    """
+    c: dict = {}
+    curve, meta, new = None, {}, {}
+    knots, delta_k = None, None
+    for it in range(max(1, cfg.curve_iters)):
+        curve = fit_isotonic(curve_anchors, c, cfg)
+        delta_k = None if knots is None or len(knots) != len(curve.knots_y) else float(
+            np.max(np.abs(curve.knots_y - knots)))
+        knots = curve.knots_y
+        if not cfg.use_anchors:
+            return curve, {}, {**_no_offsets_meta(cfg), "n_iters": it + 1, "converged": True,
+                               "max_offset_delta": 0.0, "max_knot_delta": delta_k}
+        new, meta = fit_offsets(offset_anchors, curve, cfg)
+        delta = max((abs(new[p]["c"] - c.get(p, 0.0)) for p in new), default=0.0)
+        c = {p: new[p]["c"] for p in new}
+        meta |= {"n_iters": it + 1, "converged": delta < TOL, "max_offset_delta": float(delta),
+                 "max_knot_delta": delta_k}
+        if delta < TOL:
+            break
+    return curve, new, meta
+
+
+def _curve_subset_fold(curve_anchors, offset_anchors, rollout_scores, measured, cfg) -> dict:
+    """One core-size sweep row: the CURVE is fit on `curve_anchors` (a subset of problems),
+    but every evaluated problem still gets its own offset from `offset_anchors` (every
+    problem's own anchors) and evaluation still covers every prefix in `measured` -- never a
+    held-out problem. Answers "how few problems' anchors does the curve need", not "does the
+    method generalize to an unseen problem" (production never sees one: every level-6 problem
+    contributes anchors from its own already-evaluated v1 candidates).
+    """
+    try:
+        curve, offsets, meta = _fit_curve_then_offsets(curve_anchors, offset_anchors, cfg)
+    except ValueError as e:
+        return _fit_error_row({m.pkey for m in measured.values()}, str(e))
+    return _measure_fit(curve, offsets, meta, rollout_scores, measured)
+
+
+def _stability(anchors, rollout_scores, measured, cfg, n: int, seed: int, n_reps: int) -> dict:
+    """Independent re-draws of the CURVE's fit subset at this size (offsets, as always, use
+    every problem's own anchors): is the diagnostic's number the population's, or one core
+    sample's luck? Spawned off (seed, n) via numpy's SeedSequence so every core_size gets its
+    own reproducible substream, independent of how many sizes ran before it in the sweep.
+    """
+    problems = sorted({a.pkey for a in anchors})
+    cals, agrees = [], []
+    for child in np.random.SeedSequence([seed, n]).spawn(n_reps):
+        rng = np.random.default_rng(child)
+        core = set(rng.choice(problems, size=min(n, len(problems)), replace=False).tolist())
+        curve_anchors = [a for a in anchors if a.pkey in core]
+        fold = _curve_subset_fold(curve_anchors, anchors, rollout_scores, measured, cfg)
+        if fold["cal_error"] is not None:
+            cals.append(fold["cal_error"])
+        if fold["pair_agreement"] is not None:
+            agrees.append(fold["pair_agreement"])
+    return {"n_reps": n_reps, "n_usable": len(cals),
+            "cal_error_mean": float(np.mean(cals)) if cals else None,
+            "cal_error_std": float(np.std(cals)) if cals else None,
+            "pair_agreement_mean": float(np.mean(agrees)) if agrees else None,
+            "pair_agreement_std": float(np.std(agrees)) if agrees else None}
+
+
+def validate(anchors, rollout_scores, measured, cfg, core_sizes=(4, 8, 12, 20, 40), seed=42,
+             n_reps=3) -> dict:
+    """The headline: fit_joint on EVERY level-1 anchor (no problem split -- production's own
+    composition, run here against measured truth instead of nothing), impute every level-1
+    prefix from its own rollouts, compare to its own measured V̂. `pair_agreement` from this
+    run is the number gated at >= 0.65; `cal_error` (overall, by round, by depth) is reported
+    from the same run. On level 1 every anchor is ORM-unseen -- the ORM trained on level 6
+    only -- so `fit_isotonic`'s contamination filter is a no-op here, unlike level 6 where
+    only a fraction of anchors are clean.
+
+    The core-size sweep is a separate DIAGNOSTIC, not the gate: how few problems' anchors does
+    the CURVE need before it stops improving, while every evaluated problem still gets its own
+    offset from its own anchors and evaluation always covers every level-1 prefix -- never a
+    held-out one, since production never holds one out either.
+
+    `cfg` is `prm_rollout` (matches `fit_joint`'s `conf`, not the whole `RerankerConfig`).
+    `measured` maps prefix_id -> `Measured`; `rollout_scores` maps the same prefix_id -> the
+    raw ORM scores of that prefix's own rollouts.
+    """
+    headline = _fold(anchors, rollout_scores, measured, cfg)
+    rng = np.random.default_rng(seed)
+    problems = sorted({a.pkey for a in anchors})
+    sweep: list[dict] = []
+    for n in core_sizes:
+        core = set(rng.choice(problems, size=min(n, len(problems)), replace=False).tolist())
+        curve_anchors = [a for a in anchors if a.pkey in core]
+        fold = _curve_subset_fold(curve_anchors, anchors, rollout_scores, measured, cfg)
+        fold["core_size"] = len(core)
+        fold["core_problems"] = sorted(core)
+        fold["stability"] = _stability(anchors, rollout_scores, measured, cfg, n, seed, n_reps)
+        sweep.append(fold)
+    ablations = {
+        name: _fold(anchors, rollout_scores, measured, dataclasses.replace(cfg, **kw))
+        for name, kw in (("no_offset", {"use_anchors": False}),
+                         ("curve_iters_1", {"curve_iters": 1}),
+                         ("fixed_kappa_8", {"offset_kappa": 8.0}))
+    }
+    return {**headline, "sweep": sweep, "ablations": ablations,
+            "orm_vs_length": _length_control(anchors)}
 
 
 def main(argv=None) -> None:

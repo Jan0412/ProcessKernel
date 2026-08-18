@@ -675,3 +675,273 @@ def test_a_campaign_with_no_correct_anchor_is_told_it_is_the_pooled_fit(tmp_path
     assert "0 of 2 problems" in msg and "2 offsets were zeroed" in msg
     assert "this IS the pooled fit" in msg
     assert "stands as solved" not in msg      # the round-2 wording, now false
+
+
+# --- validate: the level-1 full-corpus calibration check + core-size diagnostic --------------
+
+
+def _synthetic(noise=0.3, n_problems=30, anchors_per_problem=15, seed=0):
+    """A validate() fixture with closed-form ground truth. Each problem gets a true offset
+    c_true; anchor score = x - c_true (clean), target = sigma(x). Each problem also gets two
+    lists (one per round), each with two prefixes at different depths; a prefix's own rollout
+    scores are x2 - c_true + N(0, noise). noise=0 makes imputation exact up to fit error;
+    noise=99 swamps the rollout scores so the imputed order is a coin flip -- the two ends
+    test_validate_is_pinned_at_both_ends checks.
+
+    `c_true` is drawn from `fit_offsets`' usual wide spread (unlike an earlier version of this
+    fixture, which had to narrow it: under the corrected design every evaluated problem gets
+    its own offset fit from its own anchors in the headline run, never a default 0.0, so a
+    wide, realistic c_true no longer breaks the pinned cal_error bound). Deliberately returns
+    only the keys `validate` itself takes (no core_sizes/seed/n_reps), so every test can
+    freely override those without a duplicate-keyword collision against `**_synthetic(...)`.
+    """
+    rng = np.random.default_rng(seed)
+    sigma = lambda x: 1.0 / (1.0 + np.exp(-x))                       # noqa: E731
+    anchors, rollout_scores, measured = [], {}, {}
+    for pid in range(n_problems):
+        c_true = float(rng.uniform(-1.5, 1.5))
+        for i in range(anchors_per_problem):
+            x = float(rng.uniform(-4, 4))
+            anchors.append(calibrate.Anchor(f"a{pid}_{i}", 1, pid, x - c_true, sigma(x), False,
+                                            n_code_tokens=int(rng.integers(50, 500))))
+        for rnd in range(2):
+            list_key = f"synth:1:{pid}:{rnd}:0"
+            for depth in range(4):     # 4 prefixes/list -> up to 6 pairs, not 1 -- tight n_pairs
+                                        # is what keeps the noise=99 pair_agreement bound stable
+                x2 = float(rng.uniform(-4, 4))
+                pfx = f"p{pid}_{rnd}_{depth}"
+                measured[pfx] = calibrate.Measured(list_key, sigma(x2), 1, pid, rnd, depth)
+                rollout_scores[pfx] = [float(x2 - c_true + rng.normal(0, noise)) for _ in range(4)]
+    return {"anchors": anchors, "rollout_scores": rollout_scores, "measured": measured,
+            "cfg": _cfg(curve_bins=20, offset_clamp=6.0)}
+
+
+def test_validate_is_pinned_at_both_ends():
+    # Perfect imputation -> ~0 calibration error. Pure noise -> ~0.5 pair agreement. Both read
+    # off the full-corpus headline (top-level cal_error/pair_agreement), not the sweep.
+    #
+    # noise=0's cal_error bound is tight (< 0.02), so every problem's own EB-shrunk offset has
+    # to be recovered close to its true c_true, not just its curve well-fit: with too few
+    # anchors per problem, `var_i` (fit_offsets' proxy variance) stays large relative to tau2
+    # and EB shrinkage biases every offset toward 0 even off noiseless anchors. 80/problem
+    # keeps that bias an order of magnitude under the bound.
+    #
+    # noise=99's bound (0.4-0.6) needs no such precision -- pure noise swamps everything
+    # regardless -- but DOES need enough pairs that the observed proportion cannot drift past
+    # 0.6 by chance alone: with too few pairs a single unlucky seed can land the Binomial(n,
+    # 0.5) draw outside the window even though the underlying process is exactly chance. More
+    # problems (cheap: anchors_per_problem stays at the default) tightens that.
+    perfect = calibrate.validate(**_synthetic(noise=0.0, anchors_per_problem=80))
+    noise = calibrate.validate(**_synthetic(noise=99.0, n_problems=80))
+    assert perfect["cal_error"] < 0.02 and perfect["pair_agreement"] > 0.95
+    assert 0.4 < noise["pair_agreement"] < 0.6
+
+
+def test_every_evaluated_problem_gets_its_own_offset_regardless_of_the_curve_core():
+    # The corrected contract: the core-size sweep restricts which problems' anchors feed the
+    # CURVE, but every evaluated problem still gets its own offset from its own anchors and
+    # is still imputed and compared -- never held out. A core far smaller than the full
+    # problem pool should still leave no_anchor_rate at 0.
+    out = calibrate.validate(**_synthetic(noise=0.3), core_sizes=[4])
+    fold = out["sweep"][0]
+    assert fold["core_size"] == 4 and len(fold["core_problems"]) == 4
+    assert fold["no_anchor_rate"] == pytest.approx(0.0)
+    assert set(fold["eval_problems"]) == set(out["eval_problems"])   # same scope as the headline
+
+
+def test_sweep_reports_one_row_per_core_size():
+    out = calibrate.validate(**_synthetic(noise=0.3), core_sizes=[2, 4, 8])
+    assert [r["core_size"] for r in out["sweep"]] == [2, 4, 8]
+    assert all(r["n_pairs"] > 0 for r in out["sweep"])
+
+
+def test_ablations_are_reported():
+    out = calibrate.validate(**_synthetic(noise=0.3))
+    for k in ("no_offset", "curve_iters_1", "fixed_kappa_8"):
+        assert k in out["ablations"] and "cal_error" in out["ablations"][k]
+
+
+def test_ablations_are_measured_against_the_full_corpus_like_the_headline():
+    # No "core" for an ablation any more -- it is fit_joint on every anchor, same as the
+    # headline, just with one config knob flipped, so the two numbers are directly comparable.
+    out = calibrate.validate(**_synthetic(noise=0.3), core_sizes=[6])
+    for name in ("no_offset", "curve_iters_1", "fixed_kappa_8"):
+        assert out["ablations"][name]["eval_problems"] == out["eval_problems"]
+        assert "core_size" not in out["ablations"][name]
+
+
+def test_sweep_reports_error_by_round_and_by_depth_bucket():
+    # A good average can hide a bad bucket; both slices have to exist and cover real data.
+    out = calibrate.validate(**_synthetic(noise=0.3), core_sizes=[20])
+    fold = out["sweep"][0]
+    assert set(fold["cal_error_by_round"]) == {"0", "1"}
+    assert set(fold["cal_error_by_depth"]) == {"0", "1", "2", "3"}
+    for bucket in fold["cal_error_by_round"].values():
+        assert bucket["n"] > 0 and bucket["cal_error"] >= 0.0
+
+
+# --- n_clipped: fitting's own predict() calls must not pollute the imputation signal ----------
+#
+# Task 7 gates on "clipped lookups < 2%" as the distribution-shift check -- did the rollouts
+# land outside the range the curve was fit on. curve.n_clipped increments on every predict(),
+# including the many _solve makes while bisecting an offset, so that counter has to be
+# snapshotted before _measure_fit's own impute loop or the gate reads solver noise.
+
+
+def test_n_clipped_excludes_the_offset_solvers_own_lookups():
+    # pid=1's anchors ARE the curve (ramp y = x/10 on [0, 10]); pid=2's anchors sit at score
+    # 50, far outside that range, so _solve's own f(lo) probe while fitting pid=2's offset
+    # clips repeatedly -- and pid=1's own bisection also explores c values that push x outside
+    # [0, 10] before it converges. None of that is a rollout landing out of range.
+    ramp_anchors = _anchors([(x, x / 10) for x in range(11)], pid=1)
+    far_anchors = _anchors([(50.0, 1.0)] * 4, pid=2)
+    measured = {"p1": calibrate.Measured("L", 0.5, 6, 1, 0, 0)}
+    rollout_scores = {"p1": [5.0]}          # squarely inside [0, 10] -- no clip at impute time
+    out = calibrate.validate(ramp_anchors + far_anchors, rollout_scores, measured,
+                             _cfg(curve_bins=4), core_sizes=[1], n_reps=1)
+    assert out["n_clipped"] == 0
+
+
+def test_n_clipped_counts_a_genuinely_out_of_range_imputation():
+    ramp_anchors = _anchors([(x, x / 10) for x in range(11)], pid=1)
+    measured = {"p1": calibrate.Measured("L", 0.5, 6, 1, 0, 0)}
+    rollout_scores = {"p1": [500.0]}        # far outside [0, 10]: a real distribution shift
+    out = calibrate.validate(ramp_anchors, rollout_scores, measured, _cfg(curve_bins=4),
+                             core_sizes=[1], n_reps=1)
+    assert out["n_clipped"] == 1
+
+
+def test_curve_subset_fit_mirrors_fit_joints_use_anchors_off_branch():
+    # _fit_curve_then_offsets is meant to do what fit_joint does, just off two anchor sets
+    # instead of one. No caller varies use_anchors through it today, but a silent divergence
+    # from fit_joint's own early return would be a trap for the next one that does.
+    a = _two_offset_problems()
+    curve, offsets, meta = calibrate._fit_curve_then_offsets(a, a, _cfg(use_anchors=False))
+    assert offsets == {} and meta["converged"] is True and meta["n_iters"] == 1
+    assert len(curve.knots_x) > 1
+
+
+# --- degenerate cases ------------------------------------------------------------------------
+
+
+def test_a_curve_core_too_small_to_fit_is_reported_not_a_crash():
+    # core_size=0 -> zero anchors to fit the CURVE on -> fit_isotonic's ValueError. The row
+    # still lands in `sweep`, named, rather than the sweep silently coming up one entry short.
+    out = calibrate.validate(**_synthetic(noise=0.3), core_sizes=[0], n_reps=1)
+    fold = out["sweep"][0]
+    assert fold["fit_error"] is not None
+    assert fold["cal_error"] is None and fold["converged"] is False
+    assert len(out["sweep"]) == 1
+
+
+def test_a_prefix_with_no_partner_in_its_list_reports_no_pairs_not_a_crash():
+    # One prefix with no sibling in its list: cal_error is still computable, but there is no
+    # pair to agree or disagree on -- None, not a ZeroDivisionError or a NaN.
+    anchors = _anchors([(x, x / 10) for x in range(11)], pid=1)
+    measured = {"lonely": calibrate.Measured("only_list", 0.5, 6, 1, 0, 0)}
+    rollout_scores = {"lonely": [5.0]}
+    out = calibrate.validate(anchors, rollout_scores, measured, _cfg(curve_bins=4),
+                             core_sizes=[1], n_reps=1)
+    assert out["n_pairs"] == 0 and out["pair_agreement"] is None
+    assert out["cal_error"] is not None
+
+
+def test_non_convergence_is_visible_at_the_top_level():
+    # The headline is fit_joint over the whole corpus, so non-convergence there shows up
+    # directly at the top of validate()'s output, with no need to dig into the sweep.
+    a = _two_offset_problems()
+    out = calibrate.validate(a, {}, {}, _cfg(curve_iters=1), core_sizes=[2], n_reps=1)
+    assert out["converged"] is False
+
+
+def test_no_anchor_rate_is_zero_when_every_evaluated_problem_has_anchors():
+    anchors = (_anchors([(x, x / 10) for x in range(11)], pid=1)
+              + _anchors([(x, x / 10) for x in range(11)], pid=2))
+    measured = {
+        "p1_a": calibrate.Measured("L1", 0.2, 6, 1, 0, 0),
+        "p1_b": calibrate.Measured("L1", 0.8, 6, 1, 0, 0),
+        "p2_a": calibrate.Measured("L2", 0.1, 6, 2, 0, 0),
+        "p2_b": calibrate.Measured("L2", 0.9, 6, 2, 0, 0),
+    }
+    rollout_scores = {k: [5.0] for k in measured}
+    out = calibrate.validate(anchors, rollout_scores, measured, _cfg(curve_bins=4),
+                             core_sizes=[1], n_reps=1)
+    assert out["no_anchor_rate"] == pytest.approx(0.0)
+
+
+def test_no_anchor_rate_is_nonzero_when_one_evaluated_problem_has_no_anchors():
+    # Only problem "6:1" has anchors; "6:2" is evaluated (it is in `measured`) but contributes
+    # nothing to the fit -- the honest model for the ~2.1% of level-6 problems in that spot.
+    anchors = _anchors([(x, x / 10) for x in range(11)], pid=1)
+    measured = {
+        "p1_a": calibrate.Measured("L1", 0.2, 6, 1, 0, 0),
+        "p1_b": calibrate.Measured("L1", 0.8, 6, 1, 0, 0),
+        "p2_a": calibrate.Measured("L2", 0.1, 6, 2, 0, 0),
+        "p2_b": calibrate.Measured("L2", 0.9, 6, 2, 0, 0),
+    }
+    rollout_scores = {k: [5.0] for k in measured}
+    out = calibrate.validate(anchors, rollout_scores, measured, _cfg(curve_bins=4),
+                             core_sizes=[1], n_reps=1)
+    assert out["eval_problems"] == ["6:1", "6:2"]
+    assert out["no_anchor_rate"] == pytest.approx(0.5)      # 1 of 2 evaluated problems
+    assert out["n_pairs"] == 2         # both problems' two prefixes still pair within their list
+
+
+# --- stability: is the number the population's, or one core sample's luck? -------------------
+
+
+def test_stability_reports_spread_across_independent_core_draws():
+    out = calibrate.validate(**_synthetic(noise=0.5, n_problems=30), core_sizes=[10], n_reps=4)
+    stab = out["sweep"][0]["stability"]
+    assert stab["n_reps"] == 4 and stab["n_usable"] > 0
+    assert stab["cal_error_mean"] is not None and stab["cal_error_std"] is not None
+    assert stab["pair_agreement_mean"] is not None
+
+
+def test_stability_draws_differ_from_each_other_and_from_the_canonical_core():
+    # Real independent sampling, not the same core replayed four times under a new name.
+    fixture = _synthetic(noise=0.5, n_problems=30)
+    out = calibrate.validate(**fixture, core_sizes=[10], n_reps=4, seed=7)
+    canonical = set(out["sweep"][0]["core_problems"])
+    problems = sorted({a.pkey for a in fixture["anchors"]})
+    draws = []
+    for child in np.random.SeedSequence([7, 10]).spawn(4):
+        core = set(np.random.default_rng(child).choice(problems, size=10, replace=False).tolist())
+        draws.append(core)
+    assert len({frozenset(d) for d in draws}) > 1        # the reps are not all identical
+    assert any(d != canonical for d in draws)             # nor just the canonical core again
+
+
+# --- the ORM-vs-length diagnostic -------------------------------------------------------------
+
+
+def test_length_control_flags_a_length_only_orm():
+    # score == length, target ~ f(length-bucket) + noise. Overall accuracy is high (length
+    # tracks the bucket); within a length decile the bucket is ~constant, so only noise is
+    # left to order pairs -- accuracy there should collapse toward chance.
+    rng = np.random.default_rng(1)
+    anchors = []
+    for i in range(400):
+        length = float(rng.uniform(0, 1000))
+        bucket = int(length // 250)
+        target = float(np.clip(bucket / 3.0 + rng.normal(0, 0.15), 0.0, 1.0))
+        anchors.append(calibrate.Anchor(f"x{i}", 6, 1, length, target, False,
+                                        n_code_tokens=int(length)))
+    out = calibrate._length_control(anchors)
+    assert out["overall"] is not None and out["decile_mean"] is not None
+    assert out["overall"] > out["decile_mean"] + 0.15
+
+
+def test_length_control_handles_a_single_length_without_crashing():
+    anchors = [calibrate.Anchor(f"x{i}", 6, 1, float(i), float(i % 2), False, n_code_tokens=10)
+               for i in range(5)]
+    out = calibrate._length_control(anchors)
+    assert out["decile_mean"] is None and out["n_deciles_used"] == 0
+
+
+def test_load_anchors_carries_the_score_rows_code_length(tmp_path):
+    rows = [_row(sid=0)]
+    scores = [_score_row(rows[0], 0.5)]           # _score_row sets n_code_tokens=3
+    cfg = _campaign(tmp_path, rows, scores)
+    anchors, _ = calibrate.load_anchors(cfg)
+    assert anchors[0].n_code_tokens == 3
