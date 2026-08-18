@@ -37,10 +37,14 @@ train:
   # only alongside a length-grouped sampler.
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 8
-  # Effective batch = 1 x 32 x 4 GPUs = 128. The ORM's 32 was tuned for 12.9-item lists
+  # Effective batch = 1 x 64 x 2 GPUs = 128. The ORM's 32 was tuned for 12.9-item lists
   # carrying ~40 ranking pairs each; PRM lists hold ~3.2 items and ~3 pairs, so the same
   # list count is a far noisier gradient. 128 lists puts the pairs-per-step back in range.
-  gradient_accumulation_steps: 32
+  #
+  # COUPLED to NPROC / --gres in scripts/prm_train.sh -- 64 assumes 2 ranks. Nothing checks
+  # the product, so changing the GPU count without changing this silently retunes the
+  # optimizer (and lr below, which is 2.0e-5 because the effective batch is 4x the ORM's).
+  gradient_accumulation_steps: 64
   # 0.03, the ORM's measured value: 0.01 was ~12 steps and the grad_norm opens high.
   warmup_ratio: 0.03
   weight_decay: 0.01

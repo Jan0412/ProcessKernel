@@ -6,10 +6,16 @@
 #SBATCH --account=YOUR_ACCOUNT
 #SBATCH --qos=YOUR_QOS
 #SBATCH --nodes=1
-# 4 on one node. Data-parallel over lists. Sized for the [0,1,2] build's ~121,800 train
-# lists (~14h of forward+backward on one H100, ~4h on four); the l6_r0 campaign is 19,702,
-# so ~2h of training against ~1.5h of eval -- the wall clock below is unchanged margin.
-#SBATCH --gres=gpu:h100:4
+# 2 on one node. Data-parallel over lists. Four was sized for the [0,1,2] build's ~121,800
+# train lists (~14h of forward+backward on one H100, ~4h on four). l6_r0 is 19,702 -- round 0
+# only, then drop_dead_problems -- so two give ~3.5h of training against ~1.5h of eval, well
+# inside the wall clock below, and schedule far sooner than four.
+#
+# COUPLED to train.gradient_accumulation_steps in prm_train_base.yaml: effective batch is
+# per_device_train_batch_size x grad_accum x NPROC, and 128 is a tuned value, not a default.
+# Nothing validates the product -- change one of the two and you have silently retuned the
+# optimizer. 2 GPUs x 64 = 128; 4 x 32 = 128; 1 x 128 = 128.
+#SBATCH --gres=gpu:h100:2
 #
 # Excluded (2026-08-13): node01 is the only node whose driver (590.48.01) satisfies torch
 # 2.11+cu130, which is why lintloop.sh pins itself there -- but one of its four H100s answers
@@ -19,10 +25,10 @@
 # 1 task: torchrun forks the four ranks itself, so this is NOT --ntasks=4.
 #SBATCH --ntasks=1
 # 18 per rank, the ORM's ratio, against dataloader_num_workers=16.
-#SBATCH --cpus-per-task=72
-# 4 ranks x 16 workers, each forking the dataset's Source map -- a memory multiplier, not
-# only a throughput knob. 4x the ORM's 64G.
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=36
+# 2 ranks x 16 workers, each forking the dataset's Source map -- a memory multiplier, not
+# only a throughput knob. 2x the ORM's 64G.
+#SBATCH --mem=128G
 # ~2 days: the estimate is ~16h (13.7h train + 2.5h eval), so this is ~3x margin. The
 # script passes no --resume, so a wall-clock kill costs the whole run, not the tail.
 #SBATCH --time=2-00:00:00
@@ -79,7 +85,7 @@ CONFIG="${CONFIG:-reranker/configs/prm_train_qwen3base06b.yaml}"
 PY="${PY:-$PWD/.venv-cu129/bin}"
 [ -x "$PY/torchrun" ] || { echo "ABORT: no torchrun at $PY" >&2; exit 1; }
 
-NPROC="${NPROC:-4}"
+NPROC="${NPROC:-2}"   # must match --gres above and grad_accum in the config
 
 echo "============================================================"
 echo "  PRM listwise training | config $CONFIG"
