@@ -3,6 +3,8 @@ import json
 import os
 import pathlib
 
+import pytest
+
 from reranker.src.config import PRMRolloutConfig, RerankerConfig
 from reranker.src.encoding import SequenceEncoder
 from reranker.src.prm import build
@@ -454,3 +456,43 @@ def test_main_selects_unit_writes_its_part_and_skips_gpu_when_not_ready(tmp_path
     monkeypatch.setenv("SLURM_ARRAY_TASK_ID", str(units_sorted.index(missing)))
     orm_score.main([])
     assert calls["n"] == 1   # unchanged -- the second call never touched the GPU
+
+
+def _anchor_main_cfg(tmp_path, monkeypatch, **over):
+    """A campaign main() can score anchors for, with the GPU load faked out."""
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir(exist_ok=True)
+    (parts_dir / "part.jsonl").write_text(json.dumps(
+        {"run_name": "run", "shard": "shard_00", "round": 0, "level": 6, "problem_id": 37,
+         "sample_id": 0, "stem": "s0", "raw": "```python\nA\n```"}) + "\n")
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir(exist_ok=True)
+    (ckpt_dir / "model.safetensors").write_bytes(b"fake-checkpoint-bytes")
+
+    conf = _rollout_conf(
+        str(tmp_path), run_tags={"run": "tag"}, orm_checkpoint=str(ckpt_dir),
+        parts_glob=str(parts_dir / "*.jsonl"), anchor_rounds=[0], use_anchors=True,
+        baseline_timing_json=__file__,
+    )
+    for k, v in over.items():
+        setattr(conf, k, v)
+    cfg = RerankerConfig(prm_rollout=conf)
+    monkeypatch.setattr(orm_score, "load_config", lambda argv: cfg)
+    monkeypatch.setattr(orm_score, "_kernelbench_dir", lambda cfg: _kb(tmp_path))
+    monkeypatch.setattr(orm_score, "load_scorer", lambda c: (StubScorer(), _enc()))
+    return cfg
+
+
+def test_a_measured_campaign_can_still_score_its_anchors(tmp_path, monkeypatch):
+    """Level 1 is the only corpus with evaluated labels, so it is the only place the
+    imputation curve can be checked against measured truth -- and calibrate cannot run there
+    at all unless main() will score its anchors under label_source=measured."""
+    _anchor_main_cfg(tmp_path, monkeypatch, label_source="measured")
+    orm_score.main(["--anchors"])
+    assert os.path.exists(orm_score.unit_score_path(str(tmp_path), orm_score.ANCHORS_UNIT))
+
+
+def test_main_refuses_without_a_checkpoint_to_score_with(tmp_path, monkeypatch):
+    _anchor_main_cfg(tmp_path, monkeypatch, label_source="measured", orm_checkpoint=None)
+    with pytest.raises(ValueError, match="orm_checkpoint"):
+        orm_score.main(["--anchors"])

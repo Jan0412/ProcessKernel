@@ -326,10 +326,14 @@ def main(argv=None) -> None:
     cfg = load_config(argv)
     conf = cfg.prm_rollout
     conf.validate()
-    if conf.label_source != "imputed":
+    # The gate is the checkpoint, NOT label_source. A `measured` campaign scores its anchors
+    # too: level 1 is the only corpus whose labels are evaluated, so it is the only place the
+    # imputation curve can be checked against measured truth (prm_rollout_l1.yaml carries the
+    # orm_* keys for exactly that sweep). Without this, calibrate on level 1 dies with "job B2
+    # has not scored the anchors yet" and the method has no validation at all.
+    if not conf.orm_checkpoint:
         raise ValueError(
-            f"orm_score scores against an ORM only under label_source=imputed, got "
-            f"{conf.label_source!r}"
+            "orm_score needs prm_rollout.orm_checkpoint -- there is no model to score with"
         )
     out_dir = _resolve(conf.out_dir)
 
