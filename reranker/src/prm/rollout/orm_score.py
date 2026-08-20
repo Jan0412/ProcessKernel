@@ -132,6 +132,16 @@ def _kernelbench_dir(cfg) -> str:
     return os.path.join(_resolve(cfg.data.kernelbench_dir), "KernelBench")
 
 
+# Public names for callers outside this module (search/run.py) -- the two above stay
+# underscored (and unchanged) so the existing monkeypatches in test_orm_score.py keep working.
+def kernelbench_dir(cfg) -> str:
+    return _kernelbench_dir(cfg)
+
+
+def ref_src(kb_dir: str, level: int, pid: int) -> str:
+    return _ref_src(kb_dir, level, pid)
+
+
 def score_items(items, scorer, encoder, kb_dir, batch_size, ckpt_sha: str) -> Iterator[OrmScore]:
     """Dedup by (level, problem_id, code_sha1) -- code_sha1 ALONE is not a safe key:
     extract_code_block returns "" for any rollout with no code fence, so every empty body
