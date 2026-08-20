@@ -1,0 +1,32 @@
+# PRM-guided beam search, level 6, token cadence. The A arm.
+#
+# _base is the rollout config the PRM was trained against: gen_model, temperature,
+# think_temperature, max_new_tokens, max_length and base_model all come from there, so this
+# search cannot drift from the distribution the PRM learned.
+_base: prm_rollout_l6_r0.yaml
+
+prm_search:
+  beam_width: 4
+  expand: 4
+  max_steps: 32
+
+  advance: tokens
+  segment_max_tokens: 256      # ~6 branch points over a ~1550-token completion
+  code_steps_per_chunk: 1      # fine, so the snap-back to a line end is under one line
+  prose_lines_per_chunk: 1
+
+  selector: prm
+  min_distinct_parents: 2
+
+  prm_checkpoint: reranker/data/checkpoints_prm_qwen3base06b/final
+  orm_checkpoint: reranker/data/checkpoints_listwise_kb_deepseek_gptoss_all_rounds_speed_moderate/final
+  prm_batch_size: 8
+  orm_batch_size: 8
+
+  dataset: kernelbook          # level 6 is a KernelBook pseudo-level
+  level: 6
+  problems: 0-499              # the first 500; null runs every row
+
+  rounds: [0]
+  out_dir: data/prm_search/l6_tokens
+  write_pool: true

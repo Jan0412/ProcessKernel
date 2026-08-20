@@ -1,0 +1,8 @@
+# The control. Identical beam, no PRM -- survivors are drawn at random. If this ties the A
+# arm then the PRM's ranking contributed nothing and the gain, if any, is branching plus a
+# wider ORM pool.
+_base: prm_search_l6.yaml
+
+prm_search:
+  selector: random
+  out_dir: data/prm_search/l6_random
