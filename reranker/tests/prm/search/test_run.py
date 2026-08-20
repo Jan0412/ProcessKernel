@@ -113,3 +113,57 @@ def test_the_manifest_records_the_knobs_the_run_was_shaped_by(tmp_path):
     assert manifest["config"]["expand"] == 5
     assert manifest["config"]["advance"] == "tokens"
     assert json.loads((tmp_path / "search_manifest.json").read_text()) == manifest
+
+
+def test_the_prm_is_batched_by_prm_batch_size_not_the_trainers_eval_batch():
+    """rank_eval.load_scorer reads cfg.train.per_device_eval_batch_size, which belongs to the
+    trainer. The search has to reach it through its own knob or the field is decoration."""
+    cfg = RerankerConfig()
+    cfg.prm_search = PRMSearchConfig(prm_checkpoint="/c", prm_batch_size=3)
+    cfg.train.per_device_eval_batch_size = 64
+    seen = {}
+
+    def fake_load_scorer(passed_cfg, checkpoint):
+        seen["batch"] = passed_cfg.train.per_device_eval_batch_size
+        seen["checkpoint"] = checkpoint
+        return (lambda ids: [0.0] * len(ids)), _Tok()
+
+    run.rank_eval.load_scorer, original = fake_load_scorer, run.rank_eval.load_scorer
+    try:
+        run._prm(cfg)
+    finally:
+        run.rank_eval.load_scorer = original
+    assert seen == {"batch": 3, "checkpoint": "/c"}
+    # and the caller's own config is untouched -- the swap is on a copy
+    assert cfg.train.per_device_eval_batch_size == 64
+
+
+def test_the_backend_is_built_with_the_searchs_utilization_not_vllms_default():
+    """vLLM's 0.92 default would leave the PRM and ORM ~6.4 GB of 80 to share."""
+    import reranker.src.prm.rollout.rollout as R
+
+    rollout_conf = RerankerConfig().prm_rollout
+    seen = {}
+
+    class FakeVLLM:
+        def __init__(self, model_id, **kw):
+            seen.update(kw, model_id=model_id)
+
+    import kernel_gen.core.backend as B
+    B.VLLMBackend, original = FakeVLLM, B.VLLMBackend
+    try:
+        R._backend(rollout_conf, 0.85)
+        assert seen["gpu_memory_utilization"] == 0.85
+        seen.clear()
+        # unset stays vLLM's own default, so the rollout path is unchanged
+        R._backend(rollout_conf)
+        assert "gpu_memory_utilization" not in seen
+    finally:
+        B.VLLMBackend = original
+
+
+class _Tok:
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return [1, 2, 3]

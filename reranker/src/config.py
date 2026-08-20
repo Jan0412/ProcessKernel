@@ -550,6 +550,12 @@ class PRMSearchConfig:
     prm_batch_size: int = 8
     orm_batch_size: int = 8
 
+    # Below vLLM's own 0.92 default: the PRM stays resident for the whole run and the ORM
+    # joins it at the end, ~1.2 GB each in bf16, and vLLM measures its budget against TOTAL
+    # VRAM rather than free VRAM -- so at 0.92 the two scorers and their activations have to
+    # fit in what is left of 80 GB after 73.6.
+    gpu_memory_utilization: float = 0.85
+
     # Which problems to solve. `prm_rollout` has no dataset knobs -- it reads an existing
     # corpus off disk, where this generates a new one -- so these mirror cli.add_dataset_args
     # and are passed straight to sources.load_problems.
@@ -572,6 +578,9 @@ class PRMSearchConfig:
                      "orm_batch_size"):
             if getattr(self, name) < 1:
                 raise ValueError(f"prm_search.{name} must be >= 1, got {getattr(self, name)}")
+        if not 0.0 < self.gpu_memory_utilization < 1.0:
+            raise ValueError("prm_search.gpu_memory_utilization must be in (0, 1), got "
+                             f"{self.gpu_memory_utilization!r}")
         if self.advance not in (TOKENS, CUTS):
             raise ValueError(
                 f"prm_search.advance must be {TOKENS!r} or {CUTS!r}, got {self.advance!r}"

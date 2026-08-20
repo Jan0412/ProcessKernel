@@ -56,3 +56,16 @@ def test_the_prm_selector_needs_a_checkpoint_but_the_random_control_does_not():
 def test_the_cuts_policy_validates_the_same_way():
     PRMSearchConfig(advance=CUTS, code_steps_per_chunk=16, prose_lines_per_chunk=16,
                     prm_checkpoint="/ckpt").validate()
+
+
+def test_vllm_leaves_room_for_the_two_scorers_on_the_same_card():
+    """0.92 is vLLM's default and would leave ~6.4 GB of 80 for the PRM, the ORM and their
+    activations. The search's default has to be lower or the two scorers race the KV cache."""
+    assert PRMSearchConfig().gpu_memory_utilization < 0.92
+
+
+@pytest.mark.parametrize("bad", [0.0, 1.0, -0.1, 1.5])
+def test_validate_refuses_a_utilization_outside_the_open_unit_interval(bad):
+    conf = PRMSearchConfig(prm_checkpoint="/ckpt", gpu_memory_utilization=bad)
+    with pytest.raises(ValueError, match="gpu_memory_utilization"):
+        conf.validate()

@@ -637,12 +637,20 @@ def _job_b_manifest(conf, metas: dict, models: dict, generated: int) -> dict:
     }
 
 
-def _backend(conf):
-    """vLLM with the source run's own model kwargs -- the regime the prefixes came from."""
+def _backend(conf, gpu_memory_utilization: float | None = None):
+    """vLLM with the source run's own model kwargs -- the regime the prefixes came from.
+
+    `gpu_memory_utilization` is left to VLLMBackend's default unless a caller sets it; the
+    beam search does, because it keeps a PRM (and later an ORM) on the same card.
+    """
     from kernel_gen.core.backend import VLLMBackend
 
+    extra = {} if gpu_memory_utilization is None else {
+        "gpu_memory_utilization": gpu_memory_utilization
+    }
     return VLLMBackend(
-        conf.gen_model, max_model_len=conf.max_model_len, max_num_seqs=conf.max_num_seqs
+        conf.gen_model, max_model_len=conf.max_model_len, max_num_seqs=conf.max_num_seqs,
+        **extra,
     )
 
 

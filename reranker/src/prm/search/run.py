@@ -125,7 +125,14 @@ def _prm(cfg):
     conf = cfg.prm_search
     if conf.selector != SEL_PRM:
         return None, None
-    scorer, tokenizer = rank_eval.load_scorer(cfg, conf.prm_checkpoint)
+    # load_scorer batches by cfg.train.per_device_eval_batch_size -- a trainer knob reached
+    # from an inference path. Swap prm_batch_size in so the search owns its own batch size,
+    # the same way _orm_scores swaps in the search's own ORM checkpoint.
+    scoring_cfg = dataclasses.replace(
+        cfg,
+        train=dataclasses.replace(cfg.train, per_device_eval_batch_size=conf.prm_batch_size),
+    )
+    scorer, tokenizer = rank_eval.load_scorer(scoring_cfg, conf.prm_checkpoint)
     return scorer, PrefixEncoder(tokenizer, cfg.prm_rollout.max_length)
 
 
@@ -173,7 +180,7 @@ def main(argv=None) -> None:
         spec=conf.problems,
         all_rows=conf.problems is None,
     )
-    backend = rollout._backend(cfg.prm_rollout)
+    backend = rollout._backend(cfg.prm_rollout, conf.gpu_memory_utilization)
     scorer, encoder = _prm(cfg)
     result = S.search(
         backend, problems, conf, cfg.prm_rollout, rollout.gen_counter(cfg.prm_rollout),
