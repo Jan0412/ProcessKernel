@@ -44,13 +44,30 @@ class Finishing(FakeBackend):
         return out
 
 
+class Recorder(FakeBackend):
+    """FakeBackend, remembering each call's kwargs -- test_rollout.py:350 has the original,
+    logging more than this needs; here only the kwargs (esp. max_tokens) matter."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.calls: list[dict] = []
+
+    def complete_traced(self, prompts, **kw):
+        self.calls.append({"prompts": list(prompts), **kw})
+        return super().complete_traced(prompts, **kw)
+
+
 def test_a_plan_that_reaches_the_fence_flips_to_code_and_keeps_the_bare_fence():
-    backend = FakeBackend(rules=[("<HEAD>", "thinking\n" + CODE_FENCE + "\nimport torch\n")])
+    # Distinguishable per pass, as in the seam test below: a single "<HEAD>"-keyed rule
+    # would fire for both calls and the code pass's echo would already contain the
+    # expected substring, passing even if the bare-fence append were deleted entirely.
+    backend = FakeBackend(rules=[(CODE_FENCE, "import torch\n")],
+                           default="thinking\n" + CODE_FENCE + "\n")
     conf, rc = confs()
     c = cand()
     segment.advance(backend, [c], conf, rc, count, step=0)
     assert c.mode == CODE
-    assert CODE_FENCE + "\nimport torch\n" in c.text
+    assert c.text == "## Plan\nthinking\n" + CODE_FENCE + "\nimport torch\n"
 
 
 def test_the_seam_gains_a_newline_only_when_the_code_does_not_bring_one():
@@ -120,6 +137,41 @@ def test_calls_bucket_on_exact_room_so_a_short_budget_does_not_starve_the_batch(
     tight = cand(text="## Plan\n" + CODE_FENCE + "\n", mode=CODE, spent=rc.max_new_tokens - 5)
     segment.advance(backend, [roomy, tight], conf, rc, count, step=0)
     assert len(backend.batches) == 2
+
+
+def test_the_code_pass_gets_the_room_left_after_the_plan_pass_spent_some():
+    """Room is decremented mid-step by the plan pass's own token count, not left at the
+    full segment_max_tokens -- FakeBackend ignores max_tokens and the fixtures would not
+    otherwise notice an omitted decrement, so this reads the CODE call's kwargs directly."""
+    plan_body = "thinking\n"
+    backend = Recorder(rules=[(CODE_FENCE, "codetext\n")],
+                        default=plan_body + CODE_FENCE + "\n")
+    conf, rc = confs(segment_max_tokens=256)
+    c = cand()
+    segment.advance(backend, [c], conf, rc, count, step=0)
+    # emitted == plan_body + CODE_FENCE: the truncated plan text plus the stop string
+    # vLLM (and FakeBackend) keep the tokens for, exactly what the plan call is billed for.
+    plan_tokens = count(plan_body + CODE_FENCE)
+    assert backend.calls[0]["max_tokens"] == conf.segment_max_tokens
+    assert backend.calls[1]["max_tokens"] == conf.segment_max_tokens - plan_tokens
+
+
+def test_call_does_not_misalign_completions_across_room_buckets():
+    """The worst bug this file can have: one candidate's generated text glued onto
+    another. Three distinct rooms force >= 2 buckets, and input order [a, b, cc] with
+    rooms [256, 100, 50] means bucket iteration (sorted ascending by room) visits cc,
+    then b, then a -- the reverse of input order, so a "results come back in input
+    order" bug would pair every candidate with a sibling's text."""
+    backend = FakeBackend(rules=[("<A>", "AAA\n"), ("<B>", "BBB\n"), ("<C>", "CCC\n")])
+    conf, rc = confs(segment_max_tokens=256)
+    body = "## Plan\n" + CODE_FENCE + "\n"
+    a = cand(text=body, mode=CODE, head="<A>", spent=0)
+    b = cand(text=body, mode=CODE, head="<B>", spent=rc.max_new_tokens - 100)
+    cc = cand(text=body, mode=CODE, head="<C>", spent=rc.max_new_tokens - 50)
+    segment.advance(backend, [a, b, cc], conf, rc, count, step=0)
+    assert "AAA" in a.text and "BBB" not in a.text and "CCC" not in a.text
+    assert "BBB" in b.text and "AAA" not in b.text and "CCC" not in b.text
+    assert "CCC" in cc.text and "AAA" not in cc.text and "BBB" not in cc.text
 
 
 def test_the_cuts_policy_truncates_a_live_candidate_to_one_chunk():
