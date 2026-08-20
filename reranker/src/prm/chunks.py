@@ -103,3 +103,28 @@ def _prose_cuts(raw: str, a: int, b: int) -> list[tuple[int, str]]:
         if raw[line:nl].strip():
             out.append((nl + 1, PROSE))
         line = nl + 1
+
+
+MAX_TRIM_LINES = 64
+
+
+def live_cuts(raw: str, *, prose_lines: int = 1, code_steps: int = 1) -> list[Cut]:
+    """``cut_points`` over a live generation, whose tail is usually mid-bracket or mid-string.
+
+    Trailing lines are dropped until it tokenizes. Trimming a suffix cannot move a cut before
+    it and ``cut_points`` counts forward (I3), so cuts stay put as the text grows. Empty list,
+    not ``None``: at inference the start is always a legal cut.
+    """
+    text = raw
+    for _ in range(MAX_TRIM_LINES):
+        cuts = cut_points(text, prose_lines=prose_lines, code_steps=code_steps)
+        if cuts is not None:
+            return cuts
+        # drop the damaged trailing line whole, keeping the newline that ends the prior
+        # one -- else that prior line loses its own terminator and its cut with it.
+        stripped = text.rstrip("\n")
+        nl = stripped.rfind("\n")
+        if nl < 0:
+            return []
+        text = stripped[: nl + 1]
+    return []

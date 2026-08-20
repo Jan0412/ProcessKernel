@@ -16,6 +16,11 @@ from __future__ import annotations
 from reranker.src.prm.rollout.rollout import Source, prefix_text
 
 
+def scored_text_of(prompt: str, generated: str) -> str:
+    """The PRM's layout from its two pieces directly, for a live candidate with no stored row."""
+    return prompt + generated
+
+
 def scored_text(prefix, src: Source) -> str:
     """What the PRM reads: the stored prompt, then the generation so far.
 
@@ -23,7 +28,7 @@ def scored_text(prefix, src: Source) -> str:
     at inference there is no chat header around the fragment being judged. The generated half
     comes from job B's `prefix_text`, so the slice (and its range check) has one definition.
     """
-    return src.prompt + prefix_text(prefix, src)
+    return scored_text_of(src.prompt, prefix_text(prefix, src))
 
 
 class PrefixEncoder:
@@ -47,6 +52,9 @@ class PrefixEncoder:
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-    def encode(self, prefix, src: Source) -> list[int]:
-        ids = self.tokenizer.encode(scored_text(prefix, src), add_special_tokens=False)
+    def encode_text(self, text: str) -> list[int]:
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
         return ids[-self.max_length :]
+
+    def encode(self, prefix, src: Source) -> list[int]:
+        return self.encode_text(scored_text(prefix, src))
