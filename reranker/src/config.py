@@ -514,6 +514,91 @@ class PRMTrainConfig:
             )
 
 
+TOKENS, CUTS = "tokens", "cuts"
+SEL_PRM, SEL_RANDOM = "prm", "random"
+
+
+@dataclass
+class PRMSearchConfig:
+    """PRM-steered beam search over half-written generations; the ORM picks the winner.
+
+    Generation knobs are NOT here. `gen_model`, `temperature`, `think_temperature`,
+    `max_new_tokens`, `max_length` and `base_model` are read from `prm_rollout`, so a search
+    config `_base:`-inherits the rollout config the PRM was trained against and cannot drift
+    from it.
+    """
+
+    beam_width: int = 4                 # live candidates kept per step
+    expand: int = 4                     # children per survivor; decode cost is expand x beam_width
+    max_steps: int = 32
+
+    advance: str = TOKENS               # tokens | cuts
+    segment_max_tokens: int = 256       # the per-step cap, and the `cuts` policy's generous budget
+    # The chunker's granularity for THIS search, independent of the build's -- and under
+    # `cuts` also the stride: one step generates exactly one chunk, so these two knobs alone
+    # say how big a step is. `tokens` wants them fine (snap-back is then under a line).
+    prose_lines_per_chunk: int = 1
+    code_steps_per_chunk: int = 1
+    score_at_cut: bool = True           # False scores the raw mid-line text instead
+
+    selector: str = SEL_PRM             # prm | random -- random is the ablation control
+    min_distinct_parents: int = 2       # 0/1 disables the anti-collapse floor
+    select_seed: int = 7
+
+    prm_checkpoint: str = ""
+    orm_checkpoint: str = ""
+    prm_batch_size: int = 8
+    orm_batch_size: int = 8
+
+    # Which problems to solve. `prm_rollout` has no dataset knobs -- it reads an existing
+    # corpus off disk, where this generates a new one -- so these mirror cli.add_dataset_args
+    # and are passed straight to sources.load_problems.
+    dataset: str = "kernelbench"        # kernelbench | kernelbook
+    dataset_name: Optional[str] = None  # None = cli.DATASET_DEFAULTS[dataset]
+    level: int = 6
+    problems: Optional[str] = None      # '23' | '1-49' | '1,5,10'; None = every row
+    ref_dir: Optional[str] = None       # a staged level dir; overrides the row source
+
+    # Which generation rounds the search drives. [0] today because the PRM is trained on round
+    # 0 only; the searcher itself is round-agnostic, so this widens without a code change.
+    rounds: list[int] = field(default_factory=lambda: [0])
+    out_dir: str = "data/prm_search"
+    write_pool: bool = True
+    keep_pruned: bool = False           # diagnostic: finish pruned candidates to measure regret
+
+    def validate(self) -> None:
+        for name in ("beam_width", "expand", "max_steps", "segment_max_tokens",
+                     "prose_lines_per_chunk", "code_steps_per_chunk", "prm_batch_size",
+                     "orm_batch_size"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"prm_search.{name} must be >= 1, got {getattr(self, name)}")
+        if self.advance not in (TOKENS, CUTS):
+            raise ValueError(
+                f"prm_search.advance must be {TOKENS!r} or {CUTS!r}, got {self.advance!r}"
+            )
+        if self.selector not in (SEL_PRM, SEL_RANDOM):
+            raise ValueError(
+                f"prm_search.selector must be {SEL_PRM!r} or {SEL_RANDOM!r}, got {self.selector!r}"
+            )
+        if self.dataset not in ("kernelbench", "kernelbook"):
+            raise ValueError(f"prm_search.dataset must be kernelbench|kernelbook, got {self.dataset!r}")
+        if self.level < 1:
+            raise ValueError(f"prm_search.level must be >= 1, got {self.level}")
+        if self.min_distinct_parents > self.beam_width:
+            raise ValueError(
+                f"prm_search.min_distinct_parents ({self.min_distinct_parents}) exceeds "
+                f"beam_width ({self.beam_width}) -- unsatisfiable"
+            )
+        if self.selector == SEL_PRM and not self.prm_checkpoint:
+            raise ValueError("prm_search.selector='prm' needs prm_search.prm_checkpoint")
+        # `_coerce` has no list case, so `prm_search.rounds=[0]` from the CLI arrives as the
+        # string "[0]" and would iterate as characters. List values belong in a file.
+        if not isinstance(self.rounds, list) or not self.rounds:
+            raise ValueError(f"prm_search.rounds must be a non-empty list, got {self.rounds!r}")
+        if not all(isinstance(r, int) and not isinstance(r, bool) for r in self.rounds):
+            raise ValueError(f"prm_search.rounds must be a list of ints, got {self.rounds!r}")
+
+
 @dataclass
 class MLflowConfig:
     db_file: str = "mlflow.db"
@@ -536,6 +621,7 @@ class RerankerConfig:
     prm: PRMConfig = field(default_factory=PRMConfig)
     prm_rollout: PRMRolloutConfig = field(default_factory=PRMRolloutConfig)
     prm_train: PRMTrainConfig = field(default_factory=PRMTrainConfig)
+    prm_search: PRMSearchConfig = field(default_factory=PRMSearchConfig)
 
 
 def check_prm_budgets(cfg: RerankerConfig) -> list[str]:
