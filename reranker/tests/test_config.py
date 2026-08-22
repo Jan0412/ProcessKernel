@@ -140,11 +140,49 @@ def test_every_pipeline_grades_against_the_one_baseline():
     assert PRMConfig().baseline_timing_json == BASELINE_TIMING_JSON
 
 
-@pytest.mark.parametrize("name", ["listwise_config.yaml", "prm_config.yaml", "prm_smoke.yaml"])
+SHIPPED = sorted(f for f in os.listdir(os.path.join(PROJECT_ROOT, "configs")) if f.endswith(".yaml"))
+
+
+@pytest.mark.parametrize("name", SHIPPED)
 def test_no_shipped_config_grades_against_a_different_baseline(name):
+    # Every config in the dir, found by listing it: a variant added later inherits the check
+    # instead of being remembered into a hand-written list.
     cfg = load_config(["--config", os.path.join(PROJECT_ROOT, "configs", name)])
     section = cfg.prm if name.startswith("prm") else cfg.data
     assert _resolve(section.baseline_timing_json) == BASELINE_TIMING_JSON
+
+
+def test_the_shipped_listwise_variants_write_to_disjoint_paths():
+    # Six datasets built from one base: a copy-pasted output path would have one build
+    # silently overwrite another's dataset, lists, or checkpoints.
+    seen: dict[str, str] = {}
+    for name in (n for n in SHIPPED if n.startswith("listwise_kb_")):
+        cfg = load_config(["--config", os.path.join(PROJECT_ROOT, "configs", name)])
+        for path in (
+            cfg.data.dataset_jsonl,
+            cfg.data.splits_json,
+            cfg.train.output_dir,
+            cfg.listwise.lists_train_jsonl,
+            cfg.listwise.lists_val_jsonl,
+            cfg.listwise.lists_splits_json,
+        ):
+            assert path not in seen, f"{name} and {seen[path]} both write {path}"
+            seen[path] = name
+    assert len(seen) == 6 * 6
+
+
+def test_the_shipped_listwise_variants_share_every_training_knob():
+    cfgs = [
+        load_config(["--config", os.path.join(PROJECT_ROOT, "configs", n)])
+        for n in SHIPPED
+        if n.startswith("listwise_kb_")
+    ]
+    assert len(cfgs) == 6
+    for field_name in ("epochs", "lr", "seed", "metric_for_best_model", "max_steps"):
+        assert len({getattr(c.train, field_name) for c in cfgs}) == 1
+    for field_name in ("sigma", "loss_alpha", "list_size", "speedup_lo", "speedup_hi", "list_seed"):
+        assert len({getattr(c.listwise, field_name) for c in cfgs}) == 1
+    assert len({c.model.base_model for c in cfgs}) == 1
 
 
 def test_the_mlflow_uri_is_sqlite_under_the_project_root():

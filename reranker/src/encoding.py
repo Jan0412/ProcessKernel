@@ -38,9 +38,21 @@ class SequenceEncoder:
         self._sep_ids = tokenizer.encode(SEPARATOR, add_special_tokens=False)
 
     def encode(self, ref_src: str, kernel_src: str) -> list[int]:
+        return self.encode_with_meta(ref_src, kernel_src)[0]
+
+    def encode_with_meta(self, ref_src: str, kernel_src: str) -> tuple[list[int], dict]:
+        """Like :meth:`encode`, but also return truncation diagnostics.
+
+        ``{"ref_tokens", "kernel_tokens", "ref_total", "kernel_total", "truncated"}``:
+        ``*_tokens`` are the counts kept, ``*_total`` the untruncated counts, and
+        ``truncated`` is True iff either side was cut. The scorer records it so the
+        eval can tell a ranking difference from a tokenizer one. Same token layout as
+        :meth:`encode`, which delegates here — one source of truth.
+        """
         tok = self.tokenizer
         ref_ids = tok.encode(ref_src, add_special_tokens=False)
         kernel_ids = tok.encode(kernel_src, add_special_tokens=False)
+        ref_total, kernel_total = len(ref_ids), len(kernel_ids)
 
         # Terminate each example with a single EOS: the seq-cls head scores the
         # last non-pad token, so we give every sequence a consistent sentinel.
@@ -59,4 +71,11 @@ class SequenceEncoder:
         content = self._instr_ids + ref_ids + self._sep_ids + kernel_ids
         if eos_id is not None:
             content.append(eos_id)
-        return content
+        meta = {
+            "ref_tokens": len(ref_ids),
+            "kernel_tokens": len(kernel_ids),
+            "ref_total": ref_total,
+            "kernel_total": kernel_total,
+            "truncated": (ref_total > len(ref_ids)) or (kernel_total > len(kernel_ids)),
+        }
+        return content, meta

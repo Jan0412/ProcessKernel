@@ -32,6 +32,36 @@ def _row_key(run_name: str, level: int, problem_id: int, sample_id: int) -> tupl
     return (run_name, int(level), int(problem_id), int(sample_id))
 
 
+# What encoding a candidate needs. The rest of the row (verdicts, runtimes, speedups) was
+# already spent grading the lists, and the graded `rel` travels in the list itself.
+_ENCODED_FIELDS = ("ref_arch_src", "kernel_src")
+
+
+def _rows_for_lists(dataset_jsonl: str, lists: list[dict]) -> dict[tuple, dict]:
+    """Index only the rows the lists actually reference, streaming the source past memory.
+
+    The lists keep one candidate per (problem, sample, round) and cap each problem at
+    ``list_size``, so they cite a fraction of the corpus -- 78k of 259k rows on the combined
+    all-rounds build. Loading all of it costs several GB before a single batch is encoded,
+    and each of the dataloader's forked workers pays it again.
+    """
+    wanted = {
+        _row_key(cand["run_name"], lst["level"], lst["problem_id"], cand["sample_id"])
+        for lst in lists
+        for cand in lst["candidates"]
+    }
+    by_key: dict[tuple, dict] = {}
+    with open(_resolve(dataset_jsonl)) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            key = _row_key(r["run_name"], r["level"], r["problem_id"], r["sample_id"])
+            if key in wanted:
+                by_key[key] = {k: r[k] for k in _ENCODED_FIELDS}
+    return by_key
+
+
 class ListwiseDataset(Dataset):
     """Loads a lists JSONL and the source dataset; encodes each candidate lazily."""
 
@@ -45,14 +75,10 @@ class ListwiseDataset(Dataset):
     ):
         self.encoder = SequenceEncoder(tokenizer, max_length, reserve_ref_tokens)
 
-        rows = _read_jsonl(_resolve(dataset_jsonl))
-        self._by_key = {
-            _row_key(r["run_name"], r["level"], r["problem_id"], r["sample_id"]): r
-            for r in rows
-        }
         self.lists = _read_jsonl(_resolve(lists_jsonl))
         if not self.lists:
             raise ValueError(f"No lists in {lists_jsonl} — run reranker.src.listwise.lists first")
+        self._by_key = _rows_for_lists(dataset_jsonl, self.lists)
 
     def __len__(self) -> int:
         return len(self.lists)

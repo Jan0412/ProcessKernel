@@ -35,6 +35,11 @@ BASELINE_TIMING_JSON = (
 @dataclass
 class DataConfig:
     run_dirs: list[str] = field(default_factory=list)
+    # Which lint-loop rounds to read out of each run. null = the run root, i.e. only the
+    # kernel each sample finished on. A list expands every shard into rounds/round_R, giving
+    # the earlier attempts as extra candidates. Never both: the root kernel is byte-identical
+    # to its own final round, so a run read twice would grade one kernel as two candidates.
+    rounds: Optional[list[int]] = None
     level: Union[int, list[int]] = 1
     kernelbench_dir: str = ".."
     dataset_jsonl: str = "data/dataset.jsonl"
