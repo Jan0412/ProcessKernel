@@ -5,6 +5,14 @@
 # search cannot drift from the distribution the PRM learned.
 _base: prm_rollout_l6_r0.yaml
 
+# rank_eval.load_scorer reads this and ModelConfig defaults it to "eager", which
+# materializes the whole [batch, heads, seq, seq] matrix. Left unset, the PRM asked for
+# 3.68 GiB on one layer at batch 8 and OOM'd against a resident vLLM (job 2474404). The
+# rollout config this inherits carries no model: section; the search is the first caller to
+# share a card, so it sets it here. Every other config in the repo sets sdpa (default.yaml).
+model:
+  attn_implementation: sdpa
+
 prm_search:
   beam_width: 4
   expand: 4
@@ -25,7 +33,12 @@ prm_search:
 
   dataset: kernelbook          # level 6 is a KernelBook pseudo-level
   level: 6
-  problems: 0-499              # the first 500; null runs every row
+  # The staged references, NOT an in-process KernelBook conversion. convert_kernelbook.py
+  # picked a scale per row, so converting again here would prompt torch.rand([4, 4]) where
+  # eval instantiates [2048, 2048] -- and the gpt-oss kb6 run the PRM learned from prompted
+  # from these same bytes. Byte-identical to the ProcessKernel copy that run named.
+  ref_dir: /path/to/workdir/KernelBench/KernelBench/level6
+  problems: 0-499              # ids, not row numbers; 0-499 stages 499 (one id is absent)
 
   rounds: [0]
   out_dir: data/prm_search/l6_tokens
