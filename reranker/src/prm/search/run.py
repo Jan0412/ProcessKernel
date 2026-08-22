@@ -46,28 +46,53 @@ def _code(c) -> str:
     return code if ENTRY_CLASS in code else ""
 
 
-def write_artifacts(result, orm_scores: dict, cfg, out_dir: str) -> dict:
-    """Write pool/, best/ and trees/, and return the manifest (also written to disk)."""
+def stage_pool(result, cfg, out_dir: str) -> dict:
+    """Write pool/ and return ``{key: [(candidate, code)]}`` in sample_id order.
+
+    Split out of write_artifacts so every kernel is on disk BEFORE the ORM runs. The ORM is
+    the last step, it needs its own model on a card vLLM has just filled, and a failure there
+    used to discard the whole run -- jobs 2474471-2 lost an hour of generation each. The pool
+    is what the run exists to produce; the ORM only picks a winner out of it.
+    """
     conf = cfg.prm_search
     for name in ((POOL, BEST, TREES) if conf.write_pool else (BEST, TREES)):
         os.makedirs(os.path.join(out_dir, name), exist_ok=True)
 
+    staged = {}
+    for key, cands in sorted(result.pool.items()):
+        level, pid = key
+        # Sample ids follow the pool's own order, NOT the ORM ranking: trees/ joins a pool
+        # file back to its cid by sample_id, and that join must hold whatever the ORM says.
+        graded = [(c, code) for c, code in ((c, _code(c)) for c in cands) if code]
+        staged[key] = graded
+        if not conf.write_pool:
+            continue
+        for sample_id, (c, code) in enumerate(graded):
+            path = os.path.join(out_dir, POOL, kernel_filename(level, pid, sample_id))
+            with open(path, "w") as fh:
+                fh.write(code)
+    return staged
+
+
+def write_artifacts(result, orm_scores: dict, cfg, out_dir: str, staged=None) -> dict:
+    """Write best/ and trees/, and return the manifest (also written to disk).
+
+    ``staged`` is stage_pool's return. Omitted, the pool is staged here -- so a caller that
+    does not care about the ordering (every test) still gets the whole set of artifacts.
+    """
+    conf = cfg.prm_search
+    if staged is None:
+        staged = stage_pool(result, cfg, out_dir)
+
     n_pool = n_no_code = 0
     for key, cands in sorted(result.pool.items()):
         level, pid = key
-        graded = [(c, _code(c)) for c in cands]
-        n_no_code += sum(1 for _, code in graded if not code)
-        # Sample ids follow the pool's own order, NOT the ORM ranking: trees/ joins a pool
-        # file back to its cid by sample_id, and that join must hold whatever the ORM says.
-        graded = [(c, code) for c, code in graded if code]
+        graded = staged[key]
+        n_no_code += len(cands) - len(graded)
         n_pool += len(graded)
 
         entries, codes = [], []
         for sample_id, (c, code) in enumerate(graded):
-            if conf.write_pool:
-                path = os.path.join(out_dir, POOL, kernel_filename(level, pid, sample_id))
-                with open(path, "w") as fh:
-                    fh.write(code)
             entries.append({
                 "cid": c.cid, "sample_id": sample_id,
                 "orm_score": orm_scores.get(c.cid), "stop": c.stop, "tokens": c.spent,
@@ -190,7 +215,10 @@ def main(argv=None) -> None:
         backend, problems, conf, cfg.prm_rollout, rollout.gen_counter(cfg.prm_rollout),
         scorer, encoder, SYSTEM_PROMPT, build_base_prompt, random.Random(conf.select_seed),
     )
-    manifest = write_artifacts(result, _orm_scores(cfg, result), cfg, conf.out_dir)
+    # Stage the kernels first: everything below needs the ORM, and the ORM is the one step
+    # that can still die after hours of generation.
+    staged = stage_pool(result, cfg, conf.out_dir)
+    manifest = write_artifacts(result, _orm_scores(cfg, result), cfg, conf.out_dir, staged)
     print(json.dumps(manifest, indent=2))
 
 

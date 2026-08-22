@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from kernel_gen.core.model import Problem
 from reranker.src.config import PRMSearchConfig, RerankerConfig
 from reranker.src.prm.search import run
@@ -201,3 +203,41 @@ def test_the_orm_scores_against_the_problems_own_reference_never_a_second_copy_o
 
     assert seen == ["REF-OFF-THE-PROBLEM"]
     assert set(scores) == {"a"}
+
+
+def test_stage_pool_returns_the_sample_id_order_it_wrote(tmp_path):
+    cfg = cfg_for(tmp_path)
+    staged = run.stage_pool(result_with(cand("a"), cand("b")), cfg, str(tmp_path))
+    assert [c.cid for c, _ in staged[pkey(PROBLEM)]] == ["a", "b"]
+    assert sorted(os.listdir(tmp_path / "pool")) == [
+        "level_6_problem_12_sample_0_kernel.py",
+        "level_6_problem_12_sample_1_kernel.py",
+    ]
+
+
+def test_main_writes_the_pool_even_when_the_orm_dies(tmp_path, monkeypatch):
+    """The ORM is the last step and can still fail after hours of generation -- it loads its
+    own model onto a card vLLM has just filled. Jobs 2474471-2 raised in _orm_scores and lost
+    an hour of generation each because nothing had reached disk yet. The pool is the artifact
+    the run exists to produce; the ORM only picks a winner out of it."""
+    cfg = cfg_for(tmp_path)
+    result = result_with(cand("a"), cand("b"))
+
+    def die(*a, **k):
+        raise RuntimeError("ORM died after the search finished")
+
+    monkeypatch.setattr(run, "load_config", lambda argv: cfg)
+    monkeypatch.setattr(run, "load_problems", lambda *a, **k: [PROBLEM])
+    monkeypatch.setattr(run, "_prm", lambda c: (None, None))
+    monkeypatch.setattr(run.rollout, "_backend", lambda *a, **k: object())
+    monkeypatch.setattr(run.rollout, "gen_counter", lambda c: len)
+    monkeypatch.setattr(run.S, "search", lambda *a, **k: result)
+    monkeypatch.setattr(run, "_orm_scores", die)
+
+    with pytest.raises(RuntimeError):
+        run.main([])
+
+    assert sorted(os.listdir(tmp_path / "pool")) == [
+        "level_6_problem_12_sample_0_kernel.py",
+        "level_6_problem_12_sample_1_kernel.py",
+    ]
