@@ -167,3 +167,37 @@ class _Tok:
 
     def encode(self, text, add_special_tokens=False):
         return [1, 2, 3]
+
+
+def test_the_orm_scores_against_the_problems_own_reference_never_a_second_copy_on_disk(
+        monkeypatch):
+    """orm_score's disk lookup is a second source that can disagree with the prompt -- and
+    does: data.kernelbench_dir resolves to a tree holding no level 1 or 2, which killed
+    jobs 2474471-2 after a full hour of generation each."""
+    problem = Problem(level=1, problem_id=7, name="7_X.py", ref_arch_src="REF-OFF-THE-PROBLEM")
+    c = Candidate(problem=problem, head="H", prompt="P", text=KERNEL, cid="a",
+                  done=True, stop="eos", spent=1, scores=[0.1], cut_chars=[1])
+    r = Result()
+    r.pool[pkey(problem)].append(c)
+
+    seen = []
+
+    class Enc:
+        def encode(self, ref, code):
+            seen.append(ref)
+            return [1, 2, 3]
+
+    def no_disk(*a, **k):
+        raise AssertionError("the ORM re-read the reference from disk")
+
+    monkeypatch.setattr(run.orm_score, "load_scorer",
+                        lambda conf: (lambda chunk: [0.0] * len(chunk), Enc()))
+    monkeypatch.setattr(run.orm_score, "_ref_src", no_disk)
+    monkeypatch.setattr(run.orm_score, "_kernelbench_dir", no_disk)
+
+    cfg = RerankerConfig()
+    cfg.prm_search = PRMSearchConfig(prm_checkpoint="/c", orm_checkpoint="/o")
+    scores = run._orm_scores(cfg, r)
+
+    assert seen == ["REF-OFF-THE-PROBLEM"]
+    assert set(scores) == {"a"}

@@ -145,14 +145,18 @@ def _orm_scores(cfg, result) -> dict:
     separate concern from `prm_rollout.orm_checkpoint`, which imputes v3 training labels).
     Its encoding shape (`orm_max_length`, `orm_reserve_ref_tokens`) is not a `prm_search`
     knob, so it stays whatever the campaign's `prm_rollout` section carries.
+
+    The reference comes off the Problem, never off disk: it is the exact text the model was
+    prompted with. orm_score re-reads it from `data.kernelbench_dir` only because the
+    label-imputation pipeline streams stored rows carrying no prompt -- that second path
+    pointed at a tree with no level 1 or 2 and killed jobs 2474471-2 after a full hour.
     """
     conf = cfg.prm_search
     orm_conf = dataclasses.replace(cfg.prm_rollout, orm_checkpoint=conf.orm_checkpoint)
     scorer, encoder = orm_score.load_scorer(orm_conf)
-    kb = orm_score.kernelbench_dir(cfg)
     items, cids = [], []
-    for (level, pid), cands in sorted(result.pool.items()):
-        ref = orm_score.ref_src(kb, level, pid)
+    for _, cands in sorted(result.pool.items()):
+        ref = cands[0].problem.ref_arch_src
         for c in cands:
             code = _code(c)
             if not code:
