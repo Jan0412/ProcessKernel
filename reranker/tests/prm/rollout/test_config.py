@@ -277,3 +277,51 @@ def test_orm_budget_is_not_the_prm_budget():
     # Two models, two budgets. Equal by accident is the silent trap PLAN_v3 §7 names.
     c = PRMRolloutConfig()
     assert c.orm_max_length != c.max_length
+
+
+# --- the single-pass regime (v6 native-thinking runs) ------------------------------------
+
+
+def test_think_temperature_zero_means_one_pass_not_a_cold_plan_pass():
+    # lintloop.py maps `--think-temperature 0` to SamplingSpec.think_temperature=None, i.e.
+    # no plan pass at all. Here it stays a float, so the ONLY correct reading is > 0.
+    assert rollout(think_temperature=0.0).two_pass is False
+    assert rollout(think_temperature=1.0).two_pass is True
+
+
+def test_zero_think_temperature_is_not_none_which_is_the_trap_two_pass_exists_for():
+    # `think_temperature is not None` is True at 0.0, so a caller using it reads every v6 run
+    # as two-pass and prefills a "## Plan" the source policy never wrote.
+    c = rollout(think_temperature=0.0)
+    assert (c.think_temperature is not None) is True
+    assert c.two_pass is False
+
+
+def test_native_thinking_with_a_plan_pass_is_refused():
+    # The pair lintloop.py rejects at startup: both knobs open the assistant turn, so the
+    # plan and the code land inside a <think> block the model never closes. No source run can
+    # have been generated this way.
+    with pytest.raises(ValueError, match="think_temperature"):
+        _cfg(enable_thinking=True, think_temperature=1.0).validate()
+
+
+def test_native_thinking_single_pass_is_the_v6_regime_and_is_accepted():
+    rollout(enable_thinking=True, think_temperature=0.0).validate()
+
+
+def test_the_tail_cut_defaults_are_the_flags_own_off_positions():
+    # A run generated before --top-p/--top-k existed carries no key for them, and
+    # check_gen_model compares against these values when the key is absent.
+    c = PRMRolloutConfig()
+    assert (c.enable_thinking, c.top_p, c.top_k) == (False, 1.0, 0)
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
+def test_top_p_outside_the_unit_interval_is_refused(bad):
+    with pytest.raises(ValueError, match="top_p"):
+        _cfg(top_p=bad).validate()
+
+
+def test_a_negative_top_k_is_refused():
+    with pytest.raises(ValueError, match="top_k"):
+        _cfg(top_k=-1).validate()

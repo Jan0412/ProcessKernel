@@ -28,7 +28,10 @@ class Result:
 def search(backend, problems, conf, rollout_conf, count, scorer, encoder, system,
            build_prompt, rng) -> Result:
     """Run the beam to exhaustion or `max_steps`; return every finished candidate."""
-    think = rollout_conf.think_temperature is not None
+    # `two_pass`, not `is not None`: think_temperature is a float, so 0.0 -- the value a
+    # native-thinking run records -- passes an `is not None` test and would open every beam
+    # with a "## Plan" prefill the source policy never wrote.
+    think = rollout_conf.two_pass
     live = {
         pkey(p): [root_of(p, backend, system, build_prompt(p), think)]
         for p in problems

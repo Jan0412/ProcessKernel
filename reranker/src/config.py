@@ -322,8 +322,18 @@ class PRMRolloutConfig:
     K: int = 5
     min_rollouts: int = 3              # below this many surviving rollouts, V̂ is not measured
     temperature: float = 0.6
+    # 0 means the source run sampled in ONE pass, exactly as lintloop.py reads it
+    # (`args.think_temperature if args.think_temperature > 0 else None`). Ask `two_pass`,
+    # never `think_temperature is not None`: this is a float and 0.0 is not None, so that
+    # test reads a single-pass run as two-pass and prefills a "## Plan" it never had.
     think_temperature: float = 1.0
     max_new_tokens: int = 16384
+    # The rest of the source run's sampler. Defaults are the flags' own off-positions, so a
+    # run generated before they existed -- the kb6 corpus carries none of these keys --
+    # continues to match. A v6 run sets all three from its generation_config.yaml.
+    enable_thinking: bool = False
+    top_p: float = 1.0
+    top_k: int = 0
     gen_model: str = "openai/gpt-oss-120b"    # must match the source run's model
     max_num_seqs: int = 64
     max_model_len: int = 40960
@@ -387,6 +397,15 @@ class PRMRolloutConfig:
     out_dir: str = "data/prm_rollout"
     num_workers: int = 8
 
+    @property
+    def two_pass(self) -> bool:
+        """Did the source run split the plan and the code into two calls?
+
+        The one place the 0-means-single-pass convention is spelled out, so a caller cannot
+        reinvent it as `is not None` and get the answer backwards on a v6 run.
+        """
+        return self.think_temperature > 0
+
     def validate(self) -> None:
         """Fail before a campaign starts rather than partway through one.
 
@@ -404,6 +423,21 @@ class PRMRolloutConfig:
             raise ValueError(f"offset_kappa must be 'auto' or > 0, got {self.offset_kappa!r}")
         if not 0 <= self.calib_speed_quant < 1:
             raise ValueError(f"calib_speed_quant out of range: {self.calib_speed_quant}")
+
+        # The same pair lintloop.py rejects at startup, rejected here for the same reason:
+        # both knobs open the assistant turn, so together the plan and the code are written
+        # inside a <think> block the model never closes. No source run can have been
+        # generated this way, so no rollout may continue one this way either.
+        if self.enable_thinking and self.two_pass:
+            raise ValueError(
+                f"prm_rollout.enable_thinking with think_temperature="
+                f"{self.think_temperature} is a regime lintloop refuses to generate in -- "
+                "a native-thinking run is single-pass, so set think_temperature: 0"
+            )
+        if not 0 < self.top_p <= 1:
+            raise ValueError(f"prm_rollout.top_p must be in (0, 1], got {self.top_p}")
+        if self.top_k < 0:
+            raise ValueError(f"prm_rollout.top_k must be >= 0 (0 is off), got {self.top_k}")
 
         # `_coerce` has no list case, so `prm_rollout.rounds=[0]` from the CLI arrives as
         # the *string* "[0]" and would iterate as characters. List values belong in a file.

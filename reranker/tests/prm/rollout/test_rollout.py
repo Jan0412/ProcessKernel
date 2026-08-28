@@ -1114,3 +1114,100 @@ def test_the_budget_counter_is_built_from_the_generation_model(monkeypatch):
     conf = cfg(gen_model="openai/gpt-oss-120b", base_model="Qwen/Qwen3-Reranker-4B")
     assert rollout.gen_counter(conf)("abcd") == 4
     assert asked == ["openai/gpt-oss-120b"]
+
+
+# --- the single-pass regime: v6 runs generated with native thinking ----------------------
+
+
+def single_pass_cfg(**over):
+    """A campaign over a `think_temperature: 0` run -- one call, no plan pass."""
+    return cfg(think_temperature=0.0, enable_thinking=True, **over)
+
+
+def test_a_prose_cut_of_a_single_pass_run_is_still_one_call_at_temperature():
+    # The whole point. A run sampled at think_temperature 0 made ONE call with no stop, so
+    # it had no seam to be on either side of. Continuing a prose cut in two passes would
+    # prefill a fence the model never wrote and resample the tail at a second temperature.
+    backend = Recorder(default="\n    return x\n```\n")
+    rows = run(backend, [prefix(cut_kind="prose", cut_char=12)], conf=single_pass_cfg())
+    assert len(backend.calls) == 1
+    assert backend.calls[0]["temperature"] == 0.6
+    assert backend.calls[0]["stop"] is None
+    assert all(r.finish_reason["plan"] is None for r in rows)
+
+
+def test_a_single_pass_continuation_carries_no_plan_half():
+    # `_continuation` and `_trace` both read plan=None as "one pass"; a prose cut that
+    # reached the two-pass path would splice CODE_FENCE into the text it returns.
+    backend = Recorder(default="\n    return x\n```\n")
+    rows = run(backend, [prefix(cut_kind="prose", cut_char=12)], conf=single_pass_cfg())
+    assert [r.continuation for r in rows] == ["\n    return x\n```\n"] * 2
+
+
+def test_the_single_pass_shortcut_is_counted_not_silent():
+    counts = Counter()
+    run(backend := Recorder(default="x"), [prefix(cut_kind="prose", cut_char=12)],
+        conf=single_pass_cfg(), counts=counts)
+    assert counts["single_pass_cut"] == 1
+    assert counts["prose_cut_past_seam"] == 0
+    assert len(backend.calls) == 1
+
+
+def test_a_two_pass_campaign_is_unaffected_by_the_shortcut():
+    # The regression guard on the other side: think_temperature 1.0 keeps the plan pass.
+    backend = Recorder(default="rest of the plan\n```python\nimport torch\n")
+    run(backend, [prefix(cut_kind="prose", cut_char=12)], conf=cfg())
+    assert len(backend.calls) == 2
+
+
+# --- the sampler knobs the source run recorded -------------------------------------------
+
+
+def test_a_run_generated_before_the_tail_cut_flags_existed_still_matches(tmp_path):
+    # The kb6 corpus carries no enable_thinking/top_p/top_k key at all. A bare `.get` would
+    # compare None against False/1.0/0 and refuse every campaign over it.
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path)])
+    got = rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+    assert got == {f"{RUN}/{SHARD}": "openai/gpt-oss-120b"}
+
+
+def test_a_tail_cut_that_differs_from_the_source_run_is_refused(tmp_path):
+    # Qwen 0.95/20, MiniMax 0.95/40, Nemotron 0.95: three of the five v6 runs carry a cut
+    # vLLM's defaults do not apply, so ignoring it samples a different distribution.
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, top_p=0.95)])
+    with pytest.raises(ValueError, match="top_p"):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+
+
+def test_a_top_k_that_differs_from_the_source_run_is_refused(tmp_path):
+    write_v1_manifest(tmp_path, [write_source_run(tmp_path, top_k=20)])
+    with pytest.raises(ValueError, match="top_k"):
+        rollout.check_gen_model(gen_cfg(tmp_path), [(RUN, SHARD)])
+
+
+def test_native_thinking_that_differs_from_the_source_run_is_refused(tmp_path):
+    # render_chat branches on it: at False it CLOSES the block a native-thinking template
+    # opens, so the prefix would be reconstructed under a head its generation never had.
+    write_v1_manifest(tmp_path, [
+        write_source_run(tmp_path, enable_thinking=True, think_temperature=0.0)
+    ])
+    with pytest.raises(ValueError, match="enable_thinking"):
+        rollout.check_gen_model(gen_cfg(tmp_path, think_temperature=0.0), [(RUN, SHARD)])
+
+
+def test_the_backend_is_built_with_the_source_runs_whole_sampler(monkeypatch):
+    # Left to VLLMBackend's defaults these are False/1.0/0 -- the off-positions -- and
+    # nothing downstream can see that the rollouts were sampled in another regime.
+    import kernel_gen.core.backend as backend_mod
+
+    seen = {}
+
+    class Spy:
+        def __init__(self, model, **kw):
+            seen.update(kw, model=model)
+
+    monkeypatch.setattr(backend_mod, "VLLMBackend", Spy)
+    rollout._backend(single_pass_cfg(top_p=0.95, top_k=20))
+    assert seen["enable_thinking"] is True
+    assert seen["top_p"] == 0.95
+    assert seen["top_k"] == 20

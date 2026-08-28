@@ -46,18 +46,29 @@ ROLLOUT_MANIFEST = "rollout_manifest.json"   # job B's, beside job A's manifest.
 # single row, and a guard that refused those would be one operators route around by deleting
 # the manifest. v1's build.py draws the same line with ROW_KNOBS.
 SAMPLE_KNOBS = ("gen_model", "K", "temperature", "think_temperature", "max_new_tokens",
-                "parts_glob")
+                "enable_thinking", "top_p", "top_k", "parts_glob")
 UNIT_META = ".meta"                      # one unit's counters, beside its part
 GEN_CONFIG = "generation_config.yaml"    # what lintloop.sh leaves in every shard dir
-# The regime a rollout has to be sampled in, as {config attribute: generation_config key}.
+# The regime a rollout has to be sampled in, as
+# {config attribute: (generation_config key, value when that key is absent)}.
 # `gen_model` is the one that actually drifts -- three of the four candidate runs are
-# DeepSeek and the default is gpt-oss -- but the other three cost nothing to check and a
-# future run may move them.
+# DeepSeek and the default is gpt-oss -- but the others cost nothing to check.
+#
+# The default is not a convenience. A run generated before a flag existed carries no key for
+# it: the kb6 corpus the v1 campaigns read has no `enable_thinking`, `top_p` or `top_k`, and
+# a bare `.get` would compare None against False/1.0/0 and refuse every one of them. The
+# value here is the flag's own off-position, which is what such a run was sampled at.
 SAMPLER = {
-    "gen_model": "model",
-    "temperature": "temperature",
-    "think_temperature": "think_temperature",
-    "max_new_tokens": "max_new_tokens",
+    "gen_model": ("model", None),
+    "temperature": ("temperature", None),
+    "think_temperature": ("think_temperature", None),
+    "max_new_tokens": ("max_new_tokens", None),
+    # Absent in every pre-v6 run, and decisive in the v6 ones: three of the five carry a
+    # tail cut (Qwen 0.95/20, MiniMax 0.95/40, Nemotron 0.95) that vLLM's own defaults do
+    # not apply, so a rollout ignoring them samples a different distribution in silence.
+    "enable_thinking": ("enable_thinking", False),
+    "top_p": ("top_p", 1.0),
+    "top_k": ("top_k", 0),
 }
 
 
@@ -178,8 +189,8 @@ def check_gen_model(cfg, shards) -> dict[str, str]:
                 "cannot show it continues them in the regime they came from"
             )
         source = yaml.safe_load(_read(path))
-        for attr, key in SAMPLER.items():
-            want, got = getattr(cfg, attr), source.get(key)
+        for attr, (key, absent) in SAMPLER.items():
+            want, got = getattr(cfg, attr), source.get(key, absent)
             if want != got:
                 raise ValueError(
                     f"prm_rollout.{attr} is {want!r}, but {run_name}/{shard} was generated "
@@ -322,9 +333,12 @@ def generate(backend, prefixes, sources: dict, cfg, count, counts=None) -> list[
         head = reconstruct(backend, prefix, src)
         # Once per prefix, not once per rollout: the K siblings share a context, and this
         # scans it for fences.
-        mode = _mode(prefix, text, counts)
+        mode = _mode(prefix, text, counts, cfg.two_pass)
         jobs.extend(_Job(prefix, j, head, text, spent, room, mode) for j in range(prefix.K))
 
+    # Empty on a single-pass campaign, so `_call` returns without touching the backend and
+    # every job keeps `plan=None` -- which is what `_continuation` and `_trace` already read
+    # as "one pass". No branch needed here; `_mode` is where the regime is decided.
     prose = [job for job in jobs if job.mode == PROSE]
     plans = _call(backend, prose, lambda job: job.head, cfg.think_temperature, [CODE_FENCE])
     for job, plan in zip(prose, plans):
@@ -336,8 +350,15 @@ def generate(backend, prefixes, sources: dict, cfg, count, counts=None) -> list[
     return [_row(job, count) for job in jobs]
 
 
-def _mode(prefix, text: str, counts: Counter) -> str:
+def _mode(prefix, text: str, counts: Counter, two_pass: bool = True) -> str:
     """Which pass the source run was in at this character -- not what the text looks like.
+
+    ``two_pass=False`` short-circuits the whole question. A run sampled at
+    ``think_temperature: 0`` made ONE call with no stop string, so it had no passes to be
+    between: every character of `raw` came off the same distribution and every cut continues
+    the same way. Answering `prose` there would prefill a fence the model never wrote and
+    resample the tail at a second temperature -- the two-pass regime, applied to a
+    completion that was never generated in it.
 
     `cut_kind` answers a different question. `chunks.py` labels a chunk by what it *is*, and
     its prose regions are the gaps between fenced spans, so they carry the ```` ```python ````
@@ -352,6 +373,9 @@ def _mode(prefix, text: str, counts: Counter) -> str:
     a block. Continuing those at `think_temperature` would sample them from a distribution
     they never came from, and would splice a second opening fence into the completion.
     """
+    if not two_pass:
+        counts["single_pass_cut"] += 1
+        return CODE
     if prefix.cut_kind != PROSE:
         return CODE
     if CODE_FENCE in text:
@@ -650,6 +674,14 @@ def _backend(conf, gpu_memory_utilization: float | None = None):
     }
     return VLLMBackend(
         conf.gen_model, max_model_len=conf.max_model_len, max_num_seqs=conf.max_num_seqs,
+        # Passed, never left to the constructor's defaults. `render_chat` branches on
+        # enable_thinking: at False it *closes* the block a native-thinking template opens,
+        # so a Qwen/Nemotron/MiniMax prefix would be reconstructed under a head its
+        # generation never had. top_p/top_k are the tail cuts three of the five v6 runs were
+        # sampled at. check_gen_model has already matched all three against the source run.
+        enable_thinking=conf.enable_thinking,
+        top_p=conf.top_p,
+        top_k=conf.top_k,
         **extra,
     )
 
