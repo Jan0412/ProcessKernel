@@ -69,6 +69,7 @@ from kernel_gen.core import artifacts, cli
 from kernel_gen.core.critics import lint_critic
 from kernel_gen.core.engine import run_rounds
 from kernel_gen.core.model import Attempt, Problem, Trajectory
+from kernel_gen.core.prompt_deltas import parse_deltas
 from kernel_gen.core.prompts import SYSTEM_PROMPT, build_base_prompt, build_repair_prompt
 from kernel_gen.core.sampling import SamplingSpec
 from kernel_gen.core.sources import load_problems
@@ -171,6 +172,19 @@ def main() -> None:
     args = build_parser().parse_args()
     cli.resolve_dataset_name(args)
 
+    # Both knobs open the assistant turn: --enable-thinking leaves the model's
+    # <think> block open, a non-zero --think-temperature prefills "## Plan" into
+    # it. Together the plan and the code are written inside a block the model
+    # never closes, which yields scratch work that still parses -- so it fails
+    # here rather than after a two-day run.
+    if args.enable_thinking and args.think_temperature:
+        raise SystemExit(
+            "--enable-thinking with a non-zero --think-temperature writes the plan "
+            "and the code inside the model's own <think> block, which it never "
+            "closes. Use --think-temperature 0 with --enable-thinking, or drop "
+            "the flag."
+        )
+
     if args.output_dir is None:
         args.output_dir = default_output_dir(args)
     out_dir = args.output_dir  # created only once we commit to running (see --dry-run)
@@ -212,14 +226,16 @@ def main() -> None:
         config,
         keys=["model", "arm", "dataset", "dataset_name", "ref_dir", "level",
               "num_problems", "num_slots", "num_samples", "rounds", "feedback_policy",
-              "lint_checks", "temperature", "think_temperature", "max_new_tokens",
-              "max_model_len", "trace", "trace_topk", "output_dir"],
+              "lint_checks", "temperature", "top_p", "top_k", "think_temperature",
+              "max_new_tokens",
+              "max_model_len", "trace", "trace_topk", "prompt_deltas", "output_dir"],
         title="Lint-feedback loop (A5)",
     )
 
     # Round-0 prompts are identical to a plain generation's, so this closure is also
     # exactly what the baseline arm would use. Memoized: 10 slots share one prompt.
     prompt_cache: dict[int, str] = {}
+    deltas = parse_deltas(args.prompt_deltas)
 
     def base_prompt(problem: Problem) -> str:
         if problem.problem_id not in prompt_cache:
@@ -229,6 +245,7 @@ def main() -> None:
                 option=args.option,
                 include_hardware=args.include_hardware,
                 gpu_name=args.gpu_name,
+                deltas=deltas,
             )
         return prompt_cache[problem.problem_id]
 
@@ -258,6 +275,9 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         max_num_seqs=args.max_num_seqs,
         max_logprobs=args.trace_topk,
+        enable_thinking=args.enable_thinking,
+        top_p=args.top_p,
+        top_k=args.top_k,
     )
 
     spec = SamplingSpec(
@@ -291,6 +311,8 @@ def main() -> None:
                 "trace_window": args.trace_window,
                 "vocab_size": getattr(backend, "vocab_size", None),
                 "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
                 "think_temperature": args.think_temperature,
             },
         )

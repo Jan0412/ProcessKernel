@@ -211,6 +211,9 @@ class _FakeLLM:
     """Records the kwargs it was constructed with; returns scripted outputs."""
 
     last_kwargs: dict = {}
+    last_template_kwargs: dict = {}
+    # Set by tests to mimic a template that force-opens a think block (MiniMax M2.7).
+    template_suffix: str = ""
 
     def __init__(self, model=None, **kwargs):
         _FakeLLM.last_kwargs = {"model": model, **kwargs}
@@ -220,11 +223,14 @@ class _FakeLLM:
         )
 
     def get_tokenizer(self):
-        return types.SimpleNamespace(
-            apply_chat_template=lambda msgs, tokenize, add_generation_prompt: (
+        def apply_chat_template(msgs, tokenize, add_generation_prompt, **kwargs):
+            _FakeLLM.last_template_kwargs = dict(kwargs)
+            return (
                 f"<chat>{msgs[0]['content']}|{msgs[1]['content']}"
+                + _FakeLLM.template_suffix
             )
-        )
+
+        return types.SimpleNamespace(apply_chat_template=apply_chat_template)
 
     def generate(self, prompts, params):
         self.generate_calls.append((list(prompts), params))
@@ -274,11 +280,53 @@ def test_render_chat_delegates_to_the_models_own_template(vllm_backend):
     assert vllm_backend.render_chat("SYS", "USER") == "<chat>SYS|USER"
 
 
+def test_render_chat_passes_the_thinking_switch_to_the_template(vllm_backend):
+    vllm_backend.render_chat("SYS", "USER")
+    assert _FakeLLM.last_template_kwargs["enable_thinking"] is False
+
+
+def test_render_chat_closes_a_template_that_force_opens_a_think_block(
+    monkeypatch, vllm_backend
+):
+    # M2.7 has no enable_thinking branch; its template always ends "<think>\n". Left
+    # open, the two-pass prefill writes plan and code inside a block never closed.
+    monkeypatch.setattr(_FakeLLM, "template_suffix", "\n<think>\n")
+    assert vllm_backend.render_chat("SYS", "USER") == "<chat>SYS|USER\n<think></think>\n\n"
+
+
+def test_render_chat_keeps_the_think_block_open_when_thinking_is_enabled(
+    monkeypatch, vllm_backend
+):
+    # Native reasoning: the model must be left inside its own block, not closed out of it.
+    monkeypatch.setattr(_FakeLLM, "template_suffix", "\n<think>\n")
+    monkeypatch.setattr(vllm_backend, "enable_thinking", True)
+    assert vllm_backend.render_chat("SYS", "USER") == "<chat>SYS|USER\n<think>\n"
+
+
 def test_complete_traced_requests_flat_logprobs_only_when_tracing(vllm_backend):
     vllm_backend.complete_traced(["p"], temperature=0.6, max_tokens=32, logprobs=20)
     params = vllm_backend.llm.generate_calls[-1][1]
     assert params.kwargs["logprobs"] == 20
     assert params.kwargs["flat_logprobs"] is True  # avoids ~84M dataclasses at scale
+
+
+def test_sampling_leaves_the_tail_uncut_by_default(vllm_backend):
+    vllm_backend.complete_traced(["p"], temperature=0.6, max_tokens=32)
+    params = vllm_backend.llm.generate_calls[-1][1]
+    assert params.kwargs["top_p"] == 1.0
+    assert params.kwargs["top_k"] == 0
+
+
+def test_vendor_tail_cuts_reach_the_sampler(vllm_backend):
+    # Qwen3.5's "thinking mode for precise coding" preset. Set once on the backend, so
+    # the plan pass and the code pass are cut the same way.
+    from kernel_gen.core.backend import VLLMBackend
+
+    backend = VLLMBackend("some/model", top_p=0.95, top_k=20)
+    backend.complete_traced(["p"], temperature=0.6, max_tokens=32)
+    params = backend.llm.generate_calls[-1][1]
+    assert params.kwargs["top_p"] == 0.95
+    assert params.kwargs["top_k"] == 20
     assert params.kwargs["n"] == 1
     assert params.kwargs["include_stop_str_in_output"] is False
 

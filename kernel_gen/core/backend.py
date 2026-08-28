@@ -133,6 +133,12 @@ class VLLMBackend(Backend):
         trust_remote_code: bool = False,
         max_num_seqs: int = 32,
         max_logprobs: int = 20,
+        enable_thinking: bool = False,
+        # Per-run, not per-call like temperature: a model card's tail cut applies to the
+        # plan pass and the code pass alike. Traces are unaffected -- logprobs_mode is
+        # "raw_logprobs", read before the sampler applies either of these.
+        top_p: float = 1.0,
+        top_k: int = 0,
     ):
         # Disabled as a precaution while debugging Qwen3.6 GDN crashes; not
         # independently proven causal (the crash-relevant lever turned out to be
@@ -210,6 +216,9 @@ class VLLMBackend(Backend):
             max_logprobs=max_logprobs,
         )
         self.max_logprobs = max_logprobs
+        self.enable_thinking = enable_thinking
+        self.top_p = top_p
+        self.top_k = top_k
         if load_in_4bit:
             kwargs["quantization"] = "bitsandbytes"
             kwargs["load_format"] = "bitsandbytes"
@@ -242,11 +251,24 @@ class VLLMBackend(Backend):
         print(f"Model loaded (vocab {self.vocab_size}, max_logprobs {max_logprobs}).")
 
     def render_chat(self, system: str, user: str) -> str:
-        return self.tokenizer.apply_chat_template(
+        rendered = self.tokenizer.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
         )
+        if self.enable_thinking:
+            return rendered
+        # M2.7's template always ends with an open "<think>" and has no switch to turn
+        # that off. Left open, the two-pass prefill writes the plan AND the code inside
+        # the thinking block and the model never closes it -- so we would capture its
+        # scratch work instead of its answer. Closing it here yields an empty thinking
+        # block: the state Nemotron's own enable_thinking=False emits, and the one
+        # DeepSeek renders in by default. rstrip() because the template ends "<think>\n".
+        stripped = rendered.rstrip()
+        if stripped.endswith("<think>"):
+            return stripped + "</think>\n\n"
+        return rendered
 
     def complete(
         self,
@@ -289,6 +311,8 @@ class VLLMBackend(Backend):
             return []
         params = SamplingParams(
             temperature=temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
             max_tokens=max_tokens,
             n=1,
             stop=stop,
