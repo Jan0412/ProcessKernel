@@ -10,6 +10,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -33,6 +34,7 @@ ROW_SHA1 = "system_prompt_sha1"
 # out_dir -- without anyone having to hand-write a probe for whichever field is new.
 SCHEMA_VERSION = 1
 
+EXCLUDED = "excluded"
 TRUNCATED = "truncated"
 NO_FINISH_REASON = "no_finish_reason"
 NO_BASELINE = "no_baseline"
@@ -40,9 +42,12 @@ NO_RUNTIME = "no_runtime"
 TOKENIZE_FAILED = "tokenize_failed"
 TOO_LONG = "too_long"
 NO_CUTS = "no_cuts"
-# Applied in this order so the counts are interpretable: `truncated` first because it is
-# the only drop whose *label* is invalid rather than whose text is unusable (§6).
+# Applied in this order so the counts are interpretable: `excluded` first because it is a
+# decision about the *problem*, taken before the attempt is judged at all, and `truncated`
+# next because it is the only remaining drop whose *label* is invalid rather than whose
+# text is unusable (§6).
 REASONS = (
+    EXCLUDED,
     TRUNCATED,
     NO_FINISH_REASON,
     corpus.NO_EVAL_ENTRY,
@@ -77,6 +82,32 @@ class Built:
     record: dict
 
 
+def load_exclusions(path: str) -> dict[int, frozenset[int]]:
+    """``{level: {problem_id}}`` from a file keyed ``"level7"`` -- ``{}`` when unset.
+
+    Keyed by level like the timing JSON, and parsed the same way, because a problem id is
+    only unique within one: level1's problem 4 and level7's problem 4 are different files.
+    Keys that are not ``level<n>`` are ignored, which is what `_meta` in the shipped file is.
+    """
+    if not path:
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    out = {
+        int(m.group(1)): frozenset(int(i) for i in ids)
+        for key, ids in raw.items()
+        if (m := re.match(r"level(\d+)$", str(key))) and isinstance(ids, list)
+    }
+    if not out:
+        # Silently excluding nothing is the one outcome this knob must not have: the build
+        # would label the problems it was pointed away from and record that it had a list.
+        raise ValueError(
+            f"{path} names no level: prm.exclude_problems_json must be keyed "
+            '{"level<n>": [problem_id, ...]}'
+        )
+    return out
+
+
 def part_name(unit: corpus.Unit) -> str:
     """Both source runs contain a ``shard_00``, so the run name has to be in the file name."""
     return f"{unit.run_name}__{unit.shard}__round{unit.round}.jsonl"
@@ -96,6 +127,7 @@ def build_unit(
     *,
     parts_dir: str,
     baselines: dict,
+    excluded: dict[int, frozenset[int]],
     count: Callable[[str], int],
 ) -> Built:
     """Write one unit's part, ``.idx`` and ``.meta``, counting every attempt that did not make it."""
@@ -110,7 +142,7 @@ def build_unit(
     # run_build's "the part exists, skip it" would then treat as finished.
     with open(path + ".tmp", "wb") as f:
         for labeled in corpus.iter_labeled(unit, counts):
-            row = _row(labeled, prm, baselines, count, dropped, prompts)
+            row = _row(labeled, prm, baselines, excluded, count, dropped, prompts)
             if row is None:
                 continue
             # ensure_ascii spelled out because it is load-bearing, not a default: it is how
@@ -145,6 +177,7 @@ def _row(
     labeled: corpus.Labeled,
     prm: PRMConfig,
     baselines: dict,
+    excluded: dict[int, frozenset[int]],
     count: Callable[[str], int],
     dropped: dict[str, list[str]],
     prompts: dict[str, str],
@@ -155,6 +188,11 @@ def _row(
         dropped[reason].append(labeled.stem)
         return None
 
+    # Before everything else, truncation included: the problem is out of scope, so how its
+    # attempt turned out is not a question this build asks. Ordering it after `truncated`
+    # would split one excluded problem's attempts across two reasons.
+    if labeled.problem_id in excluded.get(labeled.level, ()):
+        return drop(EXCLUDED)
     if labeled.truncation == corpus.TRUNCATED:
         return drop(TRUNCATED)
     if labeled.truncation != corpus.OK:
@@ -232,9 +270,10 @@ def _row(
 _STATE: dict = {}
 
 
-def _init_worker(prm: PRMConfig, parts_dir: str, baselines: dict) -> None:
+def _init_worker(prm: PRMConfig, parts_dir: str, baselines: dict, excluded: dict) -> None:
     _STATE.update(
-        prm=prm, parts_dir=parts_dir, baselines=baselines, count=token_counter(prm.tokenizer)
+        prm=prm, parts_dir=parts_dir, baselines=baselines, excluded=excluded,
+        count=token_counter(prm.tokenizer),
     )
 
 
@@ -244,14 +283,16 @@ def _build_one(unit: corpus.Unit) -> Built:
         _STATE["prm"],
         parts_dir=_STATE["parts_dir"],
         baselines=_STATE["baselines"],
+        excluded=_STATE["excluded"],
         count=_STATE["count"],
     )
 
 
-def _map(todo: list[corpus.Unit], prm: PRMConfig, parts_dir: str, baselines: dict) -> list[Built]:
+def _map(todo: list[corpus.Unit], prm: PRMConfig, parts_dir: str, baselines: dict,
+         excluded: dict) -> list[Built]:
     if not todo:
         return []  # a full rerun: no tokenizer to load, nothing to fork for
-    args = (prm, parts_dir, baselines)
+    args = (prm, parts_dir, baselines, excluded)
     # One unit is not worth a fork.
     if prm.num_workers == 1 or len(todo) == 1:
         _init_worker(*args)
@@ -274,15 +315,24 @@ def run_build(cfg: RerankerConfig) -> str:
 
     baseline = _resolve(prm.baseline_timing_json)
     baseline_sha1 = _sha1(baseline)
+    # Read before out_dir exists, so a malformed list fails the build rather than a worker.
+    excludes = _resolve(prm.exclude_problems_json) if prm.exclude_problems_json else ""
+    excluded = load_exclusions(excludes)
+    exclude_sha1 = _sha1(excludes) if excludes else None
     # Off the parts on disk, not off `found` minus `todo`: replacing run_dirs outright
     # leaves every found unit new, and the old parts are merged in all the same.
     held = glob.glob(os.path.join(parts_dir, "*.jsonl"))
     if held:
-        _check_resume(_load_manifest(out_dir), prm, baseline_sha1, out_dir, len(held))
+        _check_resume(
+            _load_manifest(out_dir), prm, baseline_sha1, exclude_sha1, out_dir, len(held)
+        )
     os.makedirs(parts_dir, exist_ok=True)
 
     def stamp(built: int) -> dict:
-        return _manifest(prm, baseline, baseline_sha1, _unit_records(parts_dir), skipped, built)
+        return _manifest(
+            prm, baseline, baseline_sha1, excludes, exclude_sha1,
+            _unit_records(parts_dir), skipped, built,
+        )
 
     path = os.path.join(out_dir, MANIFEST)
     # Stamped before the pool as well as after it: a build killed at its walltime leaves
@@ -290,7 +340,7 @@ def run_build(cfg: RerankerConfig) -> str:
     before = stamp(0)
     _check_schema(before["units"], out_dir)
     write_atomic(path, json.dumps(before, indent=2))
-    _map(todo, prm, parts_dir, load_baseline_times(baseline))
+    _map(todo, prm, parts_dir, load_baseline_times(baseline), excluded)
     manifest = stamp(len(todo))
     # Derived from the parts, so a resume rewrites it. A build killed before this point
     # leaves shas resolving nowhere -- and fails stats.py's row and part gates until rerun.
@@ -308,7 +358,7 @@ def run_build(cfg: RerankerConfig) -> str:
     return path
 
 
-def _manifest(prm, baseline, baseline_sha1, units, skipped, built) -> dict:
+def _manifest(prm, baseline, baseline_sha1, excludes, exclude_sha1, units, skipped, built) -> dict:
     """The dataset as it stands on disk -- not what this invocation happened to do."""
     total: Counter = Counter()
     for name in sorted(units):
@@ -329,6 +379,10 @@ def _manifest(prm, baseline, baseline_sha1, units, skipped, built) -> dict:
         "config": dataclasses.asdict(prm),
         "baseline_timing_json": baseline,
         "baseline_sha1": baseline_sha1,
+        # Resolved path and content hash, for the reason the baseline carries both: the
+        # knob records where the list was, the sha records which list it was.
+        "exclude_problems_json": excludes or None,
+        "exclude_sha1": exclude_sha1,
         "parts": len(units),
         "units_built": built,
         "units_reused": len(units) - built,
@@ -386,7 +440,9 @@ def _load_manifest(out_dir: str) -> dict:
         return json.load(f)
 
 
-def _check_resume(was: dict, prm: PRMConfig, baseline_sha1: str, out_dir: str, n: int) -> None:
+def _check_resume(
+    was: dict, prm: PRMConfig, baseline_sha1: str, exclude_sha1: str | None, out_dir: str, n: int
+) -> None:
     """A part is reused on its name alone, so the knobs behind it must not have moved."""
     if not was:
         # Every build stamps a manifest before writing a part, so parts without one were
@@ -400,6 +456,10 @@ def _check_resume(was: dict, prm: PRMConfig, baseline_sha1: str, out_dir: str, n
     # The path can stay put while the file behind it is re-measured.
     if was.get("baseline_sha1") != baseline_sha1:
         moved["baseline_sha1"] = (was.get("baseline_sha1"), baseline_sha1)
+    # Same reasoning, and the same trap: editing the list in place leaves every knob equal
+    # while half the parts hold problems the other half excludes.
+    if was.get("exclude_sha1") != exclude_sha1:
+        moved["exclude_sha1"] = (was.get("exclude_sha1"), exclude_sha1)
     if moved:
         raise ValueError(
             f"{out_dir} holds parts built with different knobs {moved}; reusing them would "

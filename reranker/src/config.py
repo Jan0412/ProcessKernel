@@ -193,6 +193,9 @@ class PRMConfig:
     run_dirs: list[str] = field(default_factory=list)
     rounds: list[int] = field(default_factory=lambda: [0, 1, 2])
     baseline_timing_json: str = BASELINE_TIMING_JSON
+    # Problems to label at all, as {"level7": [ids]} -- keyed by level because an id means
+    # nothing without one. "" labels every problem. A row knob: it decides which rows exist.
+    exclude_problems_json: str = ""
 
     label_mode: str = "graded"    # graded | binary  — validated by targets.target_for
     speedup_stat: str = "min"     # min | mean
@@ -274,6 +277,12 @@ class PRMConfig:
         baseline = _resolve(self.baseline_timing_json)
         if not os.path.isfile(baseline):
             raise ValueError(f"prm.baseline_timing_json is not a file: {baseline}")
+        # Checked here too: a missing exclusion file would otherwise label the problems it
+        # names, which is the failure this knob exists to prevent and leaves no trace.
+        if self.exclude_problems_json:
+            excludes = _resolve(self.exclude_problems_json)
+            if not os.path.isfile(excludes):
+                raise ValueError(f"prm.exclude_problems_json is not a file: {excludes}")
 
 
 # The two prefix sources and the three train-set selection modes (PLAN_v2 §6). Here rather

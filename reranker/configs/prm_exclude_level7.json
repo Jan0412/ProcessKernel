@@ -1,0 +1,553 @@
+{
+ "level7": [
+  288,
+  477,
+  558,
+  571,
+  735,
+  1077,
+  1150,
+  1152,
+  1224,
+  1377,
+  1433,
+  1440,
+  1602,
+  1989,
+  2135,
+  2140,
+  2294,
+  2692,
+  3016,
+  3295,
+  3317,
+  3521,
+  3797,
+  3997,
+  4112,
+  4344,
+  4451,
+  4542,
+  4649,
+  4651,
+  4932,
+  5057,
+  5384,
+  5389,
+  5522,
+  5532,
+  5559,
+  5706,
+  6102,
+  6138,
+  6408,
+  7103,
+  7794,
+  8090,
+  8297,
+  8517,
+  9455,
+  9508,
+  10100,
+  10429,
+  11287,
+  11846,
+  12369,
+  12865,
+  13018,
+  13139,
+  13797,
+  14716,
+  14719,
+  15023,
+  16236,
+  17442
+ ],
+ "_meta": {
+  "created": "2026-08-28T16:50:49",
+  "purpose": "problems reranker.src.prm.build must not label; see prm.exclude_problems_json",
+  "baseline": "/path/to/workdir/KernelBench/results/timing/H100/baseline_time_torch.json",
+  "spread_threshold": 0.1,
+  "method": {
+   "ambiguous_baseline": "level7 is level6 deduped; the collapsed twins were each timed independently. A kept representative whose twins' min runtimes disagree by more than spread_threshold carries one of several readings, so its speedup is wrong by that factor whichever was kept.",
+   "no_op_reference": "decided by RUNNING each model and comparing its output to its input, never by reading the source: x * self.scale is a no-op exactly when scale defaults to 1 and get_init_inputs() passes nothing. 735_Scale.py and 801_Scale.py have identical source and land on opposite sides. A syntactic rule was tried first and was wrong about 106 of the 144 problems it proposed."
+  },
+  "counts": {
+   "ambiguous_baseline": 26,
+   "no_op_reference": 36,
+   "both": 0,
+   "total": 62,
+   "of_level7_problems": 13371,
+   "syntactically_proposed_but_rejected": 106,
+   "unrunnable_kept": 2
+  },
+  "ambiguous_baseline": {
+   "477": {
+    "file": "477_GRUCell.py",
+    "kept_min": 0.179,
+    "group_min": 0.0608,
+    "group_max": 0.179,
+    "disagreement": 2.944,
+    "n_measurements": 3
+   },
+   "1077": {
+    "file": "1077_VertexDirectEmbedder.py",
+    "kept_min": 0.0118,
+    "group_min": 0.0112,
+    "group_max": 0.0124,
+    "disagreement": 1.107,
+    "n_measurements": 6
+   },
+   "1150": {
+    "file": "1150_ODEfunc.py",
+    "kept_min": 0.104,
+    "group_min": 0.104,
+    "group_max": 0.117,
+    "disagreement": 1.125,
+    "n_measurements": 5
+   },
+   "1152": {
+    "file": "1152_SEBlock.py",
+    "kept_min": 0.0676,
+    "group_min": 0.067,
+    "group_max": 0.119,
+    "disagreement": 1.776,
+    "n_measurements": 4
+   },
+   "1224": {
+    "file": "1224_Attention.py",
+    "kept_min": 0.0339,
+    "group_min": 0.0339,
+    "group_max": 0.0427,
+    "disagreement": 1.26,
+    "n_measurements": 3
+   },
+   "1377": {
+    "file": "1377_MNIST_CNN.py",
+    "kept_min": 0.141,
+    "group_min": 0.141,
+    "group_max": 0.156,
+    "disagreement": 1.106,
+    "n_measurements": 3
+   },
+   "1433": {
+    "file": "1433_CombineSlices.py",
+    "kept_min": 0.033,
+    "group_min": 0.0213,
+    "group_max": 0.033,
+    "disagreement": 1.549,
+    "n_measurements": 4
+   },
+   "1440": {
+    "file": "1440_ScalarMix.py",
+    "kept_min": 0.0478,
+    "group_min": 0.0146,
+    "group_max": 0.0478,
+    "disagreement": 3.274,
+    "n_measurements": 2
+   },
+   "1989": {
+    "file": "1989_MNIST_CNN.py",
+    "kept_min": 0.142,
+    "group_min": 0.142,
+    "group_max": 0.16,
+    "disagreement": 1.127,
+    "n_measurements": 2
+   },
+   "2135": {
+    "file": "2135_Multi_Head_Attention.py",
+    "kept_min": 0.0468,
+    "group_min": 0.0385,
+    "group_max": 0.0529,
+    "disagreement": 1.374,
+    "n_measurements": 4
+   },
+   "2140": {
+    "file": "2140_Encoder.py",
+    "kept_min": 0.12,
+    "group_min": 0.107,
+    "group_max": 0.123,
+    "disagreement": 1.15,
+    "n_measurements": 4
+   },
+   "2294": {
+    "file": "2294_Attention.py",
+    "kept_min": 0.0335,
+    "group_min": 0.0335,
+    "group_max": 0.0419,
+    "disagreement": 1.251,
+    "n_measurements": 2
+   },
+   "3016": {
+    "file": "3016_CNN.py",
+    "kept_min": 0.0948,
+    "group_min": 0.0939,
+    "group_max": 0.225,
+    "disagreement": 2.396,
+    "n_measurements": 3
+   },
+   "3295": {
+    "file": "3295_SimpleStackModel.py",
+    "kept_min": 0.0109,
+    "group_min": 0.0105,
+    "group_max": 0.0118,
+    "disagreement": 1.124,
+    "n_measurements": 4
+   },
+   "3797": {
+    "file": "3797_adaLIN.py",
+    "kept_min": 0.0777,
+    "group_min": 0.0777,
+    "group_max": 0.154,
+    "disagreement": 1.982,
+    "n_measurements": 2
+   },
+   "3997": {
+    "file": "3997_BasicModel_ConvNet_MaxPool1d.py",
+    "kept_min": 0.0579,
+    "group_min": 0.0579,
+    "group_max": 0.0662,
+    "disagreement": 1.143,
+    "n_measurements": 2
+   },
+   "4451": {
+    "file": "4451_PCN1.py",
+    "kept_min": 0.106,
+    "group_min": 0.106,
+    "group_max": 0.227,
+    "disagreement": 2.142,
+    "n_measurements": 2
+   },
+   "4542": {
+    "file": "4542_CausalConv1d.py",
+    "kept_min": 0.08,
+    "group_min": 0.0796,
+    "group_max": 0.0883,
+    "disagreement": 1.109,
+    "n_measurements": 5
+   },
+   "4932": {
+    "file": "4932_Net.py",
+    "kept_min": 0.173,
+    "group_min": 0.0982,
+    "group_max": 0.173,
+    "disagreement": 1.762,
+    "n_measurements": 2
+   },
+   "5384": {
+    "file": "5384_BasicModel_ConvNet_MaxPool1d.py",
+    "kept_min": 0.0671,
+    "group_min": 0.0568,
+    "group_max": 0.0671,
+    "disagreement": 1.181,
+    "n_measurements": 2
+   },
+   "5389": {
+    "file": "5389_BasicModel_ConvNet.py",
+    "kept_min": 0.0623,
+    "group_min": 0.0537,
+    "group_max": 0.0623,
+    "disagreement": 1.16,
+    "n_measurements": 3
+   },
+   "5522": {
+    "file": "5522_ActorCritic.py",
+    "kept_min": 0.0343,
+    "group_min": 0.0341,
+    "group_max": 0.0613,
+    "disagreement": 1.798,
+    "n_measurements": 3
+   },
+   "5532": {
+    "file": "5532_AtteMatchLay.py",
+    "kept_min": 0.0372,
+    "group_min": 0.0367,
+    "group_max": 0.0656,
+    "disagreement": 1.787,
+    "n_measurements": 3
+   },
+   "5706": {
+    "file": "5706__Enc.py",
+    "kept_min": 0.0122,
+    "group_min": 0.0122,
+    "group_max": 0.0135,
+    "disagreement": 1.107,
+    "n_measurements": 2
+   },
+   "7103": {
+    "file": "7103_Project3D.py",
+    "kept_min": 0.0752,
+    "group_min": 0.0752,
+    "group_max": 0.128,
+    "disagreement": 1.702,
+    "n_measurements": 4
+   },
+   "8090": {
+    "file": "8090_CoAttention.py",
+    "kept_min": 272.0,
+    "group_min": 197.0,
+    "group_max": 294.0,
+    "disagreement": 1.492,
+    "n_measurements": 3
+   }
+  },
+  "no_op_reference": {
+   "288": {
+    "file": "288_Gate.py",
+    "verdict": "output == input"
+   },
+   "558": {
+    "file": "558_BiasLayer.py",
+    "verdict": "output == input"
+   },
+   "571": {
+    "file": "571_ScaleLayer.py",
+    "verdict": "output == input"
+   },
+   "735": {
+    "file": "735_Scale.py",
+    "verdict": "output == input"
+   },
+   "1602": {
+    "file": "1602_NoiseInjection.py",
+    "verdict": "output == input"
+   },
+   "2692": {
+    "file": "2692_Scale.py",
+    "verdict": "output == input"
+   },
+   "3317": {
+    "file": "3317_Bias.py",
+    "verdict": "output == input"
+   },
+   "3521": {
+    "file": "3521_LMA_Merge.py",
+    "verdict": "output == input"
+   },
+   "4112": {
+    "file": "4112_Affine.py",
+    "verdict": "output == input"
+   },
+   "4344": {
+    "file": "4344_scale_feature.py",
+    "verdict": "output == input"
+   },
+   "4649": {
+    "file": "4649_Model.py",
+    "verdict": "output == input"
+   },
+   "4651": {
+    "file": "4651_Scale.py",
+    "verdict": "output == input"
+   },
+   "5057": {
+    "file": "5057_Scale.py",
+    "verdict": "output == input"
+   },
+   "5559": {
+    "file": "5559_LR.py",
+    "verdict": "output == input"
+   },
+   "6102": {
+    "file": "6102_LearnedPositionalEmbedding1D.py",
+    "verdict": "output == input"
+   },
+   "6138": {
+    "file": "6138_Normalization.py",
+    "verdict": "output == input"
+   },
+   "6408": {
+    "file": "6408_NoNorm.py",
+    "verdict": "output == input"
+   },
+   "7794": {
+    "file": "7794_Scale.py",
+    "verdict": "output == input"
+   },
+   "8297": {
+    "file": "8297_NoiseInjection.py",
+    "verdict": "output == input"
+   },
+   "8517": {
+    "file": "8517_ConstMult.py",
+    "verdict": "output == input"
+   },
+   "9455": {
+    "file": "9455_Affine.py",
+    "verdict": "output == input"
+   },
+   "9508": {
+    "file": "9508_Affine2D.py",
+    "verdict": "output == input"
+   },
+   "10100": {
+    "file": "10100_Scale.py",
+    "verdict": "output == input"
+   },
+   "10429": {
+    "file": "10429_LayerShift.py",
+    "verdict": "output == input"
+   },
+   "11287": {
+    "file": "11287_NoNorm.py",
+    "verdict": "output == input"
+   },
+   "11846": {
+    "file": "11846_Scale.py",
+    "verdict": "output == input"
+   },
+   "12369": {
+    "file": "12369_AffineTransform.py",
+    "verdict": "output == input"
+   },
+   "12865": {
+    "file": "12865_Offset.py",
+    "verdict": "output == input"
+   },
+   "13018": {
+    "file": "13018_Scale.py",
+    "verdict": "output == input"
+   },
+   "13139": {
+    "file": "13139_Scale.py",
+    "verdict": "output == input"
+   },
+   "13797": {
+    "file": "13797_TensorConstantLinear.py",
+    "verdict": "output == input"
+   },
+   "14716": {
+    "file": "14716_FactorScalar.py",
+    "verdict": "output == input"
+   },
+   "14719": {
+    "file": "14719_LinearModel.py",
+    "verdict": "output == input"
+   },
+   "15023": {
+    "file": "15023_AddPositionEmb.py",
+    "verdict": "output == input"
+   },
+   "16236": {
+    "file": "16236_LearnedPositionalEmbedding1D.py",
+    "verdict": "output == input"
+   },
+   "17442": {
+    "file": "17442_ScaleUp.py",
+    "verdict": "output == input"
+   }
+  },
+  "syntactically_proposed_but_rejected": [
+   118,
+   271,
+   291,
+   384,
+   801,
+   870,
+   928,
+   1024,
+   1032,
+   1343,
+   1355,
+   1504,
+   1508,
+   1513,
+   1542,
+   1543,
+   1544,
+   1545,
+   1550,
+   1551,
+   1554,
+   1560,
+   1563,
+   1640,
+   1855,
+   1878,
+   2236,
+   2343,
+   2446,
+   2450,
+   2464,
+   2491,
+   2493,
+   2502,
+   2737,
+   3283,
+   3429,
+   3513,
+   3517,
+   3656,
+   3769,
+   3866,
+   4079,
+   4178,
+   4181,
+   4406,
+   4533,
+   4650,
+   4964,
+   5349,
+   5712,
+   5751,
+   6125,
+   6928,
+   7153,
+   7819,
+   7839,
+   8057,
+   8148,
+   8245,
+   8402,
+   8443,
+   8467,
+   8698,
+   9864,
+   10209,
+   10345,
+   10397,
+   10400,
+   10793,
+   10890,
+   10942,
+   10988,
+   11087,
+   11133,
+   11351,
+   11358,
+   11376,
+   12495,
+   13003,
+   13147,
+   13159,
+   13574,
+   13671,
+   13685,
+   13851,
+   13929,
+   14126,
+   14375,
+   14709,
+   14717,
+   15901,
+   15957,
+   16038,
+   16128,
+   16133,
+   16454,
+   16682,
+   16694,
+   16703,
+   16995,
+   17327,
+   17852,
+   18023,
+   18045,
+   18147
+  ],
+  "unrunnable_kept": [
+   4666,
+   16286
+  ]
+ }
+}

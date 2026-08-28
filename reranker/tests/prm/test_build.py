@@ -18,6 +18,7 @@ from reranker.tests.prm.runfixture import (
     STOP,
     attempt,
     baseline_json,
+    exclude_json,
     prm_config,
     verdict,
     write_round,
@@ -236,6 +237,7 @@ def test_more_than_one_unit_at_more_than_one_worker_goes_through_the_pool(tmp_pa
 
 def test_every_drop_reason_fires_and_names_the_stem_it_dropped(tmp_path, chars):
     attempts = [
+        attempt(problem_id=9, raw=PROSE),  # excluded below, and otherwise a perfect row
         attempt(problem_id=1, raw=PROSE, trace=LENGTH),
         attempt(problem_id=2, raw=PROSE, trace=None),
         attempt(problem_id=3, raw=PROSE),  # no verdict below -> no_eval_entry
@@ -246,6 +248,7 @@ def test_every_drop_reason_fires_and_names_the_stem_it_dropped(tmp_path, chars):
         attempt(problem_id=8, raw="no newline, so no cut"),
     ]
     verdicts = {
+        "9": [verdict()],
         "1": [verdict()],
         "2": [verdict()],
         "4": [verdict()],
@@ -254,17 +257,140 @@ def test_every_drop_reason_fires_and_names_the_stem_it_dropped(tmp_path, chars):
         "7": [verdict(correctness=False)],
         "8": [verdict(correctness=False)],
     }
-    manifest, parts = built(tmp_path, attempts, verdicts, max_length=100)
+    manifest, parts = built(
+        tmp_path, attempts, verdicts, max_length=100,
+        exclude_problems_json=exclude_json(tmp_path, [9]),
+    )
 
     assert rows_of(parts, "runA__shard_00__round0.jsonl") == []
     assert manifest["counts"] == {r: 1 for r in build.REASONS} | {"rows": 0}
     assert manifest["attempts"] == len(attempts)
     dropped = manifest["dropped_stems"]
+    assert dropped[build.EXCLUDED] == ["level_6_problem_9_sample_0_kernel"]
     assert dropped[build.TRUNCATED] == ["level_6_problem_1_sample_0_kernel"]
     assert dropped[build.NO_BASELINE] == ["level_6_problem_4_sample_0_kernel"]
     assert dropped[build.NO_RUNTIME] == ["level_6_problem_0_sample_0_kernel"]
     # no_eval_entry is counted inside corpus.iter_labeled, which never builds a stem.
     assert corpus.NO_EVAL_ENTRY not in dropped
+
+
+# --- the exclusion list --------------------------------------------------------------
+
+
+def test_an_excluded_problem_contributes_no_row_while_its_neighbours_do(tmp_path, chars):
+    # The point of the knob: a problem whose label is untrustworthy (an ambiguous baseline,
+    # a reference that does nothing) leaves the corpus entirely rather than leaving a row
+    # nothing downstream can tell apart from a good one.
+    attempts = [attempt(problem_id=p, sample_id=0, raw=PROSE) for p in (0, 5)]
+    manifest, parts = built(
+        tmp_path, attempts, {"0": [verdict()], "5": [verdict()]},
+        baseline=baseline_json(tmp_path, problems=((0, 2.0, 2.0), (5, 2.0, 2.0))),
+        exclude_problems_json=exclude_json(tmp_path, [5]),
+    )
+    rows = rows_of(parts, "runA__shard_00__round0.jsonl")
+    assert [r["problem_id"] for r in rows] == [0]
+    assert manifest["counts"][build.EXCLUDED] == 1
+    assert manifest["dropped_stems"][build.EXCLUDED] == ["level_6_problem_5_sample_0_kernel"]
+
+
+def test_every_attempt_on_an_excluded_problem_goes_under_the_one_reason(tmp_path, chars):
+    # Ordered before `truncated` on purpose. A problem is excluded as a problem, so its
+    # attempts must not be split across reasons by how each one happened to turn out --
+    # otherwise the ledger reads as three separate defects instead of one decision.
+    attempts = [
+        attempt(problem_id=5, sample_id=0, raw=PROSE),
+        attempt(problem_id=5, sample_id=1, raw=PROSE, trace=LENGTH),
+        attempt(problem_id=5, sample_id=2, raw=UNTOKENIZABLE),
+    ]
+    manifest, _ = built(
+        tmp_path, attempts, {"5": [verdict(sample_id=i) for i in range(3)]},
+        exclude_problems_json=exclude_json(tmp_path, [5]),
+    )
+    assert manifest["counts"][build.EXCLUDED] == 3
+    assert build.TRUNCATED not in manifest["counts"]
+    assert build.TOKENIZE_FAILED not in manifest["counts"]
+
+
+def test_the_list_is_read_per_level_so_the_same_id_elsewhere_survives(tmp_path, chars):
+    # Problem ids are only unique within a level -- level1's 4 and level7's 4 are different
+    # files. A flat list of ids would silently drop the wrong problem in every other level.
+    attempts = [attempt(problem_id=4, level=6, raw=PROSE), attempt(problem_id=4, level=7, raw=PROSE)]
+    # Two levels in one round is not a real corpus shape, but it is what isolates the key.
+    manifest, parts = built(
+        tmp_path, attempts, {"4": [verdict()]},
+        baseline=baseline_json(tmp_path, problems=((4, 2.0, 2.0),)),
+        exclude_problems_json=exclude_json(tmp_path, [4], level=7),
+    )
+    rows = rows_of(parts, "runA__shard_00__round0.jsonl")
+    assert [(r["level"], r["problem_id"]) for r in rows] == [(6, 4)]
+    assert manifest["dropped_stems"][build.EXCLUDED] == ["level_7_problem_4_sample_0_kernel"]
+
+
+def test_no_list_excludes_nothing_and_records_no_list(tmp_path, chars):
+    # The default has to be inert, or adding the knob would move every existing dataset.
+    manifest, parts = built(tmp_path, [attempt(raw=PROSE)], {"0": [verdict()]})
+    assert len(rows_of(parts, "runA__shard_00__round0.jsonl")) == 1
+    assert build.EXCLUDED not in manifest["counts"]
+    assert manifest["exclude_problems_json"] is None and manifest["exclude_sha1"] is None
+
+
+def test_the_manifest_names_the_list_and_hashes_it(tmp_path, chars):
+    path = exclude_json(tmp_path, [5])
+    manifest, _ = built(
+        tmp_path, [attempt(raw=PROSE)], {"0": [verdict()]}, exclude_problems_json=path
+    )
+    assert manifest["exclude_problems_json"] == path
+    assert manifest["exclude_sha1"] == hashlib.sha1(open(path, "rb").read()).hexdigest()
+
+
+def test_a_list_that_names_no_level_is_refused_rather_than_excluding_nothing(tmp_path, chars):
+    # The one outcome this knob must not have: a typo'd key parses, excludes nothing, and
+    # the manifest still records that the build had a list.
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"level_7": [5], "7": [5]}))
+    with pytest.raises(ValueError, match="names no level"):
+        built(tmp_path, [attempt(raw=PROSE)], {"0": [verdict()]},
+              exclude_problems_json=str(bad))
+
+
+def test_a_key_that_is_not_a_level_is_ignored_so_the_file_can_carry_its_provenance(tmp_path, chars):
+    # The shipped list keeps `_meta` -- why each id is on it -- beside the ids themselves.
+    manifest, _ = built(
+        tmp_path, [attempt(problem_id=5, raw=PROSE)], {"5": [verdict()]},
+        exclude_problems_json=exclude_json(tmp_path, [5], extra={"_meta": {"why": "no-op"}}),
+    )
+    assert manifest["counts"][build.EXCLUDED] == 1
+
+
+def test_resuming_after_the_list_was_edited_in_place_refuses(tmp_path, chars):
+    # Same trap the baseline sha1 closes: every knob compares equal while half the parts
+    # hold problems the other half excludes, and nothing on disk says which is which.
+    run = a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})
+    path = exclude_json(tmp_path, [5])
+    build.run_build(prm_config(tmp_path, [run], exclude_problems_json=path))
+    exclude_json(tmp_path, [5, 6])  # same path, one more problem out of scope
+    with pytest.raises(ValueError, match="exclude_sha1"):
+        build.run_build(prm_config(tmp_path, [run], exclude_problems_json=path))
+
+
+def test_resuming_a_dataset_built_without_a_list_against_one_refuses(tmp_path, chars):
+    run = a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})
+    build.run_build(prm_config(tmp_path, [run]))
+    with pytest.raises(ValueError, match="exclude"):
+        build.run_build(
+            prm_config(tmp_path, [run], exclude_problems_json=exclude_json(tmp_path, [5]))
+        )
+
+
+def test_a_list_that_is_not_on_disk_aborts_before_out_dir_exists(tmp_path, chars):
+    # Absent, the build would label exactly the problems it was pointed away from.
+    cfg = prm_config(
+        tmp_path, [a_run(tmp_path, "runA", [attempt(raw=PROSE)], {"0": [verdict()]})],
+        exclude_problems_json=str(tmp_path / "gone.json"),
+    )
+    with pytest.raises(ValueError, match="exclude_problems_json"):
+        build.run_build(cfg)
+    assert not os.path.exists(cfg.prm.out_dir)
 
 
 def test_a_truncated_sample_is_dropped_as_truncated_even_when_it_is_unusable_too(tmp_path, chars):
@@ -352,6 +478,7 @@ def test_the_resume_guard_classifies_every_config_knob():
     # Until it is, build.py counts it as row-affecting, which refuses rather than mixes.
     assert set(build.ROW_KNOBS) == {
         "baseline_timing_json",
+        "exclude_problems_json",
         "label_mode",
         "speedup_stat",
         "speedup_lo",
@@ -472,8 +599,8 @@ def test_a_build_killed_before_it_finished_still_leaves_a_manifest(tmp_path, cha
         a_run(tmp_path, "runB", [attempt(raw=PROSE)], {"0": [verdict()]}),
     ]
 
-    def killed(todo, prm, parts_dir, baselines):
-        build._init_worker(prm, parts_dir, baselines)
+    def killed(todo, prm, parts_dir, baselines, excluded):
+        build._init_worker(prm, parts_dir, baselines, excluded)
         build._build_one(todo[0])  # one part lands, then the job is gone
         raise KeyboardInterrupt("walltime")
 

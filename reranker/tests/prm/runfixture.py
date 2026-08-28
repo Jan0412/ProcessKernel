@@ -77,6 +77,15 @@ def baseline_json(tmp_path: Path, problems=((0, 2.0, 2.0),), *, level=6) -> str:
     return str(path)
 
 
+def exclude_json(tmp_path: Path, ids, *, level=6, name="exclude.json", extra=None) -> str:
+    """An exclusion list keyed the way ``build.load_exclusions`` parses it."""
+    body = {f"level{level}": list(ids)}
+    body.update(extra or {})
+    path = tmp_path / name
+    path.write_text(json.dumps(body))
+    return str(path)
+
+
 def prm_config(tmp_path: Path, run_dirs, *, baseline=None, **over) -> RerankerConfig:
     """A config whose ``prm`` section validates and builds into ``tmp_path/out``."""
     cfg = RerankerConfig()
