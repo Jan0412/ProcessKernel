@@ -91,6 +91,14 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
              "sampler warmup cost, not throughput of the queue (default: 32).",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Let the model reason in its own <think> block. Default off, which is "
+             "how the gpt-oss and DeepSeek corpora were generated: native reasoning "
+             "suppressed, the two-pass '## Plan' prefill replacing it. Requires "
+             "--think-temperature 0; the two together are rejected at startup.",
+    )
 
 
 def add_sampling_args(parser: argparse.ArgumentParser) -> None:
@@ -103,6 +111,11 @@ def add_sampling_args(parser: argparse.ArgumentParser) -> None:
         help="If set, two-pass generation split at the ```python fence: prose at this "
              "temperature, code at --temperature. Pass 0 to disable.",
     )
+    # Every card pairs its temperature with a tail cut -- Nemotron and Qwen want top_p
+    # 0.95, MiniMax 0.95 with top_k 40, DeepSeek plain 1.0. vLLM's defaults below sample
+    # the full tail, which is not the setting any of them were tuned at.
+    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus cutoff")
+    parser.add_argument("--top-k", type=int, default=0, help="Top-k cutoff; 0 is off")
     parser.add_argument("--max-new-tokens", type=int, default=16384)
 
 
@@ -117,6 +130,13 @@ def add_prompt_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--gpu-name", default="H100")
     parser.add_argument("--include-hardware", action="store_true")
+    parser.add_argument(
+        "--prompt-deltas",
+        default="",
+        help="Comma-separated additive prompt deltas: contract, precision, pitfalls, "
+             "hardware. Empty (default) reproduces the stock KernelBench prompt "
+             "byte-for-byte, which is what makes an existing run a valid control arm.",
+    )
 
 
 def resolve_dataset_name(args: argparse.Namespace) -> str:

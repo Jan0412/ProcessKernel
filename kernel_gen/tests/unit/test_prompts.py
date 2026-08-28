@@ -66,3 +66,30 @@ def test_repair_prompt_tolerates_a_missing_review():
     out = build_repair_prompt("base", attempt)
     assert "code" in out
     assert out.endswith("\n\n")  # feedback slot is empty, nothing after it
+
+
+def test_empty_deltas_reproduce_the_stock_prompt_byte_for_byte():
+    # The A/B reuses an existing run as its control arm; that is only legitimate while
+    # this holds.
+    from kernelbench.prompt_constructor_toml import get_prompt_for_backend
+
+    ref = "import torch\n\n\nclass Model(torch.nn.Module):\n    def forward(self, x):\n        return x\n"
+    problem = Problem(level=1, problem_id=1, name="1_X.py", ref_arch_src=ref)
+    stock = get_prompt_for_backend(ref_arch_src=ref, backend="triton", option="one_shot")
+    assert build_base_prompt(problem, deltas=frozenset()) == stock
+
+
+def test_a_text_delta_appends_to_the_stock_prompt_without_altering_it():
+    ref = "import torch\n\n\nclass Model(torch.nn.Module):\n    def forward(self, x):\n        return x\n"
+    problem = Problem(level=1, problem_id=1, name="1_X.py", ref_arch_src=ref)
+    stock = build_base_prompt(problem, deltas=frozenset())
+    withd = build_base_prompt(problem, deltas=frozenset({"precision"}))
+    assert withd.startswith(stock.rstrip("\n"))
+    assert "## Numerical precision" in withd
+
+
+def test_hardware_delta_turns_on_the_hardware_section():
+    ref = "import torch\n\n\nclass Model(torch.nn.Module):\n    def forward(self, x):\n        return x\n"
+    problem = Problem(level=1, problem_id=1, name="1_X.py", ref_arch_src=ref)
+    out = build_base_prompt(problem, deltas=frozenset({"hardware"}), gpu_name="H100")
+    assert "H100" in out

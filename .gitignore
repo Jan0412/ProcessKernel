@@ -38,3 +38,8 @@ linter_findings.jsonl
 # --- SLURM logs ---
 *.err
 *.out
+.venv-cu129/
+.probe/
+
+# --- Design docs, deliberately untracked ---
+prm_plan/

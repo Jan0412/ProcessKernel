@@ -122,3 +122,28 @@ def test_ref_dir_does_not_become_a_third_dataset_choice():
                    "--ref-dir", "KernelBench/level6"])
     assert args.dataset == "kernelbook"  # still drives the pseudo_level rename
     assert args.ref_dir == "KernelBench/level6"
+
+
+def test_prompt_deltas_defaults_to_empty_string():
+    import argparse
+
+    from kernel_gen.core import cli
+
+    parser = argparse.ArgumentParser()
+    cli.add_prompt_args(parser)
+    args = parser.parse_args([])
+    assert args.prompt_deltas == ""
+
+
+def test_prompt_deltas_is_a_single_comma_string_not_a_list():
+    # An argparse dest is a public YAML key; nargs would serialise as a block list
+    # whose lines the flat config scanner drops.
+    import argparse
+
+    from kernel_gen.core import cli
+
+    parser = argparse.ArgumentParser()
+    cli.add_prompt_args(parser)
+    args = parser.parse_args(["--prompt-deltas", "contract,precision"])
+    assert args.prompt_deltas == "contract,precision"
+    assert isinstance(args.prompt_deltas, str)

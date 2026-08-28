@@ -39,17 +39,22 @@ def build_base_prompt(
     option: str = "one_shot",
     include_hardware: bool = False,
     gpu_name: str | None = None,
+    deltas: frozenset[str] = frozenset(),
 ) -> str:
-    """KernelBench's own prompt constructor, over either dataset's reference."""
+    """KernelBench's own prompt constructor, plus any enabled additive deltas."""
     from kernelbench.prompt_constructor_toml import get_prompt_for_backend
 
-    return get_prompt_for_backend(
+    from .prompt_deltas import apply_deltas
+
+    hardware = include_hardware or "hardware" in deltas
+    prompt = get_prompt_for_backend(
         ref_arch_src=problem.ref_arch_src,
         backend=backend,
         option=option,
-        include_hardware=include_hardware,
-        gpu_name=gpu_name if include_hardware else None,
+        include_hardware=hardware,
+        gpu_name=gpu_name if hardware else None,
     )
+    return apply_deltas(prompt, problem, deltas)
 
 
 def build_repair_prompt(base_prompt: str, attempt: Attempt) -> str:
