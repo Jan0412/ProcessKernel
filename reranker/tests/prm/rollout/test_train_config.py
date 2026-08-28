@@ -5,20 +5,60 @@ from __future__ import annotations
 import os
 
 import pytest
+import yaml
 
 from reranker.src.config import PROJECT_ROOT, RerankerConfig, check_prm_budgets, load_config
 
 CONFIGS = os.path.join(PROJECT_ROOT, "configs")
 
 # The campaign knobs the trainer reads out of `prm_rollout`. The arms inherit them through
-# `_base: prm_rollout.yaml` rather than copying them, so this is checked as inheritance
-# instead of as a parity test over a duplicate.
+# `_base` rather than copying them, so this is checked as inheritance instead of as a parity
+# test over a duplicate.
 CAMPAIGN_KNOBS = (
     "out_dir", "parts_glob", "max_length", "depth_buckets", "min_rel_depth", "max_rel_depth",
 )
 
 # The backbone arms. Adding one here is what puts it under every test below.
 ARMS = ("prm_train_qwen3base06b.yaml", "prm_train_qwen25coder05b.yaml")
+
+#: The effective batch the lr was tuned at. THIS is the invariant, not any one factor of it:
+#: `cafd2f2` moved 4 GPUs x 32 accum to 2 x 64 and left the product alone, which a test
+#: pinning the accumulation called a regression and a test pinning the product would not.
+EFFECTIVE_BATCH = 128
+
+
+def base_chain(name: str) -> list[str]:
+    """``name`` and every config it inherits, nearest first.
+
+    Resolved from the file rather than hardcoded. The arms were repointed from
+    `prm_rollout.yaml` to `prm_rollout_l6_r0.yaml` by `2a06ee6`, and a test naming the
+    campaign itself compares each arm against a file no arm inherits -- which fails on a
+    move that is exactly what `_base` exists to make cheap.
+    """
+    seen: list[str] = []
+    while name and name not in seen:
+        seen.append(name)
+        with open(os.path.join(CONFIGS, name)) as f:
+            name = (yaml.safe_load(f) or {}).get("_base")
+    return seen
+
+
+def campaign_of(arm: str) -> str:
+    """The campaign config an arm ultimately trains on -- the last link of its `_base` chain."""
+    return base_chain(arm)[-1]
+
+
+def train_gpus() -> int:
+    """How many ranks `prm_train.sh` launches, read off its own `--gres` line.
+
+    The third factor of the effective batch lives in the sbatch header, not in any config, so
+    a test that asserts the product has to read it there or it is asserting two thirds of one.
+    """
+    with open(os.path.join(PROJECT_ROOT, "..", "scripts", "prm_train.sh")) as f:
+        for line in f:
+            if line.startswith("#SBATCH --gres=gpu:"):
+                return int(line.rsplit(":", 1)[1])
+    raise AssertionError("prm_train.sh has no '#SBATCH --gres=gpu:<type>:<n>' line to read")
 
 
 def paired(prm_model="Qwen/Qwen3-Reranker-4B", orm_model="Qwen/Qwen3-Reranker-4B"):
@@ -157,10 +197,26 @@ def test_each_arm_selects_on_the_prm_metric(arm):
 @pytest.mark.parametrize("arm", ARMS)
 @pytest.mark.parametrize("knob", CAMPAIGN_KNOBS)
 def test_each_arm_inherits_the_campaign_it_trains_on(arm, knob):
-    # `_base: prm_rollout.yaml` makes this structural: move the campaign's out_dir and every
-    # arm follows, where a copied block would have to be found and edited in each file.
-    campaign = shipped("prm_rollout.yaml").prm_rollout
+    # `_base` makes this structural: move the campaign's out_dir and every arm follows, where
+    # a copied block would have to be found and edited in each file.
+    #
+    # The campaign is read off the arm's own chain, never named here. Which campaign the arms
+    # train on is a decision that moves -- `2a06ee6` repointed them from prm_rollout.yaml to
+    # the imputed prm_rollout_l6_r0.yaml -- and a hardcoded name turns that move into a
+    # failure while the property being tested, that the arm inherits rather than copies, is
+    # untouched.
+    campaign = shipped(campaign_of(arm)).prm_rollout
     assert getattr(shipped(arm).prm_rollout, knob) == getattr(campaign, knob)
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_an_arm_reaches_a_campaign_through_base_rather_than_copying_one(arm):
+    # The premise the test above rests on, checked separately so a broken chain fails as a
+    # broken chain: an arm that inherited nothing would compare a config against itself and
+    # pass every knob trivially.
+    chain = base_chain(arm)
+    assert len(chain) > 1, f"{arm} inherits nothing, so it copies the campaign instead"
+    assert chain[-1].startswith("prm_rollout"), f"{arm} bottoms out at {chain[-1]}, not a campaign"
 
 
 @pytest.mark.parametrize("arm", ARMS)
@@ -191,8 +247,18 @@ def test_every_arm_caps_the_eval_on_the_identical_seeded_subset():
 @pytest.mark.parametrize("arm", ARMS)
 def test_the_micro_batch_stays_at_one_so_the_effective_batch_is_the_accumulation(arm):
     # Measured on the ORM: throughput FALLS as per_device grows (1.10 -> 0.79 -> 0.53 lists/s
-    # at 1/2/4) because the collator pads to the longest candidate in the batch. The effective
-    # batch is 1 x 32 x 4 GPUs = 128; prm_train.sh is what supplies the 4.
+    # at 1/2/4) because the collator pads to the longest candidate in the batch. So the micro
+    # batch is pinned at 1 -- that one IS a value, and moving it is the regression.
+    #
+    # The accumulation is NOT pinned. It is one factor of a product the lr was tuned against,
+    # and the GPU count is the other: `cafd2f2` halved the ranks and doubled the steps, which
+    # left the effective batch exactly where it was. Asserting the product lets that trade
+    # through and still catches the case that matters -- a rank count and an accumulation
+    # that no longer multiply to what the lr expects.
     t = shipped(arm).train
     assert t.per_device_train_batch_size == 1
-    assert t.gradient_accumulation_steps == 32
+    effective = t.per_device_train_batch_size * t.gradient_accumulation_steps * train_gpus()
+    assert effective == EFFECTIVE_BATCH, (
+        f"{arm}: {t.per_device_train_batch_size} x {t.gradient_accumulation_steps} x "
+        f"{train_gpus()} GPUs = {effective}, not the {EFFECTIVE_BATCH} the lr was tuned at"
+    )
