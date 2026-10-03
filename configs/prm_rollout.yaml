@@ -1,0 +1,134 @@
+# One PRM rollout campaign: the DeepSeek-V4-Flash level-7 run. The Qwen3.5-122B and
+# MiniMax-M2.7 campaigns of the training corpus differ only in run_tags, the sampler block,
+# gen_model and out_dir -- pass those as overrides.
+#   CFG=configs/prm_rollout.yaml
+#   python -m processkernel.prm.rollout.prefixes --config $CFG                        # A
+#   python -m processkernel.prm.rollout.rollout --config $CFG                         # B
+#   python -m processkernel.prm.rollout.orm_score --anchors --config $CFG             # B2
+#   python -m processkernel.prm.rollout.orm_score --config $CFG                       # B2
+#   python -m processkernel.prm.rollout.calibrate --config $CFG                       # D
+#   python -m processkernel.prm.rollout.values --config $CFG
+#   python -m processkernel.prm.rollout.lists --config $CFG
+#
+# B and B2 work unit by unit; with SLURM_ARRAY_TASK_ID set they run only that unit
+# (`rollout --units` prints the count), otherwise every unit in turn.
+#
+# Reads the level-7 build (configs/prm_build.yaml): a campaign has to be cut under
+# the splits its own corpus was split with.
+#
+# NO job C. `label_source: imputed` labels every rollout from the ORM + calibration curve, so
+# nothing is staged and nothing is evaluated — the v3 chain here is A -> B -> B2 -> D. The
+# eval_* keys below are inherited defaults and are NOT sized for this campaign.
+
+# The KernelBench checkout; orm_score reads the level-7 references from its KernelBench/level7/.
+data:
+  kernelbench_dir: KernelBench
+
+prm_rollout:
+  parts_glob: data/prm_l7/parts/*.jsonl
+  splits_json: data/prm_l7/splits.json
+  baseline_timing_json: KernelBench/results/timing/H100/baseline_time_torch_l7.json
+
+  # The run filter as well as the tag: prm_l7 holds both models' parts, and naming only this
+  # one drops the DeepSeek rows. Each campaign names its own run.
+  run_tags:
+    DeepSeek-V4-Flash_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced: ds-l7
+
+  source: cut
+  # THE budget lever, and it is linear: 13,371 groups x ~10.2 prefixes/group (the level-6
+  # measured rate, same 4-sample shape) is ~136k prefixes, x K 5 = ~680k rollouts. Halve this
+  # to halve job B. Re-read the real number off job A's manifest before submitting B.
+  depths_per_group: 4
+  min_rel_depth: 0.1
+  max_rel_depth: 0.9
+  min_list_size: 2
+  # Inert on a 4-sample corpus: lists_at_cap was 0 on the level-6 build of the same shape.
+  max_list_size: 8
+  train_selection: random
+  prm_v1_checkpoint: null
+  select_seed: 42
+
+  K: 5
+  min_rollouts: 3
+
+  # --- the source run's sampler regime; check_gen_model refuses any mismatch -------------
+  # Read off shard_00/generation_config.yaml of the run above. think_temperature 0.0 takes
+  # the single-pass path, which is what the traces show (passes: 1, n_plan_tokens: 0).
+  temperature: 1.0
+  think_temperature: 0.0
+  max_new_tokens: 16384
+  enable_thinking: true
+  top_p: 1.0
+  top_k: 0
+  gen_model: deepseek-ai/DeepSeek-V4-Flash
+  # backend.py applies this model's own engine args off the id (kv_cache_dtype fp8_ds_mla,
+  # moe_backend humming) and sets tensor_parallel_size from the visible GPU count. The
+  # checkpoint is 149 GB: run job B for this campaign on 4 H100s.
+  max_num_seqs: 64
+  # 30720, not vLLM's 40960 default. Measured over 2,500 distinct level-7 problems: the
+  # prompt maxes at 8,662 tokens (median 1,564, p99 3,594), and a request is bounded by
+  # head + max_new_tokens = 8,662 + 16,384 = 25,046. 40960 therefore divided the KV cache by
+  # ~1.6x more than any request needs -- and on DeepSeek that cache is only 194,190 tokens,
+  # so vLLM reported a max concurrency of 4.74x. Not a sampler knob: it bounds memory, never
+  # the distribution, so check_gen_model does not read it and lowering it changes no output.
+  max_model_len: 30720
+  # 0.94, not the 0.92 default: the KV cache is the thin remainder after the weights, so the
+  # extra 2% of VRAM is a large relative cache (MiniMax 16.0 -> ~22.4 GiB, 8.83x -> ~12x
+  # concurrency). Bounds memory only; not a SAMPLE_KNOB, so finished units stay reusable.
+  gpu_memory_utilization: 0.94
+  prefixes_per_batch: 256
+
+  # Inherited defaults. Unused: `label_source: imputed` stages and evaluates nothing.
+  eval_runs_dir: KernelBench/runs
+  eval_run_name: prm_rollout_l7_deepseek
+  eval_shards: 4
+  num_correct_trials: 5
+  num_perf_trials: 100
+  eval_timeout: 300
+  dedup_by_code_sha1: true
+
+  label_mode: graded
+  speedup_stat: min
+  speedup_lo: 0.2
+  speedup_hi: 4.0
+  # Matches prm_build.yaml: v1's labels and v3's imputed V-hat sit on one relevance scale.
+  speed_quant: 0.1
+
+  base_model: Qwen/Qwen3-Reranker-4B
+  max_length: 16384
+  depth_buckets: 4
+
+  out_dir: data/prm_rollout_l7_deepseek
+  num_workers: 8
+
+  # --- v3: ORM-imputed labels ------------------------------------------------------------
+  label_source: imputed
+  # 4B, not the 0.6B: measured on the level-6 shard_00 bench, where it led every arm on
+  # both views -- pair_agr .901 vs .808, MAE .139 vs .202 filtered.
+  # The ORM of configs/orm.yaml. orm_checkpoint is read relative to the working directory,
+  # so run from the repository root.
+  orm_checkpoint: data/checkpoints_listwise_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b/final
+  # That ORM's own train and val lists (exactly two files): the kernels it has seen.
+  orm_lists_glob: data/lists_{train,val}_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b.jsonl
+  orm_max_length: 6144
+  orm_reserve_ref_tokens: 1024
+  orm_batch_size: 16
+
+  # true, as on level 6 and unlike level 1: this ORM trained on kb6, and level 7 IS kb6
+  # deduplicated, so ~every level-7 problem is a seen anchor. Excluding them would leave
+  # nothing to fit the curve on.
+  curve_fit_orm_seen: true
+  curve_bins: 40
+  curve_iters: 16
+  offset_kappa: auto
+  offset_clamp: 4.0
+  use_anchors: true
+  calib_speed_quant: 0.0
+  # A problem no anchor of which ever passed hands its lists an order nothing measured.
+  # DeepSeek solves 19.1% at level 7 over 4 samples, so dead problems are common.
+  drop_dead_problems: true
+  # The same predicate, moved into job A so a dead problem's rollouts are never generated
+  # rather than generated and then discarded here. Verified identical to job D's dead set
+  # (calibrate.dead_problems over re-graded anchors): 7,777 problems, 0 differences.
+  # Units 0-2 were cancelled and resubmitted so no part predates this flag.
+  prefilter_dead_problems: true

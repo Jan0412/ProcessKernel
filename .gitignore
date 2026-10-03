@@ -9,8 +9,6 @@ __pycache__/
 .coveragerc.gremlins
 htmlcov/
 
-# --- Dependency / build ---
-uv.lock
 
 # --- Editor / tooling ---
 .vscode/
@@ -25,17 +23,16 @@ mlflow.db
 # --- Caches / links ---
 .hf_cache/
 .cuda_link/
-reranker/data/
+/data/
 
-# --- Vendored benchmark (installed via pyproject git source) ---
-KernelBench/
+# --- KernelBench checkout: the grader and the problem levels (README, Set up) ---
+/KernelBench/
 
 # --- Generated artifacts ---
-runs/
-level5/
+/runs/
 linter_findings.jsonl
 
-# --- SLURM logs ---
+# --- Job logs ---
 *.err
 *.out
 .venv-cu129/
@@ -43,3 +40,8 @@ linter_findings.jsonl
 
 # --- Design docs, deliberately untracked ---
 prm_plan/
+
+# Judge credentials passed via --env-file; the .example template is the only one tracked.
+*.env
+!*.env.example
+

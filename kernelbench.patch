@@ -1,0 +1,790 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index f3f98ae..82e5086 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -50,6 +50,17 @@ dev = [
+ ]
+ 
+ 
++# cu128 binaries run on both CUDA 12.8 and CUDA 13 drivers; cu130 requires a
++# 580+ driver, which excludes the 570-series nodes.
++[[tool.uv.index]]
++name = "pytorch-cu128"
++url = "https://download.pytorch.org/whl/cu128"
++explicit = true
++
++[tool.uv.sources]
++torch = { index = "pytorch-cu128" }
++triton = { index = "pytorch-cu128" }
++
+ [tool.setuptools.packages.find]
+ where = ["src"]
+ include = ["kernelbench*"]
+diff --git a/scripts/eval_from_generations.py b/scripts/eval_from_generations.py
+index 6fac151..26da56f 100644
+--- a/scripts/eval_from_generations.py
++++ b/scripts/eval_from_generations.py
+@@ -32,6 +32,10 @@ from tqdm import tqdm
+ # Modal support
+ import modal
+ 
++from kb_normalize import normalize_pair
++
++NORMALIZE_MULTI_OUTPUT_DEFAULT = True
++
+ """
+ Batch Evaluation from Existing Generations
+ 
+@@ -122,6 +126,7 @@ class EvalConfig(Config):
+         self.timeout = 180  # in seconds
+         self.measure_performance = True
+         self.timing_method = "cuda_event"
++        self.normalize_multi_output = True
+ 
+         # Eval Flow setting
+         # To speedup evaluation, you can start building the kernel on CPU on disk as cache
+@@ -186,6 +191,7 @@ class ModalEvaluator:
+         verbose: bool = False,
+         backend: str = "cuda",
+         precision: str = "fp32",
++        normalize_multi_output: bool = NORMALIZE_MULTI_OUTPUT_DEFAULT,
+     ):
+         """
+         Evaluate a single sample on Modal GPU with automatic retries for GPU attachment failures
+@@ -216,6 +222,10 @@ class ModalEvaluator:
+         
+         set_gpu_arch(gpu_arch)
+ 
++        ref_arch_src, kernel_src = normalize_pair(
++            ref_arch_src, kernel_src, normalize_multi_output
++        )
++
+         gpu_corrupted = False
+         try:
+             result = eval_kernel_against_ref(
+@@ -267,15 +277,17 @@ def fetch_ref_arch_from_problem_id(
+     return problem.code
+ 
+ 
++def kernel_filename(level: int, problem_id: int, sample_id: int) -> str:
++    return f"level_{level}_problem_{problem_id}_sample_{sample_id}_kernel.py"
++
++
+ def fetch_kernel_from_disk(
+     run_dir: str, level: int, problem_id: int, sample_id: int
+ ) -> str | None:
+     """
+     Fetch kernel file from disk (stored in runs/{run_name})
+     """
+-    kernel_path = os.path.join(
+-        run_dir, f"level_{level}_problem_{problem_id}_sample_{sample_id}_kernel.py"
+-    )
++    kernel_path = os.path.join(run_dir, kernel_filename(level, problem_id, sample_id))
+ 
+     if os.path.exists(kernel_path):
+         return read_file(kernel_path)
+@@ -311,6 +323,12 @@ def evaluate_single_sample(
+         configs.kernel_eval_build_dir, configs.run_name, f"{problem_id}", f"{sample_id}"
+     )
+ 
++    ref_arch_src, kernel_src = normalize_pair(
++        ref_arch_src,
++        kernel_src,
++        getattr(configs, "normalize_multi_output", NORMALIZE_MULTI_OUTPUT_DEFAULT),
++    )
++
+     try:
+         eval_result = eval_kernel_against_ref(
+             original_model_src=ref_arch_src,
+@@ -383,6 +401,9 @@ def evaluate_single_sample_modal_direct(
+             measure_performance=configs.measure_performance,
+             timing_method=configs.timing_method,
+             verbose=configs.verbose,
++            normalize_multi_output=getattr(
++                configs, "normalize_multi_output", NORMALIZE_MULTI_OUTPUT_DEFAULT
++            ),
+         )
+         return eval_result
+     except Exception as e:
+@@ -504,6 +525,9 @@ def batch_eval_modal(
+                             verbose=config.verbose,
+                             backend=config.backend,
+                             precision=config.precision,
++                            normalize_multi_output=getattr(
++                                config, "normalize_multi_output", NORMALIZE_MULTI_OUTPUT_DEFAULT
++                            ),
+                         )
+                         futures.append(future)
+                 
+@@ -634,6 +658,31 @@ def batch_eval(
+                         elapsed_time = time.time() - start_time
+                         remaining_time = max(0, batch_timeout - elapsed_time)
+                         result = async_result.get(timeout=remaining_time)
++
++                        if result is None:
++                            # eval_kernel_against_ref returns None for a transient
++                            # lock-file / compile error meant to be retried. Nothing
++                            # retries here, so record it as a compilation failure
++                            # rather than letting a None crash the whole batch job.
++                            print(
++                                f"[WARNING] Evaluation returned None for Problem ID: {problem_id}, Sample ID: {sample_id}; recording as compilation failure"
++                            )
++                            result = KernelExecResult(
++                                compiled=False,
++                                correctness=False,
++                                metadata={
++                                    "error": "eval_kernel_against_ref returned None (compilation/lock-file error)"
++                                },
++                                runtime=-1.0,
++                                runtime_stats={},
++                            )
++                            remove_cache_dir(
++                                config.kernel_eval_build_dir,
++                                config.run_name,
++                                problem_id,
++                                sample_id,
++                            )
++
+                         results.append((problem_id, sample_id, result))
+ 
+                     except mp.TimeoutError:
+@@ -726,6 +775,14 @@ def add_to_eval_results_file(
+     Add evaluation result to eval results file
+     TODO: migrate database support
+     """
++    # Defensive guard: a None result should already be normalized by the caller,
++    # but never let one slip through and crash the whole run on `.compiled`.
++    if eval_result is None:
++        print(
++            f"[WARNING] Skipping write for problem {problem_id} sample {sample_id}: eval_result is None"
++        )
++        return
++
+     # Load existing results if file exists
+     if os.path.exists(eval_file_path):
+         with open(eval_file_path, "r") as f:
+@@ -829,10 +886,29 @@ def main(config: EvalConfig):
+     # To Debug
+     # single_eval_example(config, dataset, run_dir, eval_file_path)
+ 
++    # Load eval results once instead of re-reading the file on every check
++    if os.path.exists(eval_file_path):
++        with open(eval_file_path, "r") as f:
++            existing_eval_results = json.load(f)
++    else:
++        existing_eval_results = {}
++
++    # one readdir instead of a stat per sample
++    try:
++        kernels_on_disk = set(os.listdir(run_dir))
++    except FileNotFoundError:
++        kernels_on_disk = set()
++
+     total_work = []
+     for problem_id in problem_ids_to_run:
++        completed_samples = {
++            entry["sample_id"]
++            for entry in existing_eval_results.get(str(problem_id), [])
++        }
+         for sample_id in range(config.num_samples_per_problem):
+-            if not check_if_eval_exists_local(problem_id, sample_id, eval_file_path):
++            if sample_id in completed_samples:
++                continue
++            if kernel_filename(config.level, problem_id, sample_id) in kernels_on_disk:
+                 total_work.append((problem_id, sample_id))
+ 
+     print(
+diff --git a/scripts/generate_baseline_time.py b/scripts/generate_baseline_time.py
+index e53fd91..5620353 100644
+--- a/scripts/generate_baseline_time.py
++++ b/scripts/generate_baseline_time.py
+@@ -5,6 +5,7 @@ from kernelbench.timing import measure_ref_program_time
+ from kernelbench.utils import read_file
+ import os
+ import json
++import multiprocessing as mp
+ from tqdm import tqdm
+ 
+ """
+@@ -41,43 +42,187 @@ TIMING_DIR = os.path.join(REPO_TOP_PATH, "results", "timing")
+ 
+ 
+ 
+-def record_baseline_times(use_torch_compile: bool = False, 
+-                          torch_compile_backend: str="inductor", 
++def _atomic_save(obj: dict, path: str):
++    """Write JSON atomically (temp file + rename) so a killed job never leaves a corrupt file."""
++    tmp = f"{path}.tmp"
++    with open(tmp, "w") as f:
++        json.dump(obj, f)
++    os.replace(tmp, path)
++
++
++def _worker_loop(task_queue, result_queue, device_index: int):
++    """Runs in a spawned subprocess with its own CUDA context.
++
++    Pulls measurement tasks, times the reference program, and reports
++    `(stats, healthy)`. `healthy` is False once a sticky CUDA error (e.g. a
++    device-side assert) has poisoned the context; the worker then exits so the
++    parent can respawn a clean one. This isolates the rest of the run from a
++    single bad problem instead of letting it return None for everything after.
++    """
++    import torch
++    from kernelbench.timing import measure_ref_program_time
++
++    device = torch.device(f"cuda:{device_index}")
++    while True:
++        task = task_queue.get()
++        if task is None:  # shutdown sentinel
++            break
++        try:
++            stats = measure_ref_program_time(device=device, verbose=False, **task)
++        except Exception as e:  # defensive: measure_ref_program_time already swallows most
++            print(f"[Eval] Worker error measuring {task.get('ref_arch_name')}: {e}")
++            stats = None
++
++        # Health probe: detect a poisoned CUDA context (sticky device-side assert).
++        healthy = True
++        try:
++            torch.cuda.synchronize(device=device)
++            probe = torch.ones(1, device=device) + 1
++            torch.cuda.synchronize(device=device)
++            del probe
++        except Exception:
++            healthy = False
++
++        result_queue.put((stats, healthy))
++        if not healthy:
++            break
++
++
++class IsolatedRunner:
++    """Measures each problem in a restartable worker subprocess.
++
++    The worker persists across problems (so the common path stays fast and pays
++    CUDA init only once), and is killed + respawned only when it poisons its
++    context, hangs past `timeout`, or dies unexpectedly.
++    """
++
++    def __init__(self, device_index: int = 0, timeout: float = 600.0):
++        self.ctx = mp.get_context("spawn")
++        self.device_index = device_index
++        self.timeout = timeout
++        self.proc = None
++        self.task_queue = None
++        self.result_queue = None
++
++    def _ensure_worker(self):
++        if self.proc is not None and self.proc.is_alive():
++            return
++        self._kill()
++        self.task_queue = self.ctx.Queue()
++        self.result_queue = self.ctx.Queue()
++        self.proc = self.ctx.Process(
++            target=_worker_loop,
++            args=(self.task_queue, self.result_queue, self.device_index),
++            daemon=True,
++        )
++        self.proc.start()
++
++    def measure(self, task: dict):
++        self._ensure_worker()
++        self.task_queue.put(task)
++        try:
++            stats, healthy = self.result_queue.get(timeout=self.timeout)
++        except Exception:
++            # Timed out or worker died without responding: drop it, respawn next call.
++            self._kill()
++            return None
++        if not healthy:
++            # Context poisoned; worker is exiting. Drop it so a fresh one spawns next call.
++            self._kill()
++        return stats
++
++    def _kill(self):
++        if self.proc is not None:
++            try:
++                if self.proc.is_alive():
++                    self.proc.terminate()
++                    self.proc.join(timeout=10)
++                if self.proc.is_alive():
++                    self.proc.kill()
++                    self.proc.join(timeout=10)
++            except Exception:
++                pass
++        self.proc = None
++        self.task_queue = None
++        self.result_queue = None
++
++    def close(self):
++        if self.proc is not None and self.proc.is_alive() and self.task_queue is not None:
++            try:
++                self.task_queue.put(None)
++                self.proc.join(timeout=10)
++            except Exception:
++                pass
++        self._kill()
++
++
++def record_baseline_times(use_torch_compile: bool = False,
++                          torch_compile_backend: str="inductor",
+                           torch_compile_options: str="default",
+                           file_name: str="baseline_time.json",
+-                          precision: str="fp32"):
++                          precision: str="fp32",
++                          levels: tuple = (1, 2, 3, 4, 6),
++                          save_every: int = 50):
+     """
+-    Generate baseline time for KernelBench, 
++    Generate baseline time for KernelBench,
+     configure profiler options for PyTorch
+     save to specified file
+-    """
+-    device = torch.device("cuda:0")
+-    json_results = {}
+-    
+-    for level in [1, 2, 3]:
+-        dataset = construct_kernelbench_dataset(level)
+-        json_results[f"level{level}"] = {}
+-
+-        num_problems = len(dataset)
+-        for problem_id in tqdm(dataset.get_problem_ids()):
+-            ref_arch_path, ref_arch_name, ref_arch_src = fetch_ref_arch_from_dataset(dataset, problem_id)
+-            runtime_stats = measure_ref_program_time(
+-                ref_arch_name=ref_arch_name,
+-                ref_arch_src=ref_arch_src,
+-                use_torch_compile=use_torch_compile,
+-                torch_compile_backend=torch_compile_backend,
+-                torch_compile_options=torch_compile_options,
+-                device=device,
+-                verbose=False, # do not print 
+-                precision=precision,
+-            )
+-            json_results[f"level{level}"][ref_arch_name] = runtime_stats
+ 
++    Resumable: existing results in the target file are loaded and already-measured
++    problems are skipped, and progress is checkpointed every `save_every` problems and
++    after each level. A job killed mid-pass can be resubmitted to continue where it left off.
++
++    Each problem is measured in an isolated, restartable worker subprocess
++    (see IsolatedRunner). A problem that triggers a sticky CUDA error (e.g. a
++    device-side assert) only poisons its own worker, which is then respawned,
++    so subsequent problems and levels are unaffected.
++    """
+     save_path = os.path.join(TIMING_DIR, file_name)
+     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+ 
+-    with open(save_path, "w") as f:
+-        json.dump(json_results, f)
++    # Resume from any existing results for this config
++    if os.path.exists(save_path):
++        with open(save_path, "r") as f:
++            json_results = json.load(f)
++    else:
++        json_results = {}
++
++    runner = IsolatedRunner(device_index=0)
++    try:
++        for level in levels:
++            dataset = construct_kernelbench_dataset(level)
++            level_key = f"level{level}"
++            json_results.setdefault(level_key, {})
++
++            num_new = 0
++            for problem_id in tqdm(dataset.get_problem_ids(), desc=f"{file_name} {level_key}"):
++                ref_arch_path, ref_arch_name, ref_arch_src = fetch_ref_arch_from_dataset(dataset, problem_id)
++                # Skip problems already measured (resume support)
++                if ref_arch_name in json_results[level_key]:
++                    continue
++                runtime_stats = runner.measure(dict(
++                    ref_arch_name=ref_arch_name,
++                    ref_arch_src=ref_arch_src,
++                    use_torch_compile=use_torch_compile,
++                    torch_compile_backend=torch_compile_backend,
++                    torch_compile_options=torch_compile_options,
++                    precision=precision,
++                ))
++                if runtime_stats is None:
++                    # Problem failed to load or measure (e.g. missing import, dtype error,
++                    # or a device-side assert that poisoned its worker); skip it.
++                    continue
++                json_results[level_key][ref_arch_name] = runtime_stats
++                num_new += 1
++                if num_new % save_every == 0:
++                    _atomic_save(json_results, save_path)
++
++            # Checkpoint at the end of each level
++            _atomic_save(json_results, save_path)
++    finally:
++        runner.close()
++
++    _atomic_save(json_results, save_path)
+     return json_results
+ 
+ def test_measure_particular_program(level_num: int, problem_id: int):
+@@ -108,37 +253,44 @@ if __name__ == "__main__":
+     # DEBUG and simple testing
+     # test_measure_particular_program(2, 28)
+     
+-    # Replace this with whatever hardware you are running on 
+-    # hardware_name = "L40S_matx3"
+-    hardware_name = "H100_PCIe_LambdaLabs"
++    # Hardware label for the output directory.
++    # Override via the HARDWARE_NAME env var; defaults to "H100".
++    hardware_name = os.environ.get("HARDWARE_NAME", "H100")
+ 
+-    input(f"You are about to start recording baseline time for {hardware_name}, press Enter to continue...")
+-    # Systematic recording of baseline time
++    # Must match the precision the kernels are evaluated at, or every speedup computed
++    # from these numbers is wrong by the dtype ratio. eval_all_rounds.sh defaults to
++    # fp32, so this does too; they are only meaningful as a pair.
++    precision = os.environ.get("BASELINE_PRECISION", "fp32")
++    # Only baseline_time_torch.json is read downstream. The torch.compile configs take
++    # ~13h more over 17k level-6 problems and get killed mid-file, so they are opt-in.
++    eager_only = os.environ.get("BASELINE_EAGER_ONLY", "1") == "1"
+ 
+-    if os.path.exists(os.path.join(TIMING_DIR, hardware_name)):
+-        input(f"Directory {hardware_name} already exists, Are you sure you want to overwrite? Enter to continue...")
++    print(f"Recording baseline time for {hardware_name} -> {os.path.join(TIMING_DIR, hardware_name)}")
++    print(f"Precision: {precision}   eager_only: {eager_only}")
++    print("Resumable: existing results are loaded and already-measured problems are skipped.")
+ 
+     # 1. Record Torch Eager
+-    record_baseline_times(use_torch_compile=False, 
++    record_baseline_times(use_torch_compile=False,
+                           torch_compile_backend=None,
+-                          torch_compile_options=None, 
++                          torch_compile_options=None,
+                           file_name=f"{hardware_name}/baseline_time_torch.json",
+-                          precision="bf16")
+-    
+-    # 2. Record Torch Compile using Inductor
+-    for torch_compile_mode in ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]:
+-        record_baseline_times(use_torch_compile=True, 
+-                              torch_compile_backend="inductor",
+-                              torch_compile_options=torch_compile_mode, 
+-                              file_name=f"{hardware_name}/baseline_time_torch_compile_inductor_{torch_compile_mode}.json",
+-                              precision="bf16")
+- 
+-    # 3. Record Torch Compile using cudagraphs
+-    record_baseline_times(use_torch_compile=True, 
+-                          torch_compile_backend="cudagraphs",
+-                          torch_compile_options=None, 
+-                          file_name=f"{hardware_name}/baseline_time_torch_compile_cudagraphs.json",
+-                          precision="bf16")
++                          precision=precision)
++
++    if not eager_only:
++        # 2. Record Torch Compile using Inductor
++        for torch_compile_mode in ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]:
++            record_baseline_times(use_torch_compile=True,
++                                  torch_compile_backend="inductor",
++                                  torch_compile_options=torch_compile_mode,
++                                  file_name=f"{hardware_name}/baseline_time_torch_compile_inductor_{torch_compile_mode}.json",
++                                  precision=precision)
++
++        # 3. Record Torch Compile using cudagraphs
++        record_baseline_times(use_torch_compile=True,
++                              torch_compile_backend="cudagraphs",
++                              torch_compile_options=None,
++                              file_name=f"{hardware_name}/baseline_time_torch_compile_cudagraphs.json",
++                              precision=precision)
+     
+ 
+ 
+diff --git a/scripts/kb_normalize.py b/scripts/kb_normalize.py
+new file mode 100644
+index 0000000..50c5b14
+--- /dev/null
++++ b/scripts/kb_normalize.py
+@@ -0,0 +1,36 @@
++"""Grade multi-output problems on their primary output.
++
++KernelBench's `output.shape` comparison raises on a tuple, so tuple-returning problems
++are unpassable. Appending a subclass cannot mangle the source, and the isinstance guard
++makes it a no-op for single-output problems.
++"""
++
++from __future__ import annotations
++
++_WRAPPER = '''
++
++_KB_INNER_{name} = {name}
++
++
++class {name}(_KB_INNER_{name}):
++    def forward(self, *args, **kwargs):
++        out = super().forward(*args, **kwargs)
++        if isinstance(out, (tuple, list)) and len(out) > 0:
++            return out[0]
++        return out
++'''
++
++
++def wrap_primary_output(src: str, class_name: str) -> str:
++    return src.rstrip("\n") + "\n" + _WRAPPER.format(name=class_name)
++
++
++def normalize_pair(
++    ref_src: str, kernel_src: str, enabled: bool = True
++) -> tuple[str, str]:
++    if not enabled:
++        return ref_src, kernel_src
++    return (
++        wrap_primary_output(ref_src, "Model"),
++        wrap_primary_output(kernel_src, "ModelNew"),
++    )
+diff --git a/scripts/test_kb_normalize.py b/scripts/test_kb_normalize.py
+new file mode 100644
+index 0000000..4fa3d6f
+--- /dev/null
++++ b/scripts/test_kb_normalize.py
+@@ -0,0 +1,131 @@
++"""kb_normalize: collapse a multi-output forward to its primary output.
++
++Deliberately torch-free -- the wrapper only subclasses whatever the source defines,
++so a plain class exercises the same code path and the test runs locally.
++"""
++
++from kb_normalize import normalize_pair, wrap_primary_output
++
++
++def _load(src: str, name: str):
++    ns: dict = {}
++    exec(compile(src, "<test>", "exec"), ns)
++    return ns[name]
++
++
++def test_tensor_return_passes_through_unchanged():
++    src = "class Model:\n    def forward(self, x):\n        return x * 2\n"
++    model = _load(wrap_primary_output(src, "Model"), "Model")()
++    assert model.forward(3) == 6
++
++
++def test_two_tuple_collapses_to_first_element():
++    src = "class Model:\n    def forward(self, x):\n        return (x, x * 10)\n"
++    model = _load(wrap_primary_output(src, "Model"), "Model")()
++    assert model.forward(3) == 3
++
++
++def test_one_element_tuple_collapses_to_the_element():
++    src = "class Model:\n    def forward(self, x):\n        return (x,)\n"
++    model = _load(wrap_primary_output(src, "Model"), "Model")()
++    assert model.forward(7) == 7
++
++
++def test_list_return_collapses_like_a_tuple():
++    src = "class Model:\n    def forward(self, x):\n        return [x, x + 1]\n"
++    model = _load(wrap_primary_output(src, "Model"), "Model")()
++    assert model.forward(4) == 4
++
++
++def test_empty_tuple_is_returned_untouched():
++    src = "class Model:\n    def forward(self, x):\n        return ()\n"
++    model = _load(wrap_primary_output(src, "Model"), "Model")()
++    assert model.forward(1) == ()
++
++
++def test_keyword_arguments_reach_the_inner_forward():
++    src = "class Model:\n    def forward(self, x, scale=1):\n        return (x * scale, x)\n"
++    model = _load(wrap_primary_output(src, "Model"), "Model")()
++    assert model.forward(3, scale=5) == 15
++
++
++def test_wrapping_twice_is_harmless():
++    src = "class Model:\n    def forward(self, x):\n        return (x, x)\n"
++    once = wrap_primary_output(src, "Model")
++    model = _load(wrap_primary_output(once, "Model"), "Model")()
++    assert model.forward(9) == 9
++
++
++def test_normalize_pair_wraps_model_and_modelnew():
++    ref = "class Model:\n    def forward(self, x):\n        return (x, 0)\n"
++    new = "class ModelNew:\n    def forward(self, x):\n        return (x, 1)\n"
++    ref_out, new_out = normalize_pair(ref, new)
++    assert _load(ref_out, "Model")().forward(2) == 2
++    assert _load(new_out, "ModelNew")().forward(2) == 2
++
++
++def test_normalize_pair_disabled_returns_sources_unchanged():
++    ref, new = "a = 1\n", "b = 2\n"
++    assert normalize_pair(ref, new, enabled=False) == (ref, new)
++
++
++import ast
++import pathlib
++
++
++def _driver_source() -> str:
++    return (pathlib.Path(__file__).parent / "eval_from_generations.py").read_text()
++
++
++def test_driver_declares_the_default_on_constant():
++    assert "NORMALIZE_MULTI_OUTPUT_DEFAULT = True" in _driver_source()
++
++
++def _top_level_index(fn: ast.FunctionDef | ast.AsyncFunctionDef, target: ast.AST) -> int | None:
++    # Which statement in fn.body (if any) contains target, searching at any depth below it.
++    for i, stmt in enumerate(fn.body):
++        for n in ast.walk(stmt):
++            if n is target:
++                return i
++    return None
++
++
++def test_every_eval_call_is_preceded_by_normalisation_in_the_same_function():
++    # Not just "normalize_pair is called somewhere in this function": it must be a
++    # top-level statement (not buried in an if/for/try), its result must be assigned,
++    # and that assignment must come before the statement holding the eval call.
++    tree = ast.parse(_driver_source())
++    checked = 0
++    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
++        eval_calls = [
++            n for n in ast.walk(fn)
++            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "eval_kernel_against_ref"
++        ]
++        if not eval_calls:
++            continue
++
++        eval_indices = [_top_level_index(fn, call) for call in eval_calls]
++        assert all(i is not None for i in eval_indices), (
++            f"{fn.name} calls eval_kernel_against_ref outside any top-level statement"
++        )
++        eval_idx = min(eval_indices)
++
++        normalise_idx = next(
++            (
++                i for i, stmt in enumerate(fn.body)
++                if isinstance(stmt, ast.Assign)
++                and isinstance(stmt.value, ast.Call)
++                and getattr(stmt.value.func, "id", None) == "normalize_pair"
++            ),
++            None,
++        )
++        assert normalise_idx is not None, (
++            f"{fn.name} calls eval_kernel_against_ref without a top-level "
++            "`... = normalize_pair(...)` assignment in the same function"
++        )
++        assert normalise_idx < eval_idx, (
++            f"{fn.name} normalises at body[{normalise_idx}] but eval_kernel_against_ref "
++            f"is reached from body[{eval_idx}] -- normalisation must come first"
++        )
++        checked += 1
++    assert checked >= 2, f"expected both eval call sites to be covered, found {checked}"
+diff --git a/src/kernelbench/eval.py b/src/kernelbench/eval.py
+index 3557dc9..5a3b906 100644
+--- a/src/kernelbench/eval.py
++++ b/src/kernelbench/eval.py
+@@ -23,6 +23,69 @@ from pydantic import BaseModel
+ 
+ from . import timing, dataset
+ 
++# torch >= 2.7 dropped torch._inductor.runtime.triton_heuristics.grid, which every
++# inductor-style generated kernel imports. INDUCTOR_GRID_COMPAT=1 puts torch 2.6.0's
++# function back verbatim so those kernels load unedited; off by default.
++from torch._inductor.runtime.runtime_utils import ceildiv, get_max_y_grid
++
++
++def grid(*numels):
++    """Helper function to compute triton grids"""
++    if len(numels) == 1:
++        xnumel, ynumel, znumel = numels[0], None, None
++    elif len(numels) == 2:
++        xnumel, ynumel, znumel = numels[1], numels[0], None
++    elif len(numels) == 3:
++        xnumel, ynumel, znumel = numels[2], numels[1], numels[0]
++    else:
++        raise AssertionError(f"invalid size for numels {len(numels)}")
++
++    def get_grid_dim(numel, block):
++        if numel is None:
++            return 1
++        if block is None:
++            return numel
++        return ceildiv(numel, block)
++
++    def grid_fn(meta):
++        x_grid = get_grid_dim(xnumel, meta.get("XBLOCK", 1))
++        y_grid = get_grid_dim(ynumel, meta.get("YBLOCK", None))
++
++        max_y_grid = get_max_y_grid()
++        if znumel is None:
++            div = ceildiv(y_grid, max_y_grid)
++            y_grid = ceildiv(y_grid, div)
++            z_grid = div
++        else:
++            z_grid = get_grid_dim(znumel, meta.get("ZBLOCK", None))
++            torch._check(
++                y_grid <= max_y_grid,
++                lambda: f"Generated y grid beyond 2^16 ({y_grid}) not supported with z dimension present. File issue",
++            )
++
++        return (
++            x_grid,
++            y_grid,
++            z_grid,
++        )
++
++    setattr(grid_fn, "grid_fn_str", f"grid{numels}")  # noqa: B010
++
++    return grid_fn
++
++
++def _install_inductor_grid_compat() -> bool:
++    if os.environ.get("INDUCTOR_GRID_COMPAT", "") not in ("1", "true", "True"):
++        return False
++    from torch._inductor.runtime import triton_heuristics as _th
++    if hasattr(_th, "grid"):
++        return False
++    _th.grid = grid
++    return True
++
++
++_INDUCTOR_GRID_COMPAT = _install_inductor_grid_compat()
++
+ REPO_TOP_PATH = os.path.abspath(
+     os.path.join(
+         os.path.dirname(__file__),
+@@ -384,8 +447,9 @@ def _process_input_tensor(input, device, backend="cuda", precision=torch.float32
+     if not isinstance(input, torch.Tensor):
+         return input
+     
+-    # cast to the desired percision dtype for activations
+-    input_tensor = input.to(dtype=precision)
++    # Only activations carry a precision. Casting an index or mask tensor breaks the op
++    # that consumes it, e.g. cross_entropy targets in level 1 problem 95.
++    input_tensor = input.to(dtype=precision) if input.is_floating_point() else input
+     
+     # Default for all other backends and float types
+     return input_tensor.to(device=device)
+diff --git a/src/kernelbench/timing.py b/src/kernelbench/timing.py
+index f22920b..b83285c 100644
+--- a/src/kernelbench/timing.py
++++ b/src/kernelbench/timing.py
+@@ -59,15 +59,18 @@ def measure_ref_program_time(
+                 precision_dtype = precision
+ 
+ 
++            # Only activations carry a precision. Casting an index or mask tensor breaks
++            # the op that consumes it, e.g. cross_entropy targets in level 1 problem 95.
++            def _cast(x):
++                if not isinstance(x, torch.Tensor):
++                    return x
++                if x.is_floating_point():
++                    return x.to(device=device, dtype=precision_dtype)
++                return x.to(device=device)
++
+             # set model weights and inputs to specified precision
+-            inputs = [
+-                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
+-                for x in inputs
+-            ]
+-            init_inputs = [
+-                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
+-                for x in init_inputs
+-            ]
++            inputs = [_cast(x) for x in inputs]
++            init_inputs = [_cast(x) for x in init_inputs]
+ 
+             model = Model(*init_inputs)
+             model = model.to(device=device, dtype=precision_dtype)

@@ -1,0 +1,63 @@
+# The PRM labeling build over the KernelBench level-7 runs.
+#   python -m processkernel.prm.data.build --config configs/prm_build.yaml
+#   python -m processkernel.prm.data.splits --config configs/prm_build.yaml
+#   python -m processkernel.prm.data.stats --config configs/prm_build.yaml
+#
+# ONE build over all the runs. splits.json is keyed "level:problem", so a joint build gives
+# every model the same train/val split and a problem cannot land in train for one rollout
+# campaign and val for another. Each campaign then picks its own rows with run_tags
+# (configs/prm_rollout.yaml).
+#
+# run_dirs is FROZEN once this has run. splits.py shuffles sorted(set of (level, problem_id))
+# over every part, so a later build whose problem set differs re-rolls the whole assignment --
+# and two campaigns cut under two different splits cannot be concatenated without leaking.
+# Nemotron is listed but has no campaign: its parts cost minutes and keep the option open,
+# whereas adding it later could move the split. Units missing an eval simply build no part and
+# are picked up on resume -- and that resume must run `prm.build` ALONE, never `prm.splits`
+# again.
+#
+# Level 7 is level 6 DEDUPLICATED: 13,371 of its 13,373 files also exist under level6/, whose
+# 17,439 hold only 13,371 distinct sources. That is why this is a separate build and not a
+# rebuild of data/prm — and it is why the ORM in the campaigns has seen these problems.
+prm:
+  run_dirs:
+    - /path/to/workdir/KernelBench/runs/DeepSeek-V4-Flash_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced
+    - /path/to/workdir/KernelBench/runs/MiniMax-M2.7_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced
+    - /path/to/workdir/KernelBench/runs/NVIDIA-Nemotron-3-Super-120B-A12B-FP8_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced
+    - /path/to/workdir/KernelBench/runs/Qwen3.5-122B-A10B-FP8_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced
+    - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced
+
+  # The level-7 file, NOT baseline_time_torch.json — that one has no level7 key at all.
+  # 12,850 of the runs' 13,371 problems have an entry, so ~521 problems' correct kernels
+  # drop as `no_baseline`. Incorrect ones are unaffected: they are graded 0 without a timing.
+  baseline_timing_json: KernelBench/results/timing/H100/baseline_time_torch_l7.json
+
+  # Relative to the repository root. 62 problems: 26 whose deduped twin was timed
+  # differently, 36 whose reference returns its input unchanged.
+  exclude_problems_json: configs/prm_exclude_level7.json
+
+  label_mode: graded
+  speedup_stat: min
+  speedup_lo: 0.2
+  speedup_hi: 4.0
+  # 0.1 as in the level-6 build. Level 7 is that corpus deduplicated and the ORM the
+  # campaigns impute with was trained on it, so v1's labels here and the anchors
+  # it calibrates against have to sit on one relevance scale. The campaigns repeat this value.
+  speed_quant: 0.1
+
+  prose_lines_per_chunk: 1
+  code_steps_per_chunk: 1
+  min_frac: 0.0
+
+  tokenizer: Qwen/Qwen3-Reranker-4B
+  # Slack, not a binding cap: the longest v6 completions are ~2,900
+  # tokens of `raw` (DeepSeek) and ~1,800 (gpt-oss), well inside it even with the prompt.
+  max_length: 32768
+
+  # Joint over every run — same problem ids in each, so one split covers every campaign.
+  split_ratios: [0.7, 0.15, 0.15]
+  split_seed: 42
+
+  out_dir: data/prm_l7
+  num_workers: 8
+  max_shards: null

@@ -1,0 +1,32 @@
+# The ORM: a listwise Qwen3-Reranker-4B over the DeepSeek-V4-Flash and gpt-oss-120b level-6
+# runs. The search uses it to pick each problem's final kernel, and the PRM
+# rollouts use it to impute labels.
+#
+#   python -m processkernel.orm.train --config configs/orm.yaml   # builds data + lists if missing
+#
+# On N GPUs, launch the same module with accelerate and FSDP (configs/prm_train.yaml)
+# and pass train.gradient_accumulation_steps=<32 / N>: here it is the TOTAL over all ranks.
+_base: listwise_base.yaml
+
+data:
+  run_dirs:
+  - /path/to/workdir/KernelBench/runs/DeepSeek-V4-Flash_kb6_lintloop_triton_v5_traced
+  - /path/to/workdir/KernelBench/runs/gpt-oss-120b_kb6_lintloop_triton_v5_traced
+  dataset_jsonl: data/dataset_kb_deepseek_gptoss.jsonl
+  splits_json: data/splits_kb_deepseek_gptoss_speed_moderate.json
+model:
+  base_model: Qwen/Qwen3-Reranker-4B
+train:
+  output_dir: data/checkpoints_listwise_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b
+  metric_for_best_model: eval_fast_at1
+mlflow:
+  run_name: kb_deepseek_gptoss_speed_moderate_qwen3reranker4b
+listwise:
+  lists_train_jsonl: data/lists_train_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b.jsonl
+  lists_val_jsonl: data/lists_val_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b.jsonl
+  lists_splits_json: data/lists_splits_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b.json
+  list_size: 16
+  max_positives: 8
+  max_negatives: 8
+  speed_quant: 0.0
+  loss_alpha: 0.25

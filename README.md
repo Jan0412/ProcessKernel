@@ -1,210 +1,186 @@
-# ProcessKernel — Quality Signals for LLM-Generated Triton Kernels
+# ProcessKernel: Calibrated Process Supervision for GPU Kernel Generation
 
-Large language models can generate GPU kernels that **pass every correctness test and
-are still bad** — they fall back to PyTorch for the hard part, launch a decoy kernel,
-or waste memory bandwidth on intermediates a competent author would fuse away. This
-repository studies how to *detect* that gap and *close* it, without a human in the loop.
+An execution-free process supervision framework that turns one-time outcome measurements
+into reusable guidance for unfinished GPU kernels during autoregressive generation.
 
-Four ideas are developed and evaluated against
-[KernelBench](https://github.com/ScalingIntelligence/KernelBench) and
-[KernelBook](https://huggingface.co/datasets/GPUMODE/KernelBook):
+[KernelBench](https://github.com/ScalingIntelligence/KernelBench) |
+[KernelBook dataset](https://huggingface.co/datasets/GPUMODE/KernelBook) |
+[License](LICENSE)
 
-1. **Deterministic, GPU-free static analysis** (`checker/`) that reads a generated
-   kernel and reports, in bytes and microseconds, whether it cheated or is provably slow —
-   and, separately, whether the evaluator can load it at all.
-2. **A self-refinement loop** (`kernel_gen/arms/lintloop.py`) that feeds those findings
-   back to the model and asks it to repair its own kernel.
-3. **A learned reranker** (`reranker/`) that picks the best of *N* samples so the loop
-   spends its budget on the candidate most likely to be correct and fast.
-4. **Per-token confidence traces** (`--trace`) capturing what the model weighed at every
-   step of a generation, joined to the linter's findings by line number — training data
-   for a process reward model, at no extra generation cost.
+![Overview of the ProcessKernel framework](assets/pipeline.png)
 
----
+## 👋 Overview
 
-## Repository layout
+Generating efficient GPU kernels requires searching a vast space of functionally equivalent
+programs whose performance depends on low-level hardware behavior. Effective search relies on
+execution feedback, but obtaining it is expensive: each candidate must be completed,
+compiled, validated and timed. ProcessKernel amortizes a much smaller set of measured
+executions into scalable process supervision:
 
-| Path | What it is |
-|---|---|
-| [`checker/`](checker/README.md) | The static analyzers. Pure-stdlib `ast`, no GPU. **Start here — it has its own detailed README.** |
-| &nbsp;&nbsp;`checker/core/` | What both analyzers are built from: the AST front end, the `Finding` vocabulary, and the `Check` / `Analyzer` / `Renderer` base classes. |
-| &nbsp;&nbsp;`checker/lint/` | *"Is this good Triton?"* — families F1 (is the kernel real) and F2 (what it wastes). |
-| &nbsp;&nbsp;`checker/submission/` | *"Can the evaluator load this?"* — S1.0–S1.3. `compile()`, an entry class, a reachable `forward`, bound module aliases. Answers loadability only, never correctness. |
-| [`kernel_gen/`](kernel_gen/) | Kernel generation with vLLM. |
-| &nbsp;&nbsp;`kernel_gen/core/` | The loop-capable machinery: the `Backend` seam, the two-pass think sampler, prompt builders, completion extraction, the round-major engine, artifact writers, and the per-token trace record. Testable without a GPU against a scripted fake backend. |
-| &nbsp;&nbsp;`kernel_gen/arms/` | One module per experiment arm. Currently `lintloop.py` (A5). |
-| &nbsp;&nbsp;`kernel_gen/readout.py` | Joins a run's `eval_results.json`, its round-0 baseline's, and `lint_loop.jsonl` into the paired per-slot transition table. |
-| &nbsp;&nbsp;`kernel_gen/inspect_trace.py` | Reads a captured trace back: per-token frame, findings joined by line number, the plan-vs-code confidence split. |
-| &nbsp;&nbsp;`kernel_gen/convert_kernelbook.py` | Stages KernelBook rows as a KernelBench local level (up-scaling its placeholder `4` shapes). |
-| [`reranker/`](reranker/) | Pointwise / pairwise / listwise reranker that scores candidates and keeps the best. |
-| — | Evaluation is **not** in this repo. Runs are scored by the KernelBench checkout at `/path/to/workdir/KernelBench` via its `slum_scripts/eval_from_generations.sh`. |
-| [`timing/`](timing/README.md) | Baseline eager PyTorch runtimes per problem/GPU, used to compute speedups offline. |
-| [`scripts/`](scripts/) | SLURM + local drivers, the staging pre-flight tools, and the whole-corpus verification sweeps. |
-| [`notebooks/`](notebooks/) | Analysis: reranker eval, diversity vs. correctness, score-outcome, Fast@k, prompt token stats, speculative decoding. |
-| `KernelBench/` | Vendored benchmark and staged level dirs (git-ignored; the package installs via the `pyproject` git source). |
-| `runs/` | Generated kernels, traces + eval results (git-ignored artifacts). |
+1. **Outcome reward model (ORM).** We train an ORM on complete kernels with measured
+   correctness-and-speed grades. It learns within-problem rankings, which avoids regressing
+   absolute values that vary substantially across problems.
+2. **Calibration.** ORM scores are ordinal, not calibrated values. We map them to terminal
+   grades with a small set of executed anchor kernels: one monotone map shared by all
+   problems, plus a per-problem offset.
+3. **Process reward model (PRM).** The calibrated ORM estimates the value of many sampled
+   continuations of a partial kernel without executing them. This turns sparse terminal
+   measurements into dense supervision for a PRM over unfinished generations.
+4. **Guided search.** At inference time, the PRM guides a segment-level beam search, and the
+   ORM selects the final kernel from the candidate pool. Neither stage executes a kernel.
 
----
+The PRM works independently of the generator and needs no retraining or modification of it.
 
-## Datasets
+In the paper, this reduces process-supervision labeling cost by 76× (9.3 vs. an estimated
+707 H100 GPU-hours), while improving generated-kernel correctness by up to 38% and achieving
+up to 21.64× speedup.
 
-| Dataset | How it is addressed | Notes |
+## ⚙️ Pipeline
+
+| Stage | Command | Code in `src/processkernel/` |
 |---|---|---|
-| KernelBench levels 1–4 | `--level N` | Loaded from HuggingFace. The `code` column is byte-identical to the staged files, so `--ref-dir` is optional here. |
-| KernelBook | `--dataset kernelbook --level 6` | ~17.4k rows staged as a KernelBench local level by `scripts/create_kernelbook.sh`. **`--ref-dir` is not optional in practice** — without it the row is re-converted in-process *unscaled*, so the model is prompted about a 4×4 problem and graded on the 2048×2048 one. Too large for one job; shard it over a SLURM array. |
+| Convert KernelBook into KernelBench problems | `pk stage-kernelbook` | `generation/kernelbook/` |
+| Generate kernels with per-token traces | `pk generate --trace` | `generation/` |
+| Grade compilation, correctness and runtime | KernelBench's `eval_from_generations.py` | [grader patch](kernelbench.patch) |
+| Train the ORM as a within-problem ranker | `pk train-orm` | `orm/` |
+| Impute prefix values: continuations, ORM scores, calibration | `pk build-prm` … `pk lists` | `prm/data/`, `prm/rollout/` |
+| Train the PRM on the imputed values | `pk train-prm` | `prm/train/` |
+| Guided search: PRM-guided beam search, ORM picks the final kernel | `pk search` | `prm/search/` |
 
-A staged level dir is the pipeline's single source of truth: generation prompts from it,
-the linter reads its shapes, and KernelBench's eval scores against it. Pre-flight one with
-`scripts/check_level_dir.py` before trusting it, and diff a restage against the previous
-one with `scripts/diff_level_dirs.py` — replacing a staged dir is not a refresh, it is a
-change of benchmark.
+`pk` lists every command, and `pk <command> --help` shows its options. The training,
+labeling and search stages read one YAML each from [`configs/`](configs); any value can be
+overridden after `--config` as `section.key=value`.
 
----
+## 🔍 Pattern linter
 
-## The experiment arms
+`pk lint` reads a kernel file without running it. It parses the file into a syntax tree and
+builds a model of the module: the Triton kernels it defines, the launch sites in its host
+code and the buffers each launch reads and writes. Its 13 checks are rules over this model,
+in three families:
 
-Every arm is generated with the same model, sampler, and budget so differences are
-attributable to the intervention. Round 0 of a loop doubles as the paired baseline.
+- **Family 1:** work left to PyTorch or not done, e.g. no Triton kernel, a kernel that is
+  never launched, or a kernel output that never reaches the result.
+- **Family 2:** memory passes and launches added by host code. Triton never fuses separate
+  launches, so a tensor that one launch writes and another reads makes a full round trip
+  through device memory.
+- **Family 3:** structure of the kernel body, e.g. processing one element at a time or
+  looping over runtime bounds.
 
-| Arm | Intervention | Entry point |
-|---|---|---|
-| **A1** | Single-shot baseline generation | `kernel_gen.generate_kernels_samples` |
-| **A2** | Best-of-*N* via launch-config sweep | *retired — the `autotune/` package was removed* |
-| **A3** | Round-2 re-prompt with **timing** feedback | *retired with A2 (was seeded from its champion)* |
-| **A4** | Round-2 re-prompt with **tuning** feedback (full sweep table) | *retired with A2 (was seeded from its champion)* |
-| **A5** | **Lint loop**: generate → lint → repair, up to *N* rounds | `kernel_gen.arms.lintloop` |
-| — | Reranked best-of-*N* selection | `kernel_gen.generate_kernels_reranked` |
+A file shows a pattern when its check matches at least once; the checks record patterns, not
+a verdict on a kernel's quality. A separate gate (S1) checks that the grader can load the
+file at all. The linter needs no GPU and is not part of generation or search.
 
-A2–A4 are retired with the sweep. A5's round 0 is the paired baseline for every slot, so
-"how many broken samples did it fix, and did it break any that already worked?" is
-answerable per-slot rather than across two independent draws.
+## 📚 Datasets
 
-A5's repair prompt carries **both** analyzers: the linter's findings normally, and the
-submission gate's blocking message instead whenever the file cannot be loaded at all — a
-kernel is not `clean` (and does not stop its own loop) until it passes both.
+- **Evaluation: KernelBench** levels 1 and 2 (`--level N`, read from Hugging Face; levels 3
+  and 4 work the same way).
+- **Training: KernelBook, deduplicated.** `pk stage-kernelbook` converts each PyTorch module
+  into a KernelBench problem and scales its placeholder `4` shapes up. Byte-identical
+  problems are then merged, keeping the lowest problem id. The resulting 13,371 problems are
+  staged as KernelBench level 7:
 
----
+  ```bash
+  pk generate --model <hf-id> --dataset kernelbook --level 7 \
+      --ref-dir KernelBench/KernelBench/level7 --all --num-samples 4 --trace
+  ```
 
-## Quick start
+  The PRM build drops 62 more problems whose baseline timing is ambiguous or whose
+  reference does nothing ([list](configs/prm_exclude_level7.json)), which leaves 13,309.
 
-```bash
-# Install (Python 3.12, uv)
-uv sync
+Always pass `--ref-dir` for KernelBook. Without it, the model is prompted with the unscaled
+4×4 placeholder shapes but graded on the scaled ones.
 
-# Lint one generated kernel
-uv run python -m checker check runs/<run>/level_1_problem_23_sample_0_kernel.py
+## 📁 Directory structure
 
-# Scan a whole run folder to JSONL
-uv run python -m checker scan runs/<run> --out linter_findings.jsonl --workers 32
-
-# Run the generate → lint → repair loop (arm A5)
-uv run python -m kernel_gen.arms.lintloop --level 1 --all --rounds 3 --num-samples 10
-
-# The same on KernelBook, prompting from the staged references eval will score against
-uv run python -m kernel_gen.arms.lintloop --dataset kernelbook --level 6 \
-    --ref-dir KernelBench/level6 --rows 0-499 --rounds 3
-
-# Add --trace to also capture PRM training data. Changes nothing about what is generated.
-uv run python -m kernel_gen.arms.lintloop --level 1 --all --rounds 3 --trace
-
-# No GPU: render round 0's prompt and exit
-uv run python -m kernel_gen.arms.lintloop --model x --level 1 --problems 0 --dry-run
-
-# Evaluate a run (refined vs. its paired round-0 baseline). RUN_NAME is relative to runs/.
-cd /path/to/workdir/KernelBench
-sbatch --export=ALL,RUN_NAME=<run>,LEVEL=1,NUM_SAMPLES_PER_PROBLEM=10 \
-    slum_scripts/eval_from_generations.sh
-sbatch --export=ALL,RUN_NAME=<run>/rounds/round_0,LEVEL=1,NUM_SAMPLES_PER_PROBLEM=10 \
-    slum_scripts/eval_from_generations.sh
-
-# Once both evals exist: the paired transition table (fixed / broken / kept / neither)
-uv run python -m kernel_gen.readout --run-dir runs/<run>
-
-# Read a captured trace back
-uv run python -m kernel_gen.inspect_trace --run-dir runs/<run>
+```
+src/processkernel/
+├── cli.py                the `pk` command
+├── config.py             every stage's config: dataclasses, YAML loading, overrides
+├── generation/           `pk generate`: prompts, vLLM backend, traces;
+│                         kernelbook/ stages KernelBook as a KernelBench level
+├── checker/              pattern linter: check families F1-F3, submission gate S1
+├── orm/                  ORM: encoding, model, listwise training; data/ builds the dataset
+└── prm/
+    ├── data/             labels from the generation runs: cut points, targets, splits
+    ├── rollout/          rollouts, ORM scores, calibration, values, lists
+    ├── train/            PRM training and the ranking check
+    └── search/           segment-level beam search and report
+configs/                  one YAML per stage
+tests/                    mirrors src/processkernel/
+kernelbench.patch         our patch to the pinned KernelBench commit
 ```
 
-Cluster jobs go through `scripts/*.sh` (SLURM) and `reranker/scripts/*.sh`. The A5 driver
-is `scripts/lintloop.sh`, whose knobs are environment variables — `SMOKE=1`, `TRACE=1`,
-`THINK_TEMP=0` (single-pass, no plan), `DATASET=kernelbook`, `NUM_SAMPLES`, `ROUNDS` —
-each routing to its own output dir so two experiments are never confused. KernelBook runs
-in array mode (`--array=0-31%14`), each task taking a balanced slice from
-`scripts/shard_ids.py` and writing its own `shard_NN/` run dir, because the JSONL journals
-are appended without locking.
+`KernelBench/` (the grader checkout), `runs/` (generated kernels) and `data/` (datasets and
+checkpoints) are created at run time and git-ignored.
 
-### Trace output
-
-`--trace` adds a second output and changes nothing about the first. Alongside the kernels
-it writes `traces/round_{r}/`: one `.npz` per attempt holding the token ids and the top-20
-alternatives the model weighed at every step, plus an `attempts.jsonl` holding the `## Plan`
-prose, the full prompt, the extracted code, the linter's findings with their line numbers,
-the plan/code seam offsets, and DeepConf's group-confidence summaries. The numbers were
-always computed and always thrown away at generation time, so capture costs no extra GPU.
-`traces/` sits where the run-dir globs cannot see it, and eval never reads it.
-
----
-
-## Tests
+## 🔧 Set up
 
 ```bash
-uv run --group dev pytest                    # both suites (checker + kernel_gen)
-uv run --group dev pytest kernel_gen/tests   # just the generation pipeline
-uv run --group dev pytest kernel_gen/tests/unit          # pure functions
-uv run --group dev pytest kernel_gen/tests/integration   # cross-module seams
-uv run --group dev pytest kernel_gen/tests/properties     # metamorphic (gemtest) + property (Hypothesis)
+uv sync      # Python 3.12; the dev, gen (vLLM) and train groups are on by default
+
+# The grader: KernelBench at the pinned commit plus our patch, in its own environment
+git clone https://github.com/ScalingIntelligence/KernelBench.git && cd KernelBench
+git checkout 423217d && git apply ../kernelbench.patch
+uv sync && cd ..   # Python 3.10, as KernelBench requires
 ```
 
-`kernel_gen/tests/` is split into `unit/` (one file per `core/` module), `integration/`
-(the seams) and `properties/` (metamorphic via **gemtest** + property-based via
-**Hypothesis**). Two quality gates back it, both kept out of the inner-loop `pytest` so
-it stays fast:
+The grader is KernelBench at `423217d` plus [`kernelbench.patch`](kernelbench.patch):
+
+- `src/kernelbench/timing.py` casts only floating-point inputs to the eval precision; index
+  and mask tensors keep their dtype.
+- `scripts/generate_baseline_time.py` times the baselines at the eval precision (fp32), eager
+  or `torch.compile`.
+- `src/kernelbench/eval.py` grades multi-output problems on their primary output
+  (`scripts/kb_normalize.py`); `INDUCTOR_GRID_COMPAT=1` restores the inductor `grid` helper
+  that torch 2.10+ dropped.
+- `scripts/eval_from_generations.py` records a transient compile error as a failure instead
+  of crashing the run.
+- `pyproject.toml` installs torch from the CUDA 12.8 index.
+
+Always grade with `uv run` inside `KernelBench/`: our environment has an unpatched
+`kernelbench` package that only builds the prompt. Generation, search, training and grading
+need NVIDIA GPUs on Linux; the linter and the tests run on CPU.
+
+## 🚀 Usage
 
 ```bash
-# coverage FLOOR -- catches untouched code. kernel_gen/core, checker/core and
-# checker/submission are at 100% line and 99.8% branch; the gate fails under 95%.
-uv run --group dev pytest --cov --cov-branch
+# No GPU: print the paper's prompt for one level-1 problem
+pk generate --model x --level 1 --problems 0 --dry-run
 
-# mutation testing -- catches untested BEHAVIOUR, the real anti-alibi bar
-uv run --group dev pytest kernel_gen/tests --gremlins --gremlin-targets=kernel_gen/core
-uv run --group dev pytest checker/tests --gremlins --gremlin-targets=checker/core,checker/submission
+# Generate 4 kernels per problem, then grade them
+pk generate --model <hf-id> --level 1 --all --num-samples 4 --trace
+cd KernelBench && uv run python scripts/eval_from_generations.py run_name=<run> \
+    runs_dir=<abs path of runs/> dataset_src=local level=1 backend=triton \
+    gpu_arch='["Hopper"]' num_samples_per_problem=4 && cd ..
+
+# Check one kernel, or a whole run folder
+pk lint check runs/<run>/level_1_problem_23_sample_0_kernel.py
+pk lint scan runs/<run> --out linter_findings.jsonl --workers 32
+
+# Reward models and search
+pk train-orm  --config configs/orm.yaml
+pk build-prm  --config configs/prm_build.yaml     # then split-prm, prefixes ... lists
+pk train-prm  --config configs/prm_train.yaml     # multi-GPU launch: see the config
+pk search     --config configs/prm_search.yaml
 ```
 
-The coverage sources in `pyproject.toml` are **dotted module names**, not paths: a path is
-silently reported as "module was never imported" and measures nothing.
+A run folder holds the kernels, the run's arguments and, with `--trace`, the token ids and
+top-20 alternatives at every step, which the PRM trains on. The PRM's training runs added
+two prompt blocks (`--prompt-deltas contract,precision`) and were written as `shard_*`
+folders (`--output-dir runs/<run>/shard_00`), the layout `pk build-prm` reads.
 
-Mutation testing is what proves the tests actually assert something: **pytest-gremlins**
-corrupts `core/` and reports how many mutants the suite kills ("zaps"). Line coverage
-says a line ran; only this says a test would have noticed it being wrong. Do **not** pass
-`--gremlin-parallel` — it collides with coverage.py's data file and errors out.
+## 🧪 Tests
 
-Known-but-unfixed data-flow bugs are tracked as strict-xfail tests plus a row in
-`kernel_gen/tests/KERNEL_GEN_BUGS.md` (generation pipeline) and `checker/tests/BUGS.md`
-(the analyzers). A row there means "found, reproduced, not yet fixed"; rows marked
-*(fixed)* carry a regression test that was verified red against the unfixed code.
+```bash
+uv run pytest                      # no GPU needed; GPU and grader tests skip
+uv run pytest --cov --cov-branch   # coverage floor: 95%
+```
 
-Five whole-corpus sweeps in `scripts/` back claims that a unit test cannot:
+A known, unfixed bug is a strict-xfail test. A fixed bug keeps a regression test that
+failed on the unfixed code.
 
-| Sweep | What it settles |
-|---|---|
-| `verify_report_parity.py` | A refactor left `analyze_source` byte-identical over every shipped kernel. |
-| `verify_extraction_parity.py` | Hashes what the extractor picks from each captured completion, so a ranking change's blast radius is a diff, not a guess. |
-| `verify_submission_gate.py` | How many lint-clean kernels the evaluator still cannot load (367 of 9,886, 3.7% — the KGEN-14 headline). |
-| `verify_rank_blast_radius.py` | Which trajectories ship a different attempt under a changed rank ordering, and that every move is unloadable → loadable. |
-| `verify_attribution.py` | How many rounds of the mechanism table are explained by no check at all (29.9% → 0.05% after KGEN-18/22). |
+## 🪪 License
 
-> **Run dirs predate KGEN-14.** Kernels already on disk were written when `clean` meant only
-> "the linter had nothing to say", so roughly 3.7% of the ones marked clean cannot be
-> loaded at all. They are not retro-fixed; new runs stop mislabelling them.
-
----
-
-## Notes
-
-- `runs/`, `KernelBench/`, `mlruns/`, and SLURM `*.err`/`*.out` logs are **git-ignored
-  artifacts** — they are reproduced by the pipeline, not versioned.
-- The linter's own numbers are never the headline. The loop optimizes them by
-  construction, so "findings went down" is circular; the claim is made on
-  `eval_results.json`, and `lint_loop.jsonl` is read for the mechanism.
-- Component-level detail lives in each subdirectory's own README, most notably
-  [`checker/README.md`](checker/README.md), which documents every check with
-  its failure mode, false-positive guards, and paper references.
+MIT, see [LICENSE](LICENSE). The grader is
+[KernelBench](https://github.com/ScalingIntelligence/KernelBench) (MIT) with
+[our patch](kernelbench.patch).

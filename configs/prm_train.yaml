@@ -1,0 +1,53 @@
+# The PRM: a listwise Qwen3-Reranker-4B trained on the level-7 rollout corpus -- the prefixes
+# and lists of the DeepSeek-V4-Flash, Qwen3.5-122B and MiniMax-M2.7 rollout campaigns
+# (configs/prm_rollout.yaml is one of them), concatenated into prm_rollout.out_dir.
+#
+#   accelerate launch --num_processes=4 --mixed_precision=bf16 --use_fsdp --fsdp_version=1 \
+#       --fsdp_sharding_strategy=FULL_SHARD --fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP \
+#       --fsdp_transformer_layer_cls_to_wrap=Qwen3DecoderLayer \
+#       --fsdp_state_dict_type=FULL_STATE_DICT --fsdp_use_orig_params=true \
+#       --fsdp_sync_module_states=true \
+#       --module processkernel.prm.train.train --config configs/prm_train.yaml
+#
+# A 4B does not fit under plain DDP, hence FSDP. gradient_accumulation_steps is PER RANK:
+# effective batch 1 x 32 x 4 GPUs = 128.
+data:
+  kernelbench_dir: KernelBench
+model:
+  base_model: Qwen/Qwen3-Reranker-4B
+  attn_implementation: sdpa
+train:
+  output_dir: data/checkpoints_prm_l7_qwen3reranker4b
+  epochs: 5
+  lr: 2.0e-05
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 32
+  warmup_ratio: 0.03
+  eval_steps: 40
+  save_steps: 40
+  metric_for_best_model: eval_prm_ndcg
+  dataloader_num_workers: 16
+mlflow:
+  experiment: KernelReranker_PRM_kb7
+  run_name: prm_kb7_wave2_qwen3reranker4b
+prm_rollout:
+  parts_glob: data/prm_l7/parts/*.jsonl
+  splits_json: data/prm_l7/splits.json
+  baseline_timing_json: KernelBench/results/timing/H100/baseline_time_torch_l7.json
+  run_tags:
+    DeepSeek-V4-Flash_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced: ds-l7
+    Qwen3.5-122B-A10B-FP8_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced: qw-l7
+    MiniMax-M2.7_kb7_lintloop_triton_v6_deltas-contract-precision_nothink_thinking_traced: mm-l7
+  temperature: 1.0
+  think_temperature: 0.0
+  enable_thinking: true
+  max_model_len: 30720
+  eval_run_name: prm_rollout_l7_wave2
+  max_length: 24576
+  label_source: imputed
+  orm_checkpoint: data/checkpoints_listwise_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b/final
+  orm_lists_glob: data/lists_{train,val}_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b.jsonl
+  curve_fit_orm_seen: true
+  drop_dead_problems: true
+  out_dir: data/prm_rollout_l7_wave2

@@ -1,0 +1,259 @@
+"""Build the labeled reranker dataset from KernelBench evaluation runs.
+
+Reads, for each configured run directory (a sharded run expands to its ``shard_*``):
+  - eval_results.json          {problem_id: [{sample_id, compiled, correctness, runtime, ...}]}
+  - staged kernel sources      level_{L}_problem_{P}_sample_{S}_kernel.py
+and joins them with:
+  - the reference architecture source (from the KernelBench dataset)
+  - the per-problem PyTorch baseline runtime (`data.baseline_timing_json`) to
+    compute a `speedup = baseline / kernel_runtime` for each correct kernel
+    (KernelBench `fast_p` style; None when the kernel is wrong or has no baseline).
+
+Label: positive (1) iff compiled AND correct; negative (0) otherwise.
+
+Emits one JSONL row per evaluated kernel candidate to `data.dataset_jsonl`
+(fields include `runtime`, `runtime_min`, `runtime_std`, `speedup`, `label`).
+
+Usage:
+    python -m processkernel.orm.data.build_dataset --config configs/default.yaml
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from collections import Counter
+
+from processkernel.config import PROJECT_ROOT, RerankerConfig, _resolve, load_config
+from processkernel.generation.core.artifacts import layout
+from processkernel.orm.data.labels import compute_label, load_baseline_times
+
+
+def _add_kernelbench_to_path(kernelbench_dir: str) -> None:
+    src = os.path.join(_resolve(kernelbench_dir), "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+
+def _load_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _staged_kernel_path(run_dir: str, level: int, problem_id: int, sample_id: int) -> str:
+    return os.path.join(
+        run_dir, f"level_{level}_problem_{problem_id}_sample_{sample_id}_kernel.py"
+    )
+
+
+def expand_run_dirs(run_dirs: list[str], levels: list[int]) -> list[tuple[str, str, int]]:
+    """``(kernel_dir, run_name, level)`` per leaf run: a run expands to its ``shard_*`` dirs.
+
+    Each leaf is read where :func:`~processkernel.generation.core.artifacts.layout` puts its
+    kernels and ``eval_results.json``.
+
+    Rows are keyed downstream on ``(run_name, level, problem_id, sample_id)``, and the
+    pairwise/listwise datasets resolve that key through a dict -- so two runs whose leaf
+    basename is the same ``shard_00`` would silently collapse onto one row. The name carries
+    the whole path to the leaf (``<run>__shard_00``, as prm/data/build.py names its parts), and
+    anything still colliding raises rather than corrupting a list.
+    """
+    leaves: list[tuple[str, str, int]] = []
+    for run_dir_rel, level in zip(run_dirs, levels):
+        run_dir = os.path.abspath(_resolve(run_dir_rel))
+        run_name = os.path.basename(run_dir)
+        # A run dir that is simply gone stays a warning rather than dying inside a listdir.
+        if not os.path.isdir(run_dir):
+            print(f"[WARN] run dir does not exist: {run_dir}, skipping run")
+            continue
+        shards = sorted(
+            d
+            for d in os.listdir(run_dir)
+            if d.startswith("shard_") and os.path.isdir(os.path.join(run_dir, d))
+        )
+        found = [(os.path.join(run_dir, s), f"{run_name}__{s}") for s in shards] or [
+            (run_dir, run_name)
+        ]
+        for d, n in found:
+            leaves.append((layout(d)[0], n, level))
+
+    out = []
+    for leaf_dir, leaf_name, level in leaves:
+        # A shard mid-write has no verdicts yet: ordinary, and not worth failing the build.
+        if os.path.isfile(os.path.join(leaf_dir, "eval_results.json")):
+            out.append((leaf_dir, leaf_name, level))
+        else:
+            print(f"[WARN] no eval_results.json in {leaf_dir}, skipping")
+    names = [n for _, n, _ in out]
+    collide = sorted({n for n in names if names.count(n) > 1})
+    if collide:
+        raise ValueError(
+            f"run_dirs collide on name {collide}; rows are keyed on "
+            "(run_name, level, problem_id, sample_id) and one would overwrite the other"
+        )
+    return out
+
+
+def build_dataset(cfg: RerankerConfig) -> str:
+    """Build the JSONL dataset and return its path."""
+    _add_kernelbench_to_path(cfg.data.kernelbench_dir)
+    from kernelbench.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_dataset
+
+    data_cfg = cfg.data
+    if data_cfg.negative_mode not in ("all_negative", "compiled_wrong"):
+        raise ValueError(
+            f"data.negative_mode must be 'all_negative' or 'compiled_wrong', got {data_cfg.negative_mode}"
+        )
+    levels = data_cfg.levels_for_run_dirs()
+    kb_base = os.path.join(_resolve(data_cfg.kernelbench_dir), "KernelBench")
+
+    out_path = _resolve(data_cfg.dataset_jsonl)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Per-problem PyTorch baseline runtimes for the speedup grade (listwise).
+    baseline_times = load_baseline_times(_resolve(data_cfg.baseline_timing_json))
+
+    # Cache KernelBench datasets per level (run_dirs may share a level).
+    kb_datasets: dict[int, object] = {}
+
+    reason_counts: Counter = Counter()
+    level_counts: Counter = Counter()
+    rows_written = 0
+    missing_kernel = 0
+    dropped_compile_fail = 0
+    correct_with_speedup = 0
+    correct_with_speedup_min = 0
+    correct_without_baseline = 0
+
+    runs = expand_run_dirs(data_cfg.run_dirs, levels)
+    with open(out_path, "w") as out_f:
+        for run_dir, run_name, level in runs:
+            eval_path = os.path.join(run_dir, "eval_results.json")
+            if level not in kb_datasets:
+                kb_datasets[level] = construct_kernelbench_dataset(
+                    level=level, source="local", base_path=kb_base
+                )
+            kb_dataset = kb_datasets[level]
+
+            eval_results = _load_json(eval_path)
+            print(f"\n[run] {run_name}  (level {level})  — {len(eval_results)} problems")
+
+            for problem_id_str, samples in eval_results.items():
+                problem_id = int(problem_id_str)
+                try:
+                    _, problem_name, ref_arch_src = fetch_ref_arch_from_dataset(
+                        kb_dataset, problem_id
+                    )
+                except ValueError:
+                    print(f"  [WARN] problem {problem_id} not in KernelBench level {level}")
+                    continue
+
+                baseline_time = baseline_times.get(level, {}).get(problem_id)
+
+                for sample in samples:
+                    sample_id = int(sample["sample_id"])
+                    kernel_path = _staged_kernel_path(
+                        run_dir, level, problem_id, sample_id
+                    )
+                    if not os.path.isfile(kernel_path):
+                        missing_kernel += 1
+                        continue
+                    with open(kernel_path) as kf:
+                        kernel_src = kf.read()
+
+                    compiled = bool(sample.get("compiled", False))
+                    correct = bool(sample.get("correctness", False))
+                    runtime = sample.get("runtime")
+                    runtime = float(runtime) if runtime is not None else None
+
+                    rstats = sample.get("runtime_stats") or {}
+                    runtime_min = float(rstats["min"]) if rstats.get("min") is not None else None
+                    runtime_std = float(rstats["std"]) if rstats.get("std") is not None else None
+
+                    # Speedup over the per-problem PyTorch baseline (KernelBench
+                    # fast_p style). Only meaningful for correct kernels with a valid
+                    # runtime and a known baseline; otherwise None (the listwise
+                    # builder drops such candidates rather than guessing a grade).
+                    # `speedup` uses mean runtimes on both sides (the KernelBench
+                    # convention); `speedup_min` uses min/min, which is far less
+                    # noise-inflated for launch-bound micro-kernels.
+                    speedup = None
+                    speedup_min = None
+                    if correct and runtime is not None and runtime > 0:
+                        if baseline_time is not None:
+                            speedup = baseline_time["mean"] / runtime
+                            correct_with_speedup += 1
+                            baseline_min = baseline_time.get("min")
+                            if (baseline_min is not None and baseline_min > 0
+                                    and runtime_min is not None and runtime_min > 0):
+                                speedup_min = baseline_min / runtime_min
+                                correct_with_speedup_min += 1
+                        else:
+                            correct_without_baseline += 1
+
+                    lr = compute_label(compiled=compiled, correct=correct)
+
+                    # In compiled_wrong mode, keep positives and compiled-but-wrong
+                    # negatives only; drop compile-failure negatives entirely.
+                    if (data_cfg.negative_mode == "compiled_wrong"
+                            and lr.label == 0 and not compiled):
+                        dropped_compile_fail += 1
+                        continue
+
+                    reason_counts[lr.reason] += 1
+                    level_counts[level] += 1
+                    rows_written += 1
+
+                    row = {
+                        "run_name": run_name,
+                        "level": level,
+                        "problem_id": problem_id,
+                        "problem_name": problem_name,
+                        "sample_id": sample_id,
+                        "ref_arch_src": ref_arch_src,
+                        "kernel_src": kernel_src,
+                        "compiled": compiled,
+                        "correct": correct,
+                        "runtime": runtime,
+                        "runtime_min": runtime_min,
+                        "runtime_std": runtime_std,
+                        "speedup": speedup,
+                        "speedup_min": speedup_min,
+                        "label": lr.label,
+                    }
+                    out_f.write(json.dumps(row) + "\n")
+
+    n_correct = reason_counts["compiled_and_correct"]
+    print("\n" + "=" * 60)
+    print(f"Dataset written: {out_path}")
+    print(f"  runs read      : {len(runs)} leaf dirs")
+    print(f"  negative_mode  : {data_cfg.negative_mode}")
+    print(f"  rows           : {rows_written}")
+    print(f"  positives      : {n_correct}  ({100 * n_correct / max(rows_written, 1):.1f}%)")
+    print(f"  negatives      : {rows_written - n_correct}")
+    if data_cfg.negative_mode == "compiled_wrong":
+        print(f"  dropped (compile-fail negatives): {dropped_compile_fail}")
+    print(f"  speedup        : {correct_with_speedup}/{n_correct} correct have a baseline "
+          f"({correct_without_baseline} correct lack a baseline -> speedup None)")
+    print(f"  speedup_min    : {correct_with_speedup_min}/{n_correct} correct have min/min "
+          f"(needs baseline min + runtime_stats.min)")
+    print(f"  missing kernels: {missing_kernel} (eval entry but no staged .py)")
+    print(f"  per-level rows : {dict(level_counts)}")
+    print("  label reasons  :")
+    for reason, count in reason_counts.most_common():
+        print(f"      {reason:22s} {count}")
+    if rows_written == 0:
+        print("[ERROR] 0 rows written.")
+        sys.exit(1)
+    print("=" * 60)
+    return out_path
+
+
+def main() -> None:
+    cfg = load_config()
+    build_dataset(cfg)
+
+
+if __name__ == "__main__":
+    main()

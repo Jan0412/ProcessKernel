@@ -1,0 +1,124 @@
+# Shared base for the LISTWISE (LambdaRank) kernel reranker, the ORM.
+#
+# NOT trainable on its own: it names no runs and no output paths. The ORM we use is
+# orm.yaml, which is this file plus `_base: listwise_base.yaml` and its own data section.
+#
+# Override any leaf value from the CLI (lists excepted -- config._coerce has no list case):
+#   python -m processkernel.orm.train --config configs/orm.yaml listwise.sigma=2.0
+
+data:
+  # run_dirs / dataset_jsonl come from orm.yaml.
+  level: 6
+  # The KernelBench checkout (README, Set up); its KernelBench/level{L}/ resolves
+  # problem_id -> ref_arch.
+  kernelbench_dir: KernelBench
+  # Exclude non-compiling kernels entirely — compilation is a cheap deterministic
+  # post-generation check, so the reranker only ever ranks compiling candidates.
+  negative_mode: compiled_wrong
+  # Per-problem PyTorch-eager baseline runtimes for the speedup grade (KernelBench
+  # fast_p style). H100, the hardware the runs were timed on, and the same file the PRM
+  # build grades against -- the previous A100 path was also on a cluster we no longer use.
+  baseline_timing_json: KernelBench/results/timing/H100/baseline_time_torch.json
+
+model:
+  base_model: Qwen/Qwen3-Reranker-0.6B
+  max_length: 6144
+  head_type: seq_cls               # seq_cls | yes_no_lm
+  reserve_ref_tokens: 1024
+  attn_implementation: sdpa
+
+train:
+  # output_dir comes from orm.yaml.
+  # 5. The kb6 runs at 8 epochs peaked at ~epoch 2.5 on EVERY metric and declined after
+  # (fast_at1 .706 -> .689, regret .186 -> .197, ndcg .843 -> .833), i.e. 8 was ~3x too
+  # many and the extra epochs cost accuracy rather than buying it. 5 keeps headroom past
+  # the peak without training deep into the overfitting regime.
+  epochs: 5
+  lr: 1.0e-5
+  # 1, not "as big as 80 GB allows" -- measured on an H100, throughput gets WORSE as this
+  # grows, because the collator pads every candidate to the longest one in the batch:
+  #     bs=1  9.7 GB  1.10 lists/s   24k padded tokens/list
+  #     bs=2 19.3 GB  0.79 lists/s   35k
+  #     bs=4 50.6 GB  0.53 lists/s   50k
+  # A bigger batch just pulls in more long outliers and pads everything else up to them, so
+  # half the added compute is spent on padding. One list per micro-batch pads only within
+  # that list. Gradient accumulation then rebuilds the same effective batch the gradient
+  # would have had anyway -- and at 32 it is the batch lr=1.0e-5 was tuned for.
+  # Raise this only alongside a length-grouped sampler.
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 16   # pointwise eval scores single candidates
+  gradient_accumulation_steps: 32
+  # 0.03, not 0.01. At 5 epochs over the run this was tuned on (~1,190 optimizer steps) 0.01
+  # is only ~12 warmup steps, and the 0.6B's grad_norm opens at 56 before settling to ~12
+  # within 8 -- it survives, but that is a sharp spike into a very short ramp. The backbone
+  # arms go up to 1.65B with a freshly initialised `score` head (num_labels=1, random on
+  # every backbone), where too-short warmup risks a divergent first few steps and would
+  # waste the slot for a reason unrelated to the hypothesis. ~36 steps instead.
+  # Applied in the BASE so every arm gets it equally -- a per-arm warmup would confound
+  # the backbone comparison it exists to protect.
+  warmup_ratio: 0.03
+  weight_decay: 0.05
+  bf16: true
+  fp16: false
+  # Mandatory, not an economy: without it even a single list OOMs on an 80 GB H100, because
+  # one list is up to 24 candidates x 6144 tokens in one forward.
+  gradient_checkpointing: true
+  logging_steps: 5
+  # 100, not 20. An eval scores every val candidate pointwise -- 9.7k of them on the
+  # smallest variant, 38.9k on the largest -- and the run is only 504 to 1139 optimizer
+  # steps, so evaluating every 20 spends more wall clock on eval than on training.
+  # 5 to 11 evals still gives model selection something to choose between.
+  # 75. At 200 the 8-epoch runs got only 6 evals, which was far too coarse to locate the
+  # peak -- it landed on eval 3 with nothing either side of it. At 5 epochs (~1,190 steps
+  # in the run this was tuned on) 75 gives ~15 evals, enough to see the turn rather than
+  # infer it. Costs more wall clock in eval, which the per-job --time must cover.
+  eval_steps: 75
+  save_steps: 75                   # must stay a multiple of eval_steps for load_best_model_at_end
+  save_total_limit: 2
+  # Select on the graded per-problem ranking metric (rewards ranking FAST correct
+  # kernels on top, not just correct-vs-wrong). Alternatives: eval_fast_at1 (higher
+  # better) or a low eval_speed_regret_at1. Eval is listwise-only now (no binary pass).
+  metric_for_best_model: eval_list_ndcg_graded
+  greater_is_better: true
+  pos_weight: null                 # unused by the listwise loss
+  seed: 42
+  max_steps: -1                    # -1 = full training; set small (e.g. 20) for a smoke test
+  # 16 workers; give each rank ~18 CPUs. Each one forks the
+  # parent's row index, so the count is a memory multiplier, not just a throughput knob.
+  dataloader_num_workers: 16
+
+mlflow:
+  # orm.yaml sets run_name. NB: the backend is one SQLite file; stagger concurrent jobs so
+  # they do not race to create the experiment.
+  db_file: mlflow.db
+  experiment: KernelReranker_Listwise_kb6
+
+listwise:
+  # lists_*_jsonl / lists_splits_json come from orm.yaml.
+  split_ratios: [0.85, 0.15]       # train / val (listwise needs no test set)
+  split_seed: 42
+  stratify_by_level: true          # a no-op now that both runs are level 6
+  # orm.yaml sets its own list budget and caps.
+  list_size: 24                    # L: fixed budget of candidates per problem
+  min_list_size: 2                 # skip problems with fewer (deduped) candidates
+  max_positives: 12                # cap positives per list (spread-preserving subsample)
+  max_negatives: 12                # cap negatives so fast-vs-slow pairs aren't drowned
+  min_positives: 1                 # skip problems with fewer positives (1 = keep all; 2 = speed-rankable only)
+  speedup_lo: 0.2                  # speedup mapped to p=0 (log2 lower bound); clamps 7.5% of kb6
+  speedup_hi: 4.0                  # speedup mapped to p=1 (kb6 p95 = 4.4x; clamps 6.4%)
+  # Grade from min/min timing (baseline min / kernel runtime min): the mean is
+  # noise-inflated for the microsecond-scale level 6 kernels (std/mean up to ~28%
+  # at p90). `mean` restores the KernelBench fast_p convention.
+  speedup_stat: min
+  # Snap p to a 0.1 grid: candidates within ~35% runtime of each other get the
+  # SAME grade and produce no ranking pair. Without this, ~60% of speed pairs
+  # were sub-noise ties (median gap 0.02 ≈ 7% runtime diff) that teach nothing
+  # and dilute the real fast-vs-slow signal.
+  speed_quant: 0.1
+  dedup_by_code_hash: true
+  sigma: 1.0                       # logistic slope in the LambdaRank loss
+  loss_alpha: 0.5                  # correctness-vs-speed group weight (lower = more speed);
+                                   # groups are ΔNDCG-mass-normalized, so 0.5 = truly equal
+  speed_gap_eval: 0.25             # eval_speed_pair_acc_big: only speed pairs with
+                                   # rel gap >= this (≥ ~2x runtime difference)
+  list_seed: 42

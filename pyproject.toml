@@ -1,44 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "processkernel"
 version = "0.1.0"
-description = "Add your description here"
+description = "Generate Triton kernels and pick the best with an ORM and a PRM-guided beam search."
 readme = "README.md"
-
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "datasets>=5.0.0",
     "kernelbench",
+    "pyyaml",
     "torch",
-    "vllm==0.25.1",
-    # Both needed by reranker.src.prm.rollout.train, and neither was ever declared.
-    # Unpinned on purpose: they must resolve against the transformers and torch already in the
-    # venv, not drag them forward.
-    # HF's Trainer refuses to *construct* without accelerate -- so this blocks the three ORM
-    # trainers too, not only the PRM one. >=1.1.0 is the floor transformers itself names.
-    "accelerate>=1.1.0",
-    # build_training_args hardcodes report_to=["mlflow"], and the PRM trainer logs into the
-    # same mlflow.db as the ORM runs (ARCHITECTURE §9 prescribed this; it was never done).
-    "mlflow",
 ]
+
+[project.scripts]
+pk = "processkernel.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/processkernel"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-cov>=7", "hypothesis>=6", "gemtest>=1", "pytest-gremlins>=1.9"]
+# Generation, rollouts and the search.
+gen = ["vllm==0.25.1"]
+# ORM and PRM training. accelerate and mlflow are unpinned on purpose: they must resolve
+# against the torch the gen group already brings, not drag it forward.
+train = [
+    # HF's Trainer refuses to construct without accelerate; >=1.1.0 is the floor transformers names.
+    "accelerate>=1.1.0",
+    # build_training_args reports to mlflow, and the ORM and PRM runs share one mlflow.db.
+    "mlflow",
+    # The paper's training version; 5.15 dropped TrainingArguments.warmup_ratio.
+    "transformers==5.14.1",
+]
+
+[tool.uv]
+default-groups = ["dev", "gen", "train"]
 
 [tool.uv.sources]
-kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git" }
+# The commit kernelbench.patch applies to.
+kernelbench = { git = "https://github.com/ScalingIntelligence/KernelBench.git", rev = "423217d9fda91e0c2d67e4a43bf62f96f6d104f1" }
 
 [tool.pytest.ini_options]
-testpaths = ["checker/tests", "kernel_gen/tests", "reranker/tests"]
-# NB: do NOT add "kernel_gen/tests" to pythonpath. It puts a second conftest.py on the
-# global path, which shadows checker/tests' own `from conftest import ...`. Both
-# tests dirs bootstrap the repo root themselves in their conftest.py, and kernel_gen
-# tests keep their shared data local (no bare cross-file imports across the subdirs).
-# reranker/tests takes the other route: __init__.py all the way down, so pytest finds the
-# repo root itself and no conftest reaches the global path. Do not mix the two per dir.
+testpaths = ["tests"]
+pythonpath = ["src"]
+# NB: never put a tests/ subdir on pythonpath. tests/checker imports its own conftest by bare
+# name (`from conftest import ...`); a second conftest on the global path would shadow it.
+# The other test dirs are packages (__init__.py all the way down) and need no path entry.
 filterwarnings = [
-    # checker/scan.py forks a worker pool by design (mp.get_context("fork")). When
-    # the FULL suite is collected, a kernel_gen test module (gemtest / hypothesis) starts
+    # src/processkernel/checker/scan.py forks a worker pool by design (mp.get_context("fork")). When
+    # the FULL suite is collected, a generation test module (gemtest / hypothesis) starts
     # a thread at import time first, so the fork trips CPython's fork-after-thread
     # DeprecationWarning. test_scan is verified to run correctly; silence only this one.
     "ignore:This process .* is multi-threaded, use of fork.*:DeprecationWarning",
@@ -52,8 +67,8 @@ filterwarnings = [
 # reports "module was never imported" and measures nothing.
 [tool.coverage.run]
 source = [
-    "kernel_gen.core", "checker.core", "checker.submission",
-    "reranker.src.prm", "reranker.src.data.labels", "reranker.src.config",
+    "processkernel.generation.core", "processkernel.checker.core", "processkernel.checker.submission",
+    "processkernel.prm", "processkernel.orm.data.labels", "processkernel.config",
 ]
 branch = true
 

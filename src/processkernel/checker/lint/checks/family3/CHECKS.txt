@@ -1,0 +1,123 @@
+FAMILY 3 — INTRA-KERNEL STRUCTURE
+================================================================================
+Question: not "did it cheat" (F1) and not "what does the host waste between kernels"
+(F2), but "does the kernel body use the GPU at all".
+
+WHY THIS FAMILY IS DELIBERATELY SMALL
+--------------------------------------------------------------------------------
+Family 2 rests on a proof: Triton has no cross-launch fusion pass, so an intermediate
+written by one launch and read by the next PROVABLY round-trips through HBM. Nothing
+equivalent holds inside a kernel. Whether BLOCK_M=64 beats BLOCK_M=128, whether
+occupancy is too low, whether a load coalesces — all depend on shapes and on hardware
+the linter cannot see.
+
+So the rule for admission here is: the check must key on a STRUCTURAL FACT OF THE AST
+that holds for every shape and every GPU. Anything that needs a tile size, an occupancy
+target or a measured bandwidth is out of scope, permanently.
+
+Three candidates were designed, measured against 2,667 real generated kernels, and
+REJECTED. They are recorded here so nobody rebuilds them:
+
+  * literal launch grid ("the grid cannot scale with the input") — 0.0% of kernels.
+    Generated kernels always derive the grid from a runtime size. Nothing to catch.
+  * missing @triton.autotune — 99.8% of kernels. Fires on essentially everything, so it
+    separates nothing.
+  * "should have used tl.dot" — 14.2% of kernels contain a loop-carried `acc += a * b`
+    with no tl.dot. Reading them shows the instruction would often be WRONG: the shapes
+    are a FlashAttention-style online-softmax accumulation over KV blocks, or a
+    gather-shaped convolution, neither of which maps onto an MMA tile. Telling a model
+    to "use tl.dot" there breaks correct code. This is the same trap F2.1's fusibility
+    gate exists to avoid, and it has no static gate, so the check is not admissible.
+
+--------------------------------------------------------------------------------
+F3.1  unvectorised_kernel                              severity: warn / info
+--------------------------------------------------------------------------------
+Detects: a launched kernel that calls tl.load or tl.store but never calls tl.arange.
+
+A Triton program is a block, not a thread; tl.arange is what gives it a vector to work
+on. Without one, each program loads, computes and stores exactly one element, so the
+block dimension is wasted and the grid has to be as large as the output.
+
+    @triton.jit
+    def conv_kernel(x_ptr, w_ptr, out_ptr, C_in, KH, KW, ...):
+        pid_n = tl.program_id(0)
+        acc = 0.0
+        for ci in range(C_in):
+          for kh in range(KH):
+            for kw in range(KW):
+              acc += tl.load(x_ptr + ...) * tl.load(w_ptr + ...)   # one element, scalar
+        tl.store(out_ptr + ..., acc)
+
+Severity splits on whether the kernel loops:
+  * warn — a for/while loop walks the input one element per iteration (the shape above).
+  * info — no loop, so the kernel is an epilogue reading a few precomputed scalars. The
+    same defect, orders of magnitude less of it; grading them alike would send a model's
+    fix to the wrong kernel.
+
+False-positive guards:
+  * only kernels with a REACHABLE launch (a defined-but-dead kernel is F1.2's finding);
+  * a kernel that calls neither tl.load nor tl.store has nothing to vectorise.
+
+Measured on 2,772 selected kernels (7 generators, levels 1 and 2, baseline sample 0 vs
+the ORM's token-cadence pick): 8.7% overall — 12.7% of baseline kernels against 4.6% of
+the search's picks.
+
+References:
+  Ryoo et al. (2008), "Optimization principles and application performance evaluation of
+    a multithreaded GPU using CUDA", PPoPP — 1,022 citations. Establishes that the
+    memory-access pattern and the amount of work per thread dominate GPU kernel
+    performance; a one-element-per-program kernel forfeits both.
+  Hong & Kim (2009), "An analytical model for a GPU architecture with memory-level and
+    thread-level parallelism awareness", ISCA — 744 citations. Memory-level parallelism
+    is the term this check destroys: one outstanding load per program.
+  Tillet et al. (2019), "Triton", MAPL — 912 citations. The block-program model this
+    check says the kernel is failing to use.
+
+--------------------------------------------------------------------------------
+F3.2  runtime_loop_bounds                                        severity: info
+--------------------------------------------------------------------------------
+Detects: a blocked kernel with `for i in range(P)` where P is an ordinary (non-constexpr)
+kernel parameter.
+
+The trip count is then unknown at compile time, so Triton emits a real loop: a counter, a
+compare and a branch per iteration, index arithmetic recomputed each time, and addresses
+that depend on loop state and so cannot be hoisted. Declaring the bound tl.constexpr makes
+the JIT specialise per value and the loop unrolls into straight-line loads.
+
+    for kd in range(K):        # K is a runtime argument -> a real loop
+    for kd in range(KERNEL_SIZE):   # KERNEL_SIZE: tl.constexpr -> unrolled
+
+REPORTED, NOT INSTRUCTED. tl.constexpr pays off when the bound takes few distinct values
+(a filter window) and costs a recompile per value when it does not. The linter cannot see
+the value set, so the finding states the compile-time fact and leaves the judgement —
+the same discipline as F2.1, which reports a cost without naming a fusion it cannot prove
+safe. That is also why the severity is info.
+
+False-positive guards:
+  * `for k in range(0, K, BLOCK_K)` — the tiled-reduction idiom — is excluded by requiring
+    range() to have exactly one argument. K there is a data extent that MUST stay dynamic;
+    "make it constexpr" would be a recompile per shape.
+  * a bound already declared tl.constexpr;
+  * a kernel with no tl.arange at all, which is F3.1's finding — one fix, one message.
+
+Measured on the same 2,772 kernels: 8.7% overall — 7.9% of baseline kernels against 9.4%
+of the search's picks, i.e. the search makes this slightly MORE common. That matches the
+paper's appendix kernel pair for problem 46, where nucleus sampling fixed the window size
+at compile time (2.22x) and ProcessKernel passed it at run time (1.24x).
+
+References:
+  Tillet et al. (2019), "Triton", MAPL — 912 citations. tl.constexpr and JIT
+    specialisation are the mechanism this check keys on.
+  Chen et al. (2018), "TVM", OSDI — 356 citations, and Zheng et al. (2020), "Ansor",
+    OSDI — 620 citations. Both treat loop unrolling as a first-class schedule primitive
+    whose applicability depends on a statically known trip count.
+
+WHAT FAMILY 3 CANNOT CATCH
+================================================================================
+* Tile-size quality, register pressure, occupancy targets, bank conflicts. Shape- and
+  hardware-dependent; out of scope by the admission rule above.
+* Whether a load coalesces in the general case. Decidable for some address expressions,
+  not for the gather-shaped indexing that dominates generated convolutions.
+* Anything needing measurement: achieved occupancy, warp divergence, tensor-core
+  utilisation. A GPU-free linter cannot see these, and guessing them would be worse than
+  silence.

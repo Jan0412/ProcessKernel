@@ -1,0 +1,50 @@
+# The PRM-guided search as run for the paper: level 1, token cadence, gpt-oss-120b.
+#
+# Everything a run varies is an override on the command line, e.g.
+#   prm_search.level=2 prm_search.ref_dir=<staged level dir> prm_search.out_dir=<dir>
+#   prm_search.selector=random        # Random Beam
+#   prm_search.beam_groups=4          # four independent sub-beams
+#   prm_rollout.gen_model=<hf id> prm_rollout.temperature=<t> prm_rollout.top_p=<p> ...
+#   prm_rollout.max_new_tokens=<budget> prm_search.max_steps=<budget / 256>
+model:
+  attn_implementation: sdpa
+prm_rollout:
+  gen_model: openai/gpt-oss-120b
+  temperature: 1.0
+  think_temperature: 0.0
+  enable_thinking: true
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 16384
+  max_model_len: 32768
+  max_num_seqs: 64
+  max_length: 24576
+  base_model: Qwen/Qwen3-Reranker-4B
+  orm_max_length: 6144
+  orm_reserve_ref_tokens: 1024
+prm_search:
+  beam_width: 4
+  expand: 4
+  max_steps: 64
+  advance: tokens
+  segment_max_tokens: 256
+  prose_lines_per_chunk: 1
+  code_steps_per_chunk: 1
+  score_at_cut: true
+  selector: prm
+  min_distinct_parents: 2
+  beam_groups: 1
+  select_seed: 7
+  prm_checkpoint: data/checkpoints_prm_l7_qwen3reranker4b/final
+  orm_checkpoint: data/checkpoints_listwise_kb_deepseek_gptoss_speed_moderate_qwen3reranker4b/final
+  prm_batch_size: 4
+  orm_batch_size: 8
+  gpu_memory_utilization: 0.75
+  dataset: kernelbench
+  dataset_name: null
+  level: 1
+  problems: 1-100
+  ref_dir: KernelBench/KernelBench/level1
+  out_dir: data/prm_search/l1_prm_gptoss
+  write_pool: true
+  keep_pruned: false
